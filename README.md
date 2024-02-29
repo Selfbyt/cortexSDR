@@ -1,0 +1,2 @@
+# cortexSDR
+sparse distributed representation
