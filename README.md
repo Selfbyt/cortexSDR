@@ -81,7 +81,7 @@ std::string decodedNumber = sdr.decode();
 ### Building from Source
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/cortex-sdr.git
+git clone https://github.com/Selfbyt/cortexSDR.gitt
 cd cortex-sdr
 ```
 
