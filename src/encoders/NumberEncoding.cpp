@@ -50,4 +50,17 @@ std::vector<size_t> NumberEncoding::encodeNumberString(const std::string& number
 size_t NumberEncoding::getBucketIndex(double value) const {
     size_t bucket = static_cast<size_t>((value - minValue_) / bucketSize_);
     return std::min(bucket, bucketCount_ - 1);
+}
+
+std::string NumberEncoding::decodeIndices(const std::vector<size_t>& indices) const {
+    std::string result;
+    for (size_t index : indices) {
+        if (index >= startIndex_ && index < startIndex_ + bucketCount_) {
+            size_t bucketIdx = index - startIndex_;
+            double value = minValue_ + (bucketIdx * bucketSize_) + (bucketSize_ / 2);
+            if (!result.empty()) result += " ";
+            result += std::to_string(value);
+        }
+    }
+    return result;
 } 

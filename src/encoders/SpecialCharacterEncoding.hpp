@@ -7,6 +7,7 @@
 class SpecialCharacterEncoding {
 public:
     std::vector<size_t> encodeText(const std::string& text) const;
+    std::string decodeIndices(const std::vector<size_t>& indices) const;
 };
 
 #endif // SPECIAL_CHARACTER_ENCODING_HPP

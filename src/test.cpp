@@ -1,6 +1,28 @@
 #include <iostream>
 #include "cortexSDR.cpp"
 
+void testEncodeDecodeFlow() {
+    SparseDistributedRepresentation sdr{
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"
+    };
+    
+    // Test text encoding/decoding
+    std::string original = "The quick brown fox";
+    auto encoded = sdr.encodeText(original);
+    std::string decoded = sdr.decode();
+    
+    std::cout << "Original: " << original << "\n";
+    std::cout << "Decoded:  " << decoded << "\n";
+    
+    // Test number encoding/decoding
+    double number = 42.5;
+    encoded = sdr.encodeNumber(number);
+    decoded = sdr.decode();
+    
+    std::cout << "\nOriginal number: " << number << "\n";
+    std::cout << "Decoded number:  " << decoded << "\n";
+}
+
 int main() {
     // Initialize SDR with a vocabulary
     SparseDistributedRepresentation sdr{
@@ -19,11 +41,10 @@ int main() {
 
     // Encode the paragraph
     std::cout << "Encoding paragraph to SDR...\n";
-    sdr.encodeText(paragraph);
+    auto encoded = sdr.encodeText(paragraph);
     
-    // Get the encoded vector and calculate its size
-    auto encoded = sdr.getEncodedVector();
-    size_t encodedSize = sizeof(encoded);
+    // Calculate encoded size using the EncodedData structure
+    size_t encodedSize = encoded.getMemorySize();
     
     std::cout << "Encoded SDR size: " << encodedSize << " bytes\n";
     std::cout << "Compression ratio: " << static_cast<float>(paragraph.size()) / encodedSize << ":1\n\n";
@@ -31,6 +52,9 @@ int main() {
     // Print SDR stats
     std::cout << "SDR Statistics:\n";
     sdr.printStats();
+
+    std::cout << "\nTesting encode/decode flow:\n";
+    testEncodeDecodeFlow();
 
     return 0;
 }

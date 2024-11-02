@@ -11,6 +11,7 @@ public:
     WordEncoding(std::initializer_list<std::string> vocabulary);
 
     std::vector<size_t> encodeWord(const std::string& text) const;
+    std::string decodeIndices(const std::vector<size_t>& indices) const;
 
 private:
     std::vector<std::string> vocabulary_;

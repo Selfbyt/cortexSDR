@@ -16,4 +16,17 @@ std::vector<size_t> WordEncoding::encodeWord(const std::string& text) const {
         indices.push_back(it->second);
     }
     return indices;
+}
+
+std::string WordEncoding::decodeIndices(const std::vector<size_t>& indices) const {
+    std::string result;
+    for (size_t index : indices) {
+        if (index < vocabulary_.size()) {
+            if (!result.empty()) {
+                result += " ";
+            }
+            result += vocabulary_[index];
+        }
+    }
+    return result;
 } 

@@ -18,6 +18,9 @@ public:
     // Encode multiple numbers from a string (e.g., "42.5 -123.4 789")
     std::vector<size_t> encodeNumberString(const std::string& numbers) const;
 
+    // Decode indices to a string
+    std::string decodeIndices(const std::vector<size_t>& indices) const;
+
 private:
     size_t startIndex_;      // Starting index in the SDR for number encoding
     size_t bucketCount_;     // Number of buckets for value discretization
