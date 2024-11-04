@@ -2,184 +2,310 @@
 #include <bitset>
 #include <vector>
 #include <string>
+#include <memory>
+#include <algorithm>
+#include <unordered_map>
 #include "WordEncoding.hpp"
 #include "DateTimeEncoding.hpp"
 #include "SpecialCharacterEncoding.hpp"
 #include "NumberEncoding.hpp"
 
-static const size_t MAX_VECTOR_SIZE = 2000;
+// Define encoding ranges
+struct EncodingRanges
+{
+    static constexpr size_t WORD_START = 0;
+    static constexpr size_t WORD_END = 999;
+    static constexpr size_t SPECIAL_CHAR_START = 1000;
+    static constexpr size_t SPECIAL_CHAR_END = 1499;
+    static constexpr size_t NUMBER_START = 1500;
+    static constexpr size_t NUMBER_END = 1999;
+    static constexpr size_t MAX_VECTOR_SIZE = 2000;
+};
 
-class SparseDistributedRepresentation {
+class SparseDistributedRepresentation
+{
 public:
-    struct EncodedData {
+    struct EncodedData
+    {
         std::vector<size_t> activePositions;
-        size_t totalSize;  // Store the total size for reconstruction
-        
-        // Calculate actual memory usage
-        size_t getMemorySize() const {
+        size_t totalSize;
+
+        // Constructors
+        EncodedData() = default;
+        EncodedData(std::vector<size_t> positions, size_t size)
+            : activePositions(std::move(positions)), totalSize(size) {}
+
+        // Get memory size
+        size_t getMemorySize() const
+        {
             return activePositions.size() * sizeof(size_t) + sizeof(totalSize);
+        }
+
+        // Union operator
+        EncodedData &operator|=(const EncodedData &other)
+        {
+            std::vector<size_t> combined;
+            std::set_union(
+                activePositions.begin(), activePositions.end(),
+                other.activePositions.begin(), other.activePositions.end(),
+                std::back_inserter(combined));
+            activePositions = std::move(combined);
+            return *this;
+        }
+
+        // Calculate overlap
+        double calculateOverlap(const EncodedData &other) const
+        {
+            std::vector<size_t> intersection;
+            std::set_intersection(
+                activePositions.begin(), activePositions.end(),
+                other.activePositions.begin(), other.activePositions.end(),
+                std::back_inserter(intersection));
+            return static_cast<double>(intersection.size()) /
+                   std::min(activePositions.size(), other.activePositions.size());
         }
     };
 
-    SparseDistributedRepresentation(std::initializer_list<std::string> vocabulary)
-        : vocabulary_(vocabulary), vectorSize_(vocabulary.size()),
-          wordEncoder_(vocabulary),
-          dateTimeEncoder_(),
-          specialCharEncoder_(),
-          numberEncoder_() {
+    explicit SparseDistributedRepresentation(std::initializer_list<std::string> vocabulary)
+        : vocabulary_(vocabulary),
+          currentEncoding_({}, EncodingRanges::MAX_VECTOR_SIZE),
+          wordEncoder_(std::make_unique<WordEncoding>(vocabulary)),
+          dateTimeEncoder_(std::make_unique<DateTimeEncoding>()),
+          specialCharEncoder_(std::make_unique<SpecialCharacterEncoding>()),
+          numberEncoder_(std::make_unique<NumberEncoding>(
+              EncodingRanges::NUMBER_START,
+              EncodingRanges::NUMBER_END - EncodingRanges::NUMBER_START + 1,
+              -1000.0,
+              1000.0))
+    {
+        validateVocabularySize();
+        initializeWordMap();
     }
 
-    EncodedData encodeText(const std::string& text) {
-        std::bitset<MAX_VECTOR_SIZE> tempVector;
-        
-        // Encode words
-        auto wordIndices = wordEncoder_.encodeWord(text);
-        setIndices(tempVector, wordIndices);
-        
-        // Encode special characters
-        auto specialCharIndices = specialCharEncoder_.encodeText(text);
-        setIndices(tempVector, specialCharIndices);
-        
-        // Store the bitset internally
-        encodedVector_ = tempVector;
-        
-        // Return only active positions
-        return getEncodedData();
-    }
+    EncodedData encodeText(const std::string &text)
+    {
+        resetEncodedVector();
+        std::vector<std::string> tokens = tokenizeText(text);
 
-    EncodedData encodeDateTime(const std::string& dateTime) {
-        std::bitset<MAX_VECTOR_SIZE> tempVector;
-        auto dateTimeIndices = dateTimeEncoder_.encodeDateTime(dateTime);
-        setIndices(tempVector, dateTimeIndices);
-        encodedVector_ = tempVector;
-        return getEncodedData();
-    }
-
-    // Method to combine multiple encodings
-    void combineEncodings(const std::vector<std::bitset<MAX_VECTOR_SIZE>>& encodings) {
-        std::bitset<MAX_VECTOR_SIZE> combined;
-        for (const auto& encoding : encodings) {
-            combined |= encoding;
-        }
-        encodedVector_ = combined;
-    }
-
-    EncodedData encodeNumber(double number) {
-        std::bitset<MAX_VECTOR_SIZE> tempVector;
-        auto numberIndices = numberEncoder_.encodeNumber(number);
-        setIndices(tempVector, numberIndices);
-        encodedVector_ = tempVector;
-        return getEncodedData();
-    }
-
-    EncodedData encodeNumberString(const std::string& numbers) {
-        std::bitset<MAX_VECTOR_SIZE> tempVector;
-        auto numberIndices = numberEncoder_.encodeNumberString(numbers);
-        setIndices(tempVector, numberIndices);
-        encodedVector_ = tempVector;
-        return getEncodedData();
-    }
-
-    EncodedData getEncodedData() const {
-        EncodedData data;
-        data.totalSize = MAX_VECTOR_SIZE;
-        
-        // Store only active bit positions
-        for(size_t i = 0; i < MAX_VECTOR_SIZE; i++) {
-            if(encodedVector_[i]) {
-                data.activePositions.push_back(i);
+        for (const auto &token : tokens)
+        {
+            // Try to encode as a word
+            auto wordIndices = wordEncoder_->encodeWord(token);
+            if (!wordIndices.empty())
+            {
+                setIndices(wordIndices);
+                continue;
             }
-        }
-        
-        return data;
-    }
 
-    static std::bitset<MAX_VECTOR_SIZE> reconstruct(const EncodedData& data) {
-        std::bitset<MAX_VECTOR_SIZE> result;
-        for(size_t pos : data.activePositions) {
-            if(pos < MAX_VECTOR_SIZE) {
-                result.set(pos);
+            // Try to encode as a number
+            try
+            {
+                double number = std::stod(token);
+                auto numberIndices = numberEncoder_->encodeNumber(number);
+                setIndices(numberIndices);
+                continue;
             }
-        }
-        return result;
-    }
-
-    void printStats() const {
-        auto data = getEncodedData();
-        std::cout << "Active bits: " << data.activePositions.size() << "/" << MAX_VECTOR_SIZE 
-                  << " (" << (static_cast<double>(data.activePositions.size()) / MAX_VECTOR_SIZE * 100)
-                  << "%)\n";
-        
-        // Print first few active positions
-        std::cout << "First active positions: ";
-        for(size_t i = 0; i < std::min(size_t(5), data.activePositions.size()); ++i) {
-            std::cout << data.activePositions[i] << " ";
-        }
-        std::cout << "\n";
-        
-        // Print memory usage
-        std::cout << "Memory usage: " << data.getMemorySize() << " bytes\n";
-    }
-
-    // Decode the current encoded vector
-    std::string decode() const {
-        std::string result;
-        
-        // Get active positions
-        auto data = getEncodedData();
-        
-        // Separate indices by their ranges
-        std::vector<size_t> wordIndices, specialCharIndices, numberIndices, dateTimeIndices;
-        
-        for (size_t pos : data.activePositions) {
-            if (pos < 1000) {  // Word indices
-                wordIndices.push_back(pos);
-            } else if (pos >= 1000 && pos < 1500) {  // Special characters
-                specialCharIndices.push_back(pos);
-            } else if (pos >= 1500 && pos < 2000) {  // Numbers
-                numberIndices.push_back(pos);
+            catch (const std::invalid_argument &)
+            {
             }
+
+            // Encode special characters
+            auto specialCharIndices = specialCharEncoder_->encodeText(token);
+            setIndices(specialCharIndices);
         }
-        
-        // Decode words
-        if (!wordIndices.empty()) {
-            result += wordEncoder_.decodeIndices(wordIndices);
-        }
-        
-        // Decode special characters
-        if (!specialCharIndices.empty()) {
-            result += specialCharEncoder_.decodeIndices(specialCharIndices);
-        }
-        
-        // Decode numbers (if present)
-        if (!numberIndices.empty()) {
-            if (!result.empty()) result += " ";
-            result += numberEncoder_.decodeIndices(numberIndices);
-        }
-        
-        return result;
+
+        currentEncoding_ = getEncodedData();
+        return currentEncoding_;
     }
-    
-    // Decode from EncodedData
-    std::string decodeFromData(const EncodedData& data) {
-        encodedVector_ = reconstruct(data);
-        return decode();
+
+    EncodedData encodeNumber(double number)
+    {
+        resetEncodedVector();
+        auto indices = numberEncoder_->encodeNumber(number);
+        setIndices(indices);
+        currentEncoding_ = getEncodedData();
+        return currentEncoding_;
+    }
+
+    std::string decode() const
+    {
+        auto [wordIndices, specialCharIndices, numberIndices] = separateIndices(currentEncoding_);
+
+        std::vector<std::string> components;
+
+        if (!wordIndices.empty())
+        {
+            components.push_back(wordEncoder_->decodeIndices(wordIndices));
+        }
+
+        if (!specialCharIndices.empty())
+        {
+            components.push_back(specialCharEncoder_->decodeIndices(specialCharIndices));
+        }
+
+        if (!numberIndices.empty())
+        {
+            components.push_back(numberEncoder_->decodeIndices(numberIndices));
+        }
+
+        return joinComponents(components);
+    }
+
+    void printStats() const
+    {
+        double sparsity = calculateSparsity(currentEncoding_);
+        auto [wordIndices, specialCharIndices, numberIndices] = separateIndices(currentEncoding_);
+
+        std::cout << "\nSDR Statistics:\n";
+        std::cout << "----------------\n";
+        std::cout << "Active bits: " << currentEncoding_.activePositions.size()
+                  << "/" << EncodingRanges::MAX_VECTOR_SIZE
+                  << " (Sparsity: " << sparsity << "%)\n";
+
+        std::cout << "Word encodings: " << wordIndices.size() << " active bits\n";
+        std::cout << "Special characters: " << specialCharIndices.size() << " active bits\n";
+        std::cout << "Number encodings: " << numberIndices.size() << " active bits\n";
+        std::cout << "Memory usage: " << currentEncoding_.getMemorySize() << " bytes\n";
     }
 
 private:
-    void setIndices(std::bitset<MAX_VECTOR_SIZE>& vector, const std::vector<size_t>& indices) {
-        for (size_t index : indices) {
-            if (index < MAX_VECTOR_SIZE) {
-                vector.set(index);
+    std::vector<std::string> vocabulary_;
+    std::unordered_map<std::string, size_t> wordToIndex_;
+    EncodedData currentEncoding_;
+    std::unique_ptr<WordEncoding> wordEncoder_;
+    std::unique_ptr<DateTimeEncoding> dateTimeEncoder_;
+    std::unique_ptr<SpecialCharacterEncoding> specialCharEncoder_;
+    std::unique_ptr<NumberEncoding> numberEncoder_;
+    std::bitset<EncodingRanges::MAX_VECTOR_SIZE> encodedVector_;
+
+    void validateVocabularySize() const
+    {
+        if (vocabulary_.size() > EncodingRanges::WORD_END - EncodingRanges::WORD_START + 1)
+        {
+            throw std::runtime_error("Vocabulary size exceeds available word encoding range");
+        }
+    }
+
+    void initializeWordMap()
+    {
+        for (size_t i = 0; i < vocabulary_.size(); ++i)
+        {
+            std::string word = vocabulary_[i];
+            std::transform(word.begin(), word.end(), word.begin(), ::tolower);
+            wordToIndex_[word] = i;
+        }
+    }
+
+    std::vector<std::string> tokenizeText(const std::string &text) const
+    {
+        std::vector<std::string> tokens;
+        std::string currentToken;
+
+        for (char c : text)
+        {
+            if (std::isspace(c) || std::ispunct(c))
+            {
+                if (!currentToken.empty())
+                {
+                    tokens.push_back(currentToken);
+                    currentToken.clear();
+                }
+                if (std::ispunct(c))
+                {
+                    tokens.push_back(std::string(1, c));
+                }
+            }
+            else
+            {
+                currentToken += std::tolower(c);
+            }
+        }
+
+        if (!currentToken.empty())
+        {
+            tokens.push_back(currentToken);
+        }
+
+        return tokens;
+    }
+
+    void resetEncodedVector()
+    {
+        encodedVector_.reset();
+    }
+
+    void setIndices(const std::vector<size_t> &indices)
+    {
+        for (size_t index : indices)
+        {
+            if (index < EncodingRanges::MAX_VECTOR_SIZE)
+            {
+                encodedVector_.set(index);
             }
         }
     }
 
-    std::bitset<MAX_VECTOR_SIZE> encodedVector_;
-    std::vector<std::string> vocabulary_;
-    size_t vectorSize_;
-    WordEncoding wordEncoder_;
-    DateTimeEncoding dateTimeEncoder_;
-    SpecialCharacterEncoding specialCharEncoder_;
-    NumberEncoding numberEncoder_;
+    EncodedData getEncodedData() const
+    {
+        EncodedData data;
+        data.totalSize = EncodingRanges::MAX_VECTOR_SIZE;
+        for (size_t i = 0; i < encodedVector_.size(); ++i)
+        {
+            if (encodedVector_[i])
+            {
+                data.activePositions.push_back(i);
+            }
+        }
+        return data;
+    }
+
+    struct SeparatedIndices
+    {
+        std::vector<size_t> wordIndices;
+        std::vector<size_t> specialCharIndices;
+        std::vector<size_t> numberIndices;
+    };
+
+    SeparatedIndices separateIndices(const EncodedData &data) const
+    {
+        SeparatedIndices result;
+
+        for (size_t pos : data.activePositions)
+        {
+            if (pos <= EncodingRanges::WORD_END)
+            {
+                result.wordIndices.push_back(pos);
+            }
+            else if (pos <= EncodingRanges::SPECIAL_CHAR_END)
+            {
+                result.specialCharIndices.push_back(pos);
+            }
+            else if (pos <= EncodingRanges::NUMBER_END)
+            {
+                result.numberIndices.push_back(pos);
+            }
+        }
+
+        return result;
+    }
+
+    std::string joinComponents(const std::vector<std::string> &components) const
+    {
+        std::string result;
+        for (size_t i = 0; i < components.size(); ++i)
+        {
+            if (i > 0 && !components[i].empty() && !components[i - 1].empty())
+            {
+                result += " ";
+            }
+            result += components[i];
+        }
+        return result;
+    }
+
+    double calculateSparsity(const EncodedData &data) const
+    {
+        return 100.0 * (1.0 - static_cast<double>(data.activePositions.size()) /
+                                  EncodingRanges::MAX_VECTOR_SIZE);
+    }
 };
