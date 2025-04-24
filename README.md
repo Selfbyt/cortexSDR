@@ -1,14 +1,18 @@
 # Cortex SDR (Sparse Distributed Representation)
 
-A C++ firmware implementation that enables storage devices or computers to store data at a 5:1 ratio (5 MB in 1 MB space) while also providing powerful encoding and decoding capabilities for AI applications.
+A high-performance C++ implementation that compresses data by storing it as a sparse distributed representation. By only storing the positions of active bits in a large binary vector, CortexSDR achieves a 5:1 compression ratio (5 MB in 1 MB space) while maintaining semantic meaning and enabling powerful pattern matching capabilities.
 
 ## Overview
 
-Cortex SDR is a firmware that implements a Sparse Distributed Representation system. It encodes various data types into binary vectors with minimal active bits. This approach enables:
+Cortex SDR implements a Sparse Distributed Representation (SDR) system that encodes various data types into large binary vectors where only a small percentage of bits are active (set to 1). By storing only the positions of these active bits, we achieve significant compression while preserving the semantic meaning of the data.
+
+This approach enables:
 - High-density data storage (achieving 5:1 compression)
 - Efficient encoding/decoding operations for AI and machine learning
-- Noise-resilient data representations
+- Noise-resilient data representations (robust to bit flips and data corruption)
 - Advanced pattern matching and similarity detection
+- Real-time processing of streaming data
+- Cross-platform compatibility for encoded data
 
 ## Features
 
@@ -72,53 +76,118 @@ std::string decodedNumber = sdr.decode();
 ## Installation
 
 ### Prerequisites
-- C++11 or higher
-- CMake 3.0 or higher
+- C++17 or higher
+- CMake 3.10 or higher
+- Qt6 (for desktop application only)
 
 ### Building from Source
 1. Clone the repository
 ```bash
-git clone https://github.com/Selfbyt/cortexSDR.gitt
-cd cortex-sdr
+git clone https://github.com/Selfbyt/cortexSDR.git
+cd cortexSDR
 ```
 
-2. Build the project
+2. Build the project as a desktop application
 ```bash
-mkdir build
-cd build
-cmake ..
-make
+./build.sh
 ```
+
+### Building as a Library
+CortexSDR can be used as a standalone library in your applications, allowing you to leverage its powerful compression and pattern matching capabilities:
+
+```bash
+./build_library.sh
+```
+
+After building, you can install the library:
+
+```bash
+cd build_library
+sudo make install
+```
+
+**Coming Soon**: Python wrapper for easy integration with Python applications and data science workflows.
+
+### Building as Firmware
+CortexSDR can be built as firmware for real-time processing on embedded devices, enabling on-the-fly compression and pattern recognition at the edge:
+
+```bash
+./build_firmware.sh
+```
+
+This will generate both a binary executable and a HEX file that can be flashed to compatible devices. The firmware is optimized for real-time processing of streaming data with minimal memory footprint.
 
 ## Applications
 
 ### 1. Data Storage & Firmware Compression
-- Store up to 5 MB of data in only 1 MB of physical space
+- Store up to 5 MB of data in only 1 MB of physical space
 - Improve storage density in flash memory or other storage devices
 
 ### 2. Artificial Intelligence
 - Use as a preprocessor for ML models with efficient feature encoding
 - Enable noise-robust pattern recognition and similarity detection
 
-### 3. Natural Language Processing
+### 3. As a Library
+- Integrate cortexSDR into your own applications
+- Use the compression and encoding capabilities in your projects
+- Available as a CMake package for easy integration
+- Python wrapper coming soon for data science and ML applications
+
+### 4. As Firmware
+- Real-time processing of streaming data
+- Flash directly to embedded devices
+- Implement high-density storage on resource-constrained systems
+- Optimize for minimal memory footprint
+- Low-latency encoding and decoding for time-critical applications
+
+## Library Usage
+
+When using cortexSDR as a library in your CMake project:
+
+```cmake
+# Find the cortexSDR package
+find_package(cortexsdr REQUIRED)
+
+# Link against cortexSDR
+target_link_libraries(your_target PRIVATE cortexsdr::cortexsdr)
+```
+
+Then in your C++ code:
+
+```cpp
+#include "cortexSDR/cortexSDR.hpp"
+
+// Initialize SDR with vocabulary
+SparseDistributedRepresentation sdr{"word1", "word2"};
+
+// Encode data
+auto encoded = sdr.encodeText("your text here");
+
+// Decode data
+std::string decoded = sdr.decode();
+```
+
+See the `examples/library_usage` directory for a complete example.
+
+### 5. Natural Language Processing
 - Text classification
 - Semantic similarity detection
 - Pattern matching in text
 - Efficient storage of large text corpora
 
-### 4. Time Series Data
+### 6. Time Series Data
 - Temporal pattern recognition
 - Anomaly detection
 - Event sequence matching
 - Time-based predictions
 
-### 5. Machine Learning
+### 7. Machine Learning
 - Feature encoding for ML models
 - Dimensionality reduction
 - Pattern recognition
 - Noise-resistant data representation
 
-### 6. Data Compression
+### 8. Data Compression
 - Efficient storage of mixed data types
 - Lossy compression with semantic preservation
 - Pattern-based data deduplication
@@ -138,6 +207,16 @@ make
    - Image encoding
    - Audio signal encoding
    - Geographic coordinate encoding
+
+4. **Python Integration**
+   - Python wrapper for data science workflows
+   - Jupyter notebook examples
+   - Integration with popular ML frameworks
+
+5. **Web API and Services**
+   - RESTful API for remote encoding/decoding
+   - Cloud-based pattern matching service
+   - Distributed SDR network for collaborative pattern recognition
 
 ## Contributing
 
