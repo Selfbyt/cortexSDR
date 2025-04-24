@@ -1,26 +1,25 @@
 #include "cortexSDR.hpp"
 
-SparseDistributedRepresentation::SparseDistributedRepresentation()
-    : currentEncoding_({}, EncodingRanges::MAX_VECTOR_SIZE),
-    wordEncoder_(std::make_unique<CharacterEncoding>()),
-    dateTimeEncoder_(std::make_unique<DateTimeEncoding>()),
+SparseDistributedRepresentation::SparseDistributedRepresentation(std::initializer_list<std::string> vocabulary)
+    : vocabulary_(vocabulary),
+    currentEncoding_({}, EncodingRanges::MAX_VECTOR_SIZE),
+    wordEncoder_(std::make_unique<WordEncoding>(vocabulary)),
+    dateTimeEncoder_(std::make_unique<DateTimeEncoding>(DateTimeEncoding::EncodingConfig{})),
     specialCharEncoder_(std::make_unique<SpecialCharacterEncoding>()),
-    numberEncoder_(std::make_unique<NumberEncoding>(
-        EncodingRanges::NUMBER_START,
-        EncodingRanges::NUMBER_END - EncodingRanges::NUMBER_START + 1,
-        -1000.0,
-        1000.0)),
+    numberEncoder_(std::make_unique<NumberEncoding>(NumberEncoding::EncodingConfig{})),
     imageEncoder_(std::make_unique<ImageEncoding>()),
     videoEncoder_(std::make_unique<VideoEncoding>()),
     audioEncoder_(std::make_unique<AudioEncoding>())
 {
-    // Remove vocabulary initialization
 }
 
 SparseDistributedRepresentation::EncodedData SparseDistributedRepresentation::encodeText(const std::string &text)
 {
     resetEncodedVector();
     std::vector<std::string> tokens = tokenizeText(text);
+
+    // Initialize empty combined encoding
+    EncodedData combinedEncoding({}, EncodingRanges::MAX_VECTOR_SIZE);
 
     for (const auto &token : tokens)
     {
@@ -44,11 +43,13 @@ SparseDistributedRepresentation::EncodedData SparseDistributedRepresentation::en
         }
 
         // Encode regular text using character-level encoding
-        auto charIndices = wordEncoder_->encodeText(token); // This will now use character-level encoding
+        auto charIndices = wordEncoder_->encodeWord(token);
         setIndices(charIndices);
     }
 
     currentEncoding_ = getEncodedData();
+    // No need to combine with empty encoding
+    // currentEncoding_ |= combinedEncoding;
     return currentEncoding_;
 }
 
@@ -164,7 +165,7 @@ SparseDistributedRepresentation::EncodedData SparseDistributedRepresentation::ge
     return data;
 }
 
-SparseDistributedRepresentation::SeparatedIndices 
+SparseDistributedRepresentation::SeparatedIndices
 SparseDistributedRepresentation::separateIndices(const EncodedData& data) const {
     SeparatedIndices result;
 
@@ -197,3 +198,42 @@ double SparseDistributedRepresentation::calculateSparsity(const EncodedData& dat
     return 100.0 * (1.0 - static_cast<double>(data.activePositions.size()) /
                               EncodingRanges::MAX_VECTOR_SIZE);
 }
+
+// These implementations are placeholders and not needed for basic functionality
+/*
+void BrainInspiredSDR::optimizePatterns() {
+    // Implementation removed for simplicity
+}
+*/
+
+/*
+void AdaptiveEncoder::learnPatterns(const std::string& text) {
+    // Implementation removed for simplicity
+}
+*/
+
+/*
+EncodedData ContextualSDR::encodeWithContext(const std::string& text) {
+    // Implementation removed for simplicity
+    return EncodedData({}, EncodingRanges::MAX_VECTOR_SIZE);
+}
+*/
+
+/*
+void SemanticEncoder::clusterRelatedConcepts() {
+    // Implementation removed for simplicity
+}
+*/
+
+/*
+EncodedData PredictiveEncoder::encode(const std::string& text) {
+    // Implementation removed for simplicity
+    return EncodedData({}, EncodingRanges::MAX_VECTOR_SIZE);
+}
+*/
+
+/*
+void BrainLikeCompression::strengthenConnections(const EncodedData& pattern) {
+    // Implementation removed for simplicity
+}
+*/

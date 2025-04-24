@@ -101,4 +101,97 @@ private:
     double calculateSparsity(const EncodedData& data) const;
 };
 
-#endif // CORTEXSDR_HPP 
+// New classes for Brain-Inspired Optimizations and related enhancements
+// (Implementation inspired by BaMI-SDR: https://www.numenta.com/assets/pdf/biological-and-machine-intelligence/BaMI-SDR.pdf)
+
+class BrainInspiredSDR {
+public:
+    struct Synapse {
+        uint16_t position;
+        float strength;  // Hebbian update strength
+    };
+    struct Pattern {
+        std::vector<Synapse> connections;
+        float frequency;  // Updated based on occurrence
+        uint32_t context; // Encoded contextual info
+    };
+    struct HierarchicalPattern {
+        std::vector<Pattern> lowLevel;
+        std::vector<Pattern> midLevel;
+        std::vector<Pattern> highLevel;
+    };
+
+    void optimizePatterns() {
+        // TODO: Implement hierarchical pattern optimization inspired by cortical columns (BaMI-SDR)
+    }
+};
+
+class AdaptiveEncoder {
+public:
+    void learnPatterns(const std::string& text) {
+        // TODO: Update frequency, adapt encoding, merge similar patterns per BaMI-SDR principles.
+    }
+};
+
+class ContextualSDR {
+public:
+    using EncodedData = SparseDistributedRepresentation::EncodedData;
+    
+    EncodedData encodeWithContext(const std::string& text) {
+        // TODO: Analyze local context and encode only unexpected deviations (BaMI-SDR)
+        return EncodedData({}, EncodingRanges::MAX_VECTOR_SIZE);
+    }
+};
+
+class SemanticEncoder {
+public:
+    using EncodedData = SparseDistributedRepresentation::EncodedData;
+    
+    std::vector<EncodedData> semanticClusters;
+    void clusterRelatedConcepts() {
+        // TODO: Group semantically similar patterns to reduce redundancy (based on BaMI-SDR)
+    }
+};
+
+class PredictiveEncoder {
+public:
+    using EncodedData = SparseDistributedRepresentation::EncodedData;
+    
+    EncodedData encode(const std::string& text) {
+        // TODO: Compare predicted and actual patterns and encode the difference (BaMI-SDR)
+        return EncodedData({}, EncodingRanges::MAX_VECTOR_SIZE);
+    }
+};
+
+class OptimizedSDR {
+public:
+    // Forward declaration of Pattern type
+    using Pattern = BrainInspiredSDR::Pattern;
+    
+    struct CompressedPosition {
+        uint8_t prefix;
+        uint16_t offset;
+    };
+    struct PatternPool {
+        std::unordered_map<Pattern, uint16_t> commonPatterns;
+    };
+    struct TemporalCache {
+        std::vector<Pattern> recentPatterns;
+    };
+};
+
+class BrainLikeCompression {
+public:
+    using EncodedData = SparseDistributedRepresentation::EncodedData;
+    
+    static constexpr float SPARSITY_TARGET = 0.02f; // 2% active neurons
+    void strengthenConnections(const EncodedData& pattern) {
+        // TODO: Apply Hebbian learning to fortify common connections (BaMI-SDR)
+    }
+    EncodedData predictiveEncode(const std::string& text) {
+        // TODO: Encode only unexpected information using predictive error (BaMI-SDR)
+        return EncodedData({}, EncodingRanges::MAX_VECTOR_SIZE);
+    }
+};
+
+#endif // CORTEXSDR_HPP

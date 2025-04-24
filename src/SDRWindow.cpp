@@ -2,7 +2,7 @@
 #include <QVBoxLayout>
 #include <QPushButton>
 
-SDRWindow::SDRWindow() : sdr() {
+SDRWindow::SDRWindow() : sdr({"hello", "world", "example"}) {
     setWindowTitle("SDR Text Encoder/Decoder");
     setupUI();
 }

@@ -1,17 +1,14 @@
-
 # Cortex SDR (Sparse Distributed Representation)
 
-A C++ implementation of Sparse Distributed Representations for efficient encoding and storage of various data types including text, numbers, dates, and special characters.
+A C++ firmware implementation that enables storage devices or computers to store data at a 5:1 ratio (5 MB in 1 MB space) while also providing powerful encoding and decoding capabilities for AI applications.
 
 ## Overview
 
-Cortex SDR is a library that implements a Sparse Distributed Representation system, encoding different types of data into binary vectors where only a small subset of bits are active. This approach provides several key benefits:
-
-- Efficient storage through sparse representation
-- Noise-resistant data encoding
-- Pattern matching capabilities
-- Semantic similarity preservation
-- Flexible combination of different data types
+Cortex SDR is a firmware that implements a Sparse Distributed Representation system. It encodes various data types into binary vectors with minimal active bits. This approach enables:
+- High-density data storage (achieving 5:1 compression)
+- Efficient encoding/decoding operations for AI and machine learning
+- Noise-resilient data representations
+- Advanced pattern matching and similarity detection
 
 ## Features
 
@@ -41,7 +38,7 @@ Cortex SDR is a library that implements a Sparse Distributed Representation syst
 - O(1) encoding/decoding for individual elements
 - O(n) for text strings where n is string length
 - Space complexity: O(k) where k is number of active bits
-- Typical compression ratios of 10:1 or better
+- Typical compression ratios of 5:1 attainable
 
 ## Usage
 
@@ -95,25 +92,33 @@ make
 
 ## Applications
 
-### 1. Natural Language Processing
+### 1. Data Storage & Firmware Compression
+- Store up to 5 MB of data in only 1 MB of physical space
+- Improve storage density in flash memory or other storage devices
+
+### 2. Artificial Intelligence
+- Use as a preprocessor for ML models with efficient feature encoding
+- Enable noise-robust pattern recognition and similarity detection
+
+### 3. Natural Language Processing
 - Text classification
 - Semantic similarity detection
 - Pattern matching in text
 - Efficient storage of large text corpora
 
-### 2. Time Series Data
+### 4. Time Series Data
 - Temporal pattern recognition
 - Anomaly detection
 - Event sequence matching
 - Time-based predictions
 
-### 3. Machine Learning
+### 5. Machine Learning
 - Feature encoding for ML models
 - Dimensionality reduction
 - Pattern recognition
 - Noise-resistant data representation
 
-### 4. Data Compression
+### 6. Data Compression
 - Efficient storage of mixed data types
 - Lossy compression with semantic preservation
 - Pattern-based data deduplication

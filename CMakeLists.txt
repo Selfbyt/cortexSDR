@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.10)
 project(cortexsdr VERSION 1.0.0 LANGUAGES CXX)
 
+# Find Qt packages
+find_package(Qt6 COMPONENTS Widgets REQUIRED)
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Enable Qt features
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
 
 # Library target
 add_library(${PROJECT_NAME}
@@ -14,6 +22,8 @@ add_library(${PROJECT_NAME}
     src/encoders/SpecialCharacterEncoding.cpp
     src/encoders/VideoEncoding.cpp
     src/encoders/WordEncoding.cpp
+    src/SDRWindow.cpp
+    src/cortexSDR.cpp
 )
 
 target_include_directories(${PROJECT_NAME}
@@ -22,6 +32,11 @@ target_include_directories(${PROJECT_NAME}
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(${PROJECT_NAME}
+    PRIVATE
+        Qt6::Widgets
 )
 
 # Test UI
