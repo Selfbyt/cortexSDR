@@ -86,6 +86,14 @@ std::string SparseDistributedRepresentation::decode() const
     return joinComponents(components);
 }
 
+void SparseDistributedRepresentation::setEncoding(const EncodedData& data) {
+    currentEncoding_ = data;
+    // Optionally, could also update the internal bitset if needed for other operations,
+    // but decode() primarily uses currentEncoding_.activePositions.
+    // resetEncodedVector();
+    // setIndices(data.activePositions);
+}
+
 void SparseDistributedRepresentation::printStats() const
 {
     double sparsity = calculateSparsity(currentEncoding_);

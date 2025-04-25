@@ -83,6 +83,10 @@ if(BUILD_DESKTOP)
     )
 endif()
 
+# CLI Tool executable
+add_executable(cortexsdr_cli src/cli_main.cpp)
+target_link_libraries(cortexsdr_cli PRIVATE ${PROJECT_NAME})
+
 # Test UI only for desktop build
 if(BUILD_DESKTOP)
     add_subdirectory(test)

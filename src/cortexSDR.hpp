@@ -68,6 +68,7 @@ public:
     EncodedData encodeText(const std::string& text);
     EncodedData encodeNumber(double number);
     std::string decode() const;
+    void setEncoding(const EncodedData& data); // Added for decompression
     void printStats() const;
 
 private:
