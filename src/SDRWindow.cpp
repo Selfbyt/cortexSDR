@@ -2,7 +2,7 @@
 #include <QVBoxLayout>
 #include <QPushButton>
 
-SDRWindow::SDRWindow() : sdr({"hello", "world", "example"}) {
+SDRWindow::SDRWindow() : sdr() { // Use default constructor for sdr
     setWindowTitle("SDR Text Encoder/Decoder");
     setupUI();
 }
@@ -56,4 +56,4 @@ void SDRWindow::encodeText() {
     // Update UI
     outputText->setText(QString::fromStdString(decoded) + "\n\n" + activePos);
     statsLabel->setText(stats);
-} 
+}

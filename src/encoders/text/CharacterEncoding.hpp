@@ -20,7 +20,9 @@ public:
         size_t contextWindowSize = 8;
         float compressionLevel = 0.8f;
         bool enablePrediction = true;
-        size_t maxPatternLength = 16;
+        size_t maxPatternLength;
+        EncodingConfig() : contextWindowSize(8), compressionLevel(0.8f), enablePrediction(true), maxPatternLength(16) {}
+
     };
 
     struct EncodingStats {

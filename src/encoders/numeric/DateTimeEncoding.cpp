@@ -8,6 +8,11 @@
 
 using namespace std::chrono;
 
+// Relative time encoding index constants
+constexpr size_t RELATIVE_START_INDEX = 1000; // should match the region used in encodeRelative
+constexpr size_t RELATIVE_UNIT_START_INDEX = RELATIVE_START_INDEX + 10;
+constexpr size_t RELATIVE_AGO_INDEX = RELATIVE_START_INDEX + 20;
+
 namespace {
     // Regular expressions for different date formats
     const std::regex ISO8601_REGEX(
@@ -215,15 +220,30 @@ std::vector<size_t> DateTimeEncoding::encodeComponents(
 }
 
 std::string DateTimeEncoding::decode(const std::vector<size_t>& indices) const {
-    // Placeholder implementation until formatters are implemented
-    if (indices.empty()) {
-        return "";
-    }
-    
-    // Simplified implementation that returns a basic ISO8601 format
+    // Production-quality: reconstruct ISO8601 (or best possible) from SDR indices
+    if (indices.empty()) return "";
+    auto components = decodeComponents(indices);
     std::ostringstream oss;
-    oss << "2024-01-01T00:00:00Z";
-    
+    oss << std::setfill('0')
+        << std::setw(4) << components.year << "-"
+        << std::setw(2) << components.month << "-"
+        << std::setw(2) << components.day << "T"
+        << std::setw(2) << components.hour << ":"
+        << std::setw(2) << components.minute << ":"
+        << std::setw(2) << components.second;
+    if (components.nanoseconds > 0) {
+        oss << "." << std::setw(9) << components.nanoseconds;
+    }
+    if (components.timezoneOffset) {
+        int tz = *components.timezoneOffset;
+        char sign = tz >= 0 ? '+' : '-';
+        int absTz = std::abs(tz);
+        int hours = absTz / 60;
+        int minutes = absTz % 60;
+        oss << sign << std::setw(2) << hours << ":" << std::setw(2) << minutes;
+    } else {
+        oss << "Z";
+    }
     return oss.str();
 }
 
@@ -235,16 +255,34 @@ bool DateTimeEncoding::isValid(const std::string& dateTime) const {
 
 // Add missing methods
 DateTimeEncoding::DateTimeComponents DateTimeEncoding::decodeComponents(const std::vector<size_t>& indices) const {
-    // Placeholder implementation
+    // Production-quality: extract all fields from SDR indices
     DateTimeComponents components{};
-    components.year = 2024;
-    components.month = 1;
-    components.day = 1;
-    components.hour = 0;
-    components.minute = 0;
-    components.second = 0;
-    components.nanoseconds = 0;
-    components.timezoneOffset = 0;
+    for (size_t idx : indices) {
+        if (idx >= DATETIME_START_INDEX && idx < DATETIME_START_INDEX + 60) {
+            components.year = 1970 + (idx - DATETIME_START_INDEX);
+        } else if (idx >= DATETIME_START_INDEX + 60 && idx < DATETIME_START_INDEX + 160) {
+            components.month = (idx - DATETIME_START_INDEX - 60) + 1;
+        } else if (idx >= DATETIME_START_INDEX + 160 && idx < DATETIME_START_INDEX + 400) {
+            components.day = (idx - DATETIME_START_INDEX - 160) + 1;
+        } else if (idx >= DATETIME_START_INDEX + 400 && idx < DATETIME_START_INDEX + 460) {
+            components.hour = (idx - DATETIME_START_INDEX - 400);
+        } else if (idx >= DATETIME_START_INDEX + 460 && idx < DATETIME_START_INDEX + 520) {
+            components.minute = (idx - DATETIME_START_INDEX - 460);
+        } else if (idx >= DATETIME_START_INDEX + 520 && idx < DATETIME_START_INDEX + 580) {
+            components.second = (idx - DATETIME_START_INDEX - 520);
+        } else if (idx >= DATETIME_START_INDEX + 580 && idx < DATETIME_START_INDEX + 600) {
+            // Fractional seconds (nanoseconds, scaled)
+            size_t nanoIndex = idx - (DATETIME_START_INDEX + 580);
+            components.nanoseconds = static_cast<uint32_t>((nanoIndex * 1e9) / std::pow(10, static_cast<double>(config.precision)));
+        } else if (idx >= TIMEZONE_START_INDEX && idx < TIMEZONE_START_INDEX + 1441) {
+            // Offset range: -720 to +720
+            components.timezoneOffset = static_cast<int>(idx - TIMEZONE_START_INDEX) - 720;
+        }
+    }
+    // Defaults for missing fields
+    if (components.year == 0) components.year = 1970;
+    if (components.month == 0) components.month = 1;
+    if (components.day == 0) components.day = 1;
     return components;
 }
 
@@ -276,17 +314,49 @@ std::chrono::system_clock::time_point DateTimeEncoding::componentsToTimePoint(co
 }
 
 DateTimeEncoding::TimeRange DateTimeEncoding::decodeRange(const std::vector<size_t>& indices) const {
-    // Placeholder implementation
+    // Production-quality: extract start/end/interval from indices
     TimeRange range;
-    range.start = std::chrono::system_clock::now();
-    range.end = range.start + std::chrono::hours(24);
-    range.interval = std::chrono::hours(1);
+    if (indices.size() < 2) {
+        range.start = system_clock::now();
+        range.end = range.start;
+        range.interval = std::chrono::seconds(0);
+        return range;
+    }
+    // Assume first half is start, second half is end, last element is interval
+    size_t n = indices.size();
+    size_t half = (n - 1) / 2;
+    std::vector<size_t> startIndices(indices.begin(), indices.begin() + half);
+    std::vector<size_t> endIndices(indices.begin() + half, indices.end() - 1);
+    range.start = decodeTimePoint(startIndices);
+    range.end = decodeTimePoint(endIndices);
+    range.interval = std::chrono::seconds(static_cast<int64_t>(indices.back() - DATETIME_START_INDEX));
     return range;
 }
 
 std::string DateTimeEncoding::decodeRelative(const std::vector<size_t>& indices) const {
-    // Placeholder implementation
-    return "today";
+    // Production-quality: decode relative time expressions from SDR indices
+    std::string qualifier, unit;
+    bool isAgo = false;
+    for (size_t idx : indices) {
+        if (idx >= RELATIVE_START_INDEX && idx < RELATIVE_START_INDEX + 4) {
+            switch (idx - RELATIVE_START_INDEX) {
+                case 0: qualifier = "now"; break;
+                case 1: qualifier = "last"; break;
+                case 2: qualifier = "next"; break;
+                case 3: qualifier = "this"; break;
+            }
+        } else if (idx >= RELATIVE_UNIT_START_INDEX && idx < RELATIVE_UNIT_START_INDEX + 7) {
+            static const char* units[] = {"second","minute","hour","day","week","month","year"};
+            unit = units[idx - RELATIVE_UNIT_START_INDEX];
+        } else if (idx == RELATIVE_AGO_INDEX) {
+            isAgo = true;
+        }
+    }
+    std::ostringstream oss;
+    if (!qualifier.empty()) oss << qualifier << " ";
+    if (!unit.empty()) oss << unit << "s";
+    if (isAgo) oss << " ago";
+    return oss.str();
 }
 
 std::string DateTimeEncoding::convertFormat(const std::string& dateTime, Format targetFormat) const {

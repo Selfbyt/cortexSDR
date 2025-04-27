@@ -1,11 +1,13 @@
 #include "cortexSDR.hpp"
 
-SparseDistributedRepresentation::SparseDistributedRepresentation(std::initializer_list<std::string> vocabulary)
-    : vocabulary_(vocabulary),
-    currentEncoding_({}, EncodingRanges::MAX_VECTOR_SIZE),
-    wordEncoder_(std::make_unique<WordEncoding>(vocabulary)),
+// Constructor no longer takes vocabulary
+SparseDistributedRepresentation::SparseDistributedRepresentation() 
+    : currentEncoding_({}, EncodingRanges::MAX_VECTOR_SIZE),
+    wordEncoder_(std::make_unique<WordEncoding>()),
     dateTimeEncoder_(std::make_unique<DateTimeEncoding>(DateTimeEncoding::EncodingConfig{})),
     specialCharEncoder_(std::make_unique<SpecialCharacterEncoding>()),
+    specialCharSDREncoder_(std::make_unique<SpecialCharEncodingAdapter>()),
+    geoEncoder_(std::make_unique<GeoEncodingAdapter>()),
     numberEncoder_(std::make_unique<NumberEncoding>(NumberEncoding::EncodingConfig{})),
     imageEncoder_(std::make_unique<ImageEncoding>()),
     videoEncoder_(std::make_unique<VideoEncoding>()),
@@ -35,16 +37,32 @@ SparseDistributedRepresentation::EncodedData SparseDistributedRepresentation::en
         {
         }
 
-        // Handle special characters
+        // Handle special characters (SDR region)
         if (token.length() == 1 && !std::isalnum(token[0])) {
-            auto specialCharIndices = specialCharEncoder_->encodeText(token);
+            auto specialCharIndices = specialCharSDREncoder_->encode(token);
+            // Offset indices to SDR region
+            for (auto& idx : specialCharIndices) idx += EncodingRanges::SPECIAL_CHAR_START;
             setIndices(specialCharIndices);
             continue;
         }
 
-        // Encode regular text using character-level encoding
-        auto charIndices = wordEncoder_->encodeWord(token);
-        setIndices(charIndices);
+        // Geo encoding: detect lat,lon pattern (basic)
+        if (token.find(",") != std::string::npos) {
+            size_t comma = token.find(",");
+            try {
+                double lat = std::stod(token.substr(0, comma));
+                double lon = std::stod(token.substr(comma + 1));
+                auto geoIndices = geoEncoder_->encode(lat, lon);
+                // Offset geo indices to a new region (e.g., 1800+)
+                for (auto& idx : geoIndices) idx += 1800;
+                setIndices(geoIndices);
+                continue;
+            } catch (...) {}
+        }
+
+        // Encode regular text using word encoding
+        auto wordIndices = wordEncoder_->encodeWord(token);
+        setIndices(wordIndices);
     }
 
     currentEncoding_ = getEncodedData();
@@ -75,12 +93,25 @@ std::string SparseDistributedRepresentation::decode() const
 
     if (!specialCharIndices.empty())
     {
-        components.push_back(specialCharEncoder_->decodeIndices(specialCharIndices));
+        // Remove SDR region offset for decoding
+        std::vector<size_t> adjIndices;
+        for (auto idx : specialCharIndices) adjIndices.push_back(idx - EncodingRanges::SPECIAL_CHAR_START);
+        components.push_back(specialCharSDREncoder_->decode(adjIndices));
     }
 
     if (!numberIndices.empty())
     {
         components.push_back(numberEncoder_->decodeIndices(numberIndices));
+    }
+
+    // Geo decoding: look for indices in geo region (1800+)
+    std::vector<size_t> geoIndices;
+    for (size_t idx : currentEncoding_.activePositions) {
+        if (idx >= 1800 && idx < 1800 + 100) geoIndices.push_back(idx - 1800);
+    }
+    if (!geoIndices.empty()) {
+        auto geo = geoEncoder_->decode(geoIndices);
+        components.push_back("geo:" + std::to_string(geo.first) + "," + std::to_string(geo.second));
     }
 
     return joinComponents(components);
@@ -111,19 +142,7 @@ void SparseDistributedRepresentation::printStats() const
     std::cout << "Memory usage: " << currentEncoding_.getMemorySize() << " bytes\n";
 }
 
-void SparseDistributedRepresentation::validateVocabularySize() const {
-    if (vocabulary_.size() > EncodingRanges::WORD_END - EncodingRanges::WORD_START + 1) {
-        throw std::runtime_error("Vocabulary size exceeds available word encoding range");
-    }
-}
-
-void SparseDistributedRepresentation::initializeWordMap() {
-    for (size_t i = 0; i < vocabulary_.size(); ++i) {
-        std::string word = vocabulary_[i];
-        std::transform(word.begin(), word.end(), word.begin(), ::tolower);
-        wordToIndex_[word] = i;
-    }
-}
+// Removed validateVocabularySize() and initializeWordMap() as they are no longer needed
 
 std::vector<std::string> SparseDistributedRepresentation::tokenizeText(const std::string& text) const {
     std::vector<std::string> tokens;
@@ -206,6 +225,21 @@ double SparseDistributedRepresentation::calculateSparsity(const EncodedData& dat
     return 100.0 * (1.0 - static_cast<double>(data.activePositions.size()) /
                               EncodingRanges::MAX_VECTOR_SIZE);
 }
+
+// --- Vocabulary Access Methods ---
+
+const std::vector<std::string>& SparseDistributedRepresentation::getWordVocabulary() const {
+    return wordEncoder_->getVocabulary();
+}
+
+// Removed getWordToIndexMap implementation
+
+void SparseDistributedRepresentation::setWordVocabulary(const std::vector<std::string>& vocab) { // Updated signature
+    wordEncoder_->setVocabulary(vocab); // Call updated WordEncoding method
+}
+
+// --- End Vocabulary Access Methods ---
+
 
 // These implementations are placeholders and not needed for basic functionality
 /*

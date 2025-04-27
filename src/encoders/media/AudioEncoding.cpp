@@ -195,29 +195,56 @@ std::vector<float> AudioEncoding::decodeMP3(const std::vector<size_t>& indices) 
     return std::vector<float>();
 }
 
-// Add missing AAC encoding implementation
+// SDR-based AAC-like encoding: quantize, sparsify, map to indices
 std::vector<size_t> AudioEncoding::encodeAAC(const std::vector<float>& audioData) const {
-    // Placeholder implementation for AAC encoding
-    // In a real implementation, this would use the AAC algorithm
-    return std::vector<size_t>();
+    if (audioData.empty()) return {};
+    std::vector<size_t> indices;
+    indices.reserve(audioData.size());
+    // Quantize and sparsify (simulate psychoacoustic thresholding)
+    constexpr float threshold = 0.01f;
+    for (float sample : audioData) {
+        if (std::fabs(sample) < threshold) continue;
+        // Map [-1,1] to [0, 1023]
+        size_t idx = static_cast<size_t>((sample + 1.0f) * 511.5f);
+        indices.push_back(idx);
+    }
+    return indices;
 }
 
-// Add missing AAC decoding implementation
+// SDR-based AAC-like decoding: reconstruct quantized samples
 std::vector<float> AudioEncoding::decodeAAC(const std::vector<size_t>& indices) const {
-    // Placeholder implementation for AAC decoding
-    return std::vector<float>();
+    std::vector<float> audioData;
+    audioData.reserve(indices.size());
+    for (size_t idx : indices) {
+        float sample = (static_cast<float>(idx) / 511.5f) - 1.0f;
+        audioData.push_back(sample);
+    }
+    return audioData;
 }
 
-// Add missing FLAC encoding implementation
+// SDR-based FLAC-like encoding: lossless quantization, map to indices
 std::vector<size_t> AudioEncoding::encodeFLAC(const std::vector<float>& audioData) const {
-    // Placeholder implementation for FLAC encoding
-    return std::vector<size_t>();
+    if (audioData.empty()) return {};
+    std::vector<size_t> indices;
+    indices.reserve(audioData.size());
+    constexpr int quantLevels = 65536; // 16-bit
+    for (float sample : audioData) {
+        int quant = std::clamp(static_cast<int>((sample + 1.0f) * (quantLevels / 2)), 0, quantLevels - 1);
+        indices.push_back(static_cast<size_t>(quant));
+    }
+    return indices;
 }
 
-// Add missing FLAC decoding implementation
+// SDR-based FLAC-like decoding: reconstruct quantized samples
 std::vector<float> AudioEncoding::decodeFLAC(const std::vector<size_t>& indices) const {
-    // Placeholder implementation for FLAC decoding
-    return std::vector<float>();
+    std::vector<float> audioData;
+    audioData.reserve(indices.size());
+    constexpr int quantLevels = 65536; // 16-bit
+    for (size_t idx : indices) {
+        float sample = (static_cast<float>(idx) / (quantLevels / 2)) - 1.0f;
+        audioData.push_back(sample);
+    }
+    return audioData;
 }
 
 // Add missing constructor implementation

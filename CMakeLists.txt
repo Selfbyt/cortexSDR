@@ -16,6 +16,8 @@ set(CORTEXSDR_VERSION "${CORTEXSDR_VERSION_MAJOR}.${CORTEXSDR_VERSION_MINOR}.${C
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Firmware specific settings
 if(BUILD_FIRMWARE)
@@ -43,13 +45,29 @@ endif()
 
 # Define source files
 set(COMMON_SOURCES
-    src/encoders/AudioEncoding.cpp
-    src/encoders/DateTimeEncoding.cpp
-    src/encoders/ImageEncoding.cpp
-    src/encoders/NumberEncoding.cpp
+    # Text encoders
+    src/encoders/text/WordEncoding.cpp
+    src/encoders/text/CharacterEncoding.cpp
+    src/encoders/text/SpecialCharEncoding.cpp
+    
+    # Numeric encoders
+    src/encoders/numeric/NumberEncoding.cpp
+    src/encoders/numeric/DateTimeEncoding.cpp
+    src/encoders/numeric/GeoEncoding.cpp
+    
+    # Media encoders
+    src/encoders/media/ImageEncoding.cpp
+    src/encoders/media/AudioEncoding.cpp
+    src/encoders/media/VideoEncoding.cpp
+    
+    # Adapters
+    src/encoders/adapters/SpecialCharEncodingAdapter.cpp
+    src/encoders/adapters/GeoEncodingAdapter.cpp
+    
+    # Special character encoder (legacy/compat)
     src/encoders/SpecialCharacterEncoding.cpp
-    src/encoders/VideoEncoding.cpp
-    src/encoders/WordEncoding.cpp
+    
+    # Core
     src/cortexSDR.cpp
 )
 

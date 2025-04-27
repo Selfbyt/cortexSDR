@@ -69,12 +69,7 @@ public:
     }
 };
 
-CharacterEncoding::CharacterEncoding() : pimpl(std::make_unique<Impl>()) {
-    size_t maxChars = static_cast<size_t>(std::pow(VALID_CHARS.length(), CHARS_PER_POSITION));
-    if (maxChars > std::numeric_limits<size_t>::max()) {
-        throw std::runtime_error("Character encoding configuration would exceed size_t capacity");
-    }
-}
+
 
 CharacterEncoding::~CharacterEncoding() = default;
 
@@ -96,9 +91,11 @@ std::vector<size_t> CharacterEncoding::encodeText(const std::string& text) const
             std::string_view chunk(text.data() + i, CHUNK_SIZE);
             auto it = pimpl->patternTable.find(chunk);
             if (it != pimpl->patternTable.end() && it->second > 1) {
-                encodedValue = encodePattern(chunk);
-                i += CHUNK_SIZE - 1;
-                patternEncoded = true;
+                // TODO: Implement pattern encoding (encodePattern)
+                // For now, skip pattern encoding and use fallback character encoding
+                // encodedValue = encodePattern(std::string(chunk));
+                // i += CHUNK_SIZE - 1;
+                // patternEncoded = true;
             }
         }
 
@@ -116,6 +113,17 @@ std::vector<size_t> CharacterEncoding::encodeText(const std::string& text) const
     }
 
     return encoded;
+}
+
+// TODO: Properly implement pattern index detection and decoding
+static bool isPatternIndex(size_t /*index*/) {
+    // Stub: No pattern indices encoded for now
+    return false;
+}
+
+static std::string decodePattern(size_t /*index*/) {
+    // Stub: No pattern decoding implemented
+    return "";
 }
 
 std::string CharacterEncoding::decodeIndices(const std::vector<size_t>& indices) const {

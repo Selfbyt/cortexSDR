@@ -8,15 +8,21 @@
 #include <memory>
 #include <algorithm>
 #include <unordered_map>
+#include <cstdint>
 
 // Include encoder headers instead of forward declarations
-#include "encoders/WordEncoding.hpp"
-#include "encoders/DateTimeEncoding.hpp"
+#include "encoders/text/WordEncoding.hpp"
+#include "encoders/numeric/DateTimeEncoding.hpp"
 #include "encoders/SpecialCharacterEncoding.hpp"
-#include "encoders/NumberEncoding.hpp"
-#include "encoders/ImageEncoding.hpp"
-#include "encoders/VideoEncoding.hpp"
-#include "encoders/AudioEncoding.hpp"
+#include "encoders/numeric/NumberEncoding.hpp"
+#include "encoders/media/ImageEncoding.hpp"
+#include "encoders/media/VideoEncoding.hpp"
+#include "encoders/media/AudioEncoding.hpp"
+#include "encoders/text/CharacterEncoding.hpp"
+#include "encoders/text/SpecialCharEncoding.hpp"
+#include "encoders/numeric/GeoEncoding.hpp"
+#include "encoders/adapters/SpecialCharEncodingAdapter.hpp"
+#include "encoders/adapters/GeoEncodingAdapter.hpp"
 
 // Define encoding ranges
 struct EncodingRanges {
@@ -25,6 +31,8 @@ struct EncodingRanges {
     static constexpr size_t SPECIAL_CHAR_START = 1000;
     static constexpr size_t SPECIAL_CHAR_END = 1499;
     static constexpr size_t NUMBER_START = 1500;
+    static constexpr size_t GEO_START = 1800;
+    static constexpr size_t GEO_END = 1899;
     static constexpr size_t NUMBER_END = 1999;
     static constexpr size_t MAX_VECTOR_SIZE = 2000;
 };
@@ -40,7 +48,8 @@ public:
             : activePositions(std::move(positions)), totalSize(size) {}
 
         size_t getMemorySize() const {
-            return activePositions.size() * sizeof(size_t) + sizeof(totalSize);
+            // On-disk SDR size: totalSize (size_t) + numActivePositions (uint32_t) + indices (uint16_t each)
+            return sizeof(totalSize) + sizeof(uint32_t) + activePositions.size() * sizeof(uint16_t);
         }
 
         EncodedData& operator|=(const EncodedData& other) {
@@ -64,32 +73,40 @@ public:
         }
     };
 
-    explicit SparseDistributedRepresentation(std::initializer_list<std::string> vocabulary);
+    SparseDistributedRepresentation(); // Updated constructor (removed explicit and vocabulary param)
     EncodedData encodeText(const std::string& text);
     EncodedData encodeNumber(double number);
     std::string decode() const;
     void setEncoding(const EncodedData& data); // Added for decompression
     void printStats() const;
 
+    // Methods to access word encoder's vocabulary state for serialization
+    const std::vector<std::string>& getWordVocabulary() const;
+    // Removed getWordToIndexMap as it's no longer needed
+    void setWordVocabulary(const std::vector<std::string>& vocab); // Updated signature
+    EncodedData getEncodedData() const; // Moved to public
+    const std::vector<EncodedData>& getTokenEncodings() const;
+
 private:
-    std::vector<std::string> vocabulary_;
-    std::unordered_map<std::string, size_t> wordToIndex_;
+    // Removed vocabulary_ and wordToIndex_ members
     EncodedData currentEncoding_;
     std::unique_ptr<WordEncoding> wordEncoder_;
     std::unique_ptr<DateTimeEncoding> dateTimeEncoder_;
     std::unique_ptr<SpecialCharacterEncoding> specialCharEncoder_;
+    std::unique_ptr<SpecialCharEncodingAdapter> specialCharSDREncoder_;
+    std::unique_ptr<GeoEncodingAdapter> geoEncoder_;
     std::unique_ptr<NumberEncoding> numberEncoder_;
     std::unique_ptr<ImageEncoding> imageEncoder_;
     std::unique_ptr<VideoEncoding> videoEncoder_;
     std::unique_ptr<AudioEncoding> audioEncoder_;
     std::bitset<EncodingRanges::MAX_VECTOR_SIZE> encodedVector_;
+    std::vector<EncodedData> tokenEncodings_;
 
-    void validateVocabularySize() const;
-    void initializeWordMap();
+    // Removed validateVocabularySize() and initializeWordMap() declarations
     std::vector<std::string> tokenizeText(const std::string& text) const;
     void resetEncodedVector();
     void setIndices(const std::vector<size_t>& indices);
-    EncodedData getEncodedData() const;
+    // Removed getEncodedData() declaration from private section
 
     struct SeparatedIndices {
         std::vector<size_t> wordIndices;

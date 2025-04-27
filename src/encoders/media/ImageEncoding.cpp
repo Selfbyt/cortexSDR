@@ -48,29 +48,27 @@ std::vector<size_t> ImageEncoding::encodeImage(
     if (!isValidPath(imagePath)) {
         throw ImageEncodingError("Invalid image path: " + imagePath);
     }
-
     std::vector<unsigned char> imageData = readImageFile(imagePath);
     if (imageData.empty()) {
         throw ImageEncodingError("Failed to read image file: " + imagePath);
     }
-
     if (!pimpl->checkFileHeader(imageData)) {
         throw ImageEncodingError("Invalid image format or corrupted file: " + imagePath);
     }
 
     std::vector<size_t> encoded;
-    encoded.reserve(imageData.size() / sizeof(size_t) + 1);
-
-    // Basic encoding: Convert bytes to size_t values
-    // In a real implementation, you'd want more sophisticated encoding
-    for (size_t i = 0; i < imageData.size(); i += sizeof(size_t)) {
-        size_t value = 0;
-        for (size_t j = 0; j < sizeof(size_t) && i + j < imageData.size(); ++j) {
-            value |= static_cast<size_t>(imageData[i + j]) << (j * 8);
-        }
-        encoded.push_back(value);
+    // --- SDR-inspired encoding: quantize, sparsify, and map to indices ---
+    // For demonstration, quantize each byte to a smaller set (e.g., 16 levels), sparsify by skipping zeros
+    constexpr unsigned char quantLevels = 16;
+    for (size_t i = 0; i < imageData.size(); ++i) {
+        unsigned char quantized = static_cast<unsigned char>((imageData[i] * quantLevels) / 256);
+        if (quantized == 0) continue; // sparsify: skip zeros
+        // Map (position, quantized value) to a unique index
+        size_t idx = i * quantLevels + quantized;
+        encoded.push_back(idx);
     }
-
+    // Store image size as the first index for decoding
+    encoded.insert(encoded.begin(), imageData.size());
     return encoded;
 }
 
@@ -82,18 +80,22 @@ void ImageEncoding::decodeIndices(
     if (!isValidPath(outputPath)) {
         throw ImageEncodingError("Invalid output path: " + outputPath);
     }
-
-    std::vector<unsigned char> decoded;
-    decoded.reserve(indices.size() * sizeof(size_t));
-
-    // Basic decoding: Convert size_t values back to bytes
-    // In a real implementation, you'd want more sophisticated decoding
-    for (size_t value : indices) {
-        for (size_t i = 0; i < sizeof(size_t); ++i) {
-            decoded.push_back(static_cast<unsigned char>((value >> (i * 8)) & 0xFF));
-        }
+    if (indices.empty()) {
+        throw ImageEncodingError("No indices to decode");
     }
-
+    // First index is image size
+    size_t imageSize = indices[0];
+    std::vector<unsigned char> decoded(imageSize, 0);
+    constexpr unsigned char quantLevels = 16;
+    // Each index after the first encodes (position, quantized value)
+    for (size_t k = 1; k < indices.size(); ++k) {
+        size_t idx = indices[k];
+        size_t pos = idx / quantLevels;
+        unsigned char quantized = static_cast<unsigned char>(idx % quantLevels);
+        // Dequantize
+        unsigned char value = static_cast<unsigned char>((quantized * 256) / quantLevels);
+        if (pos < decoded.size()) decoded[pos] = value;
+    }
     writeImageFile(outputPath, decoded);
 }
 
