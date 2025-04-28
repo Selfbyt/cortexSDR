@@ -12,7 +12,6 @@ SOURCES += \
     encoders/DateTimeEncoding.cpp \
     encoders/ImageEncoding.cpp \
     encoders/NumberEncoding.cpp \
-    encoders/SpecialCharacterEncoding.cpp \
     encoders/VideoEncoding.cpp \
     encoders/WordEncoding.cpp
 
@@ -22,7 +21,6 @@ HEADERS += \
     encoders/DateTimeEncoding.hpp \
     encoders/ImageEncoding.hpp \
     encoders/NumberEncoding.hpp \
-    encoders/SpecialCharacterEncoding.hpp \
     encoders/VideoEncoding.hpp \
     encoders/WordEncoding.hpp \
     encoders/CharacterEncoding.hpp

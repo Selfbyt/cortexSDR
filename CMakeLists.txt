@@ -63,12 +63,9 @@ set(COMMON_SOURCES
     # Adapters
     src/encoders/adapters/SpecialCharEncodingAdapter.cpp
     src/encoders/adapters/GeoEncodingAdapter.cpp
-    
-    # Special character encoder (legacy/compat)
-    src/encoders/SpecialCharacterEncoding.cpp
-    
     # Core
     src/cortexSDR.cpp
+    src/rle.cpp
 )
 
 # Add UI sources only for desktop build
@@ -102,11 +99,12 @@ if(BUILD_DESKTOP)
 endif()
 
 # CLI Tool executable
+find_package(ZLIB REQUIRED)
 add_executable(cortexsdr_cli src/cli_main.cpp)
-target_link_libraries(cortexsdr_cli PRIVATE ${PROJECT_NAME})
+target_link_libraries(cortexsdr_cli PRIVATE ${PROJECT_NAME} ZLIB::ZLIB)
 
-# Test UI only for desktop build
-if(BUILD_DESKTOP)
+# Add tests unless building for firmware (which might have different constraints)
+if(NOT BUILD_FIRMWARE)
     add_subdirectory(test)
 endif()
 
@@ -171,8 +169,8 @@ if(BUILD_LIBRARY)
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
     
-    # Install headers
-    install(DIRECTORY src/
+    # Install headers (from include/ directory for public API)
+    install(DIRECTORY include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${PROJECT_NAME}
         FILES_MATCHING PATTERN "*.hpp"
     )

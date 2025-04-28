@@ -13,13 +13,12 @@
 // Include encoder headers instead of forward declarations
 #include "encoders/text/WordEncoding.hpp"
 #include "encoders/numeric/DateTimeEncoding.hpp"
-#include "encoders/SpecialCharacterEncoding.hpp"
 #include "encoders/numeric/NumberEncoding.hpp"
 #include "encoders/media/ImageEncoding.hpp"
 #include "encoders/media/VideoEncoding.hpp"
 #include "encoders/media/AudioEncoding.hpp"
 #include "encoders/text/CharacterEncoding.hpp"
-#include "encoders/text/SpecialCharEncoding.hpp"
+#include "encoders/text/SpecialCharEncoding.hpp" // Correct path confirmed by file listing
 #include "encoders/numeric/GeoEncoding.hpp"
 #include "encoders/adapters/SpecialCharEncodingAdapter.hpp"
 #include "encoders/adapters/GeoEncodingAdapter.hpp"
@@ -27,17 +26,23 @@
 // Define encoding ranges
 struct EncodingRanges {
     static constexpr size_t WORD_START = 0;
-    static constexpr size_t WORD_END = 999;
-    static constexpr size_t SPECIAL_CHAR_START = 1000;
-    static constexpr size_t SPECIAL_CHAR_END = 1499;
-    static constexpr size_t NUMBER_START = 1500;
-    static constexpr size_t GEO_START = 1800;
-    static constexpr size_t GEO_END = 1899;
-    static constexpr size_t NUMBER_END = 1999;
-    static constexpr size_t MAX_VECTOR_SIZE = 2000;
+    static constexpr size_t WORD_END = 9999;
+    static constexpr size_t SPECIAL_CHAR_START = 10000;
+    static constexpr size_t SPECIAL_CHAR_END = 14999;
+    static constexpr size_t NUMBER_START = 15000;
+    static constexpr size_t GEO_START = 18000;
+    static constexpr size_t GEO_END = 18999;
+    static constexpr size_t NUMBER_END = 19999;
+    static constexpr size_t MAX_VECTOR_SIZE = 20000;
 };
 
 class SparseDistributedRepresentation {
+public:
+    // Sparsity: fraction of active bits (0.0–1.0)
+    void setSparsity(double sparsity);
+    double getSparsity() const;
+public:
+
 public:
     struct EncodedData {
         std::vector<size_t> activePositions;
@@ -76,9 +81,14 @@ public:
     SparseDistributedRepresentation(); // Updated constructor (removed explicit and vocabulary param)
     EncodedData encodeText(const std::string& text);
     EncodedData encodeNumber(double number);
+    EncodedData encodeImage(const std::string& imagePath);
     std::string decode() const;
+    std::string decodeImage() const;
     void setEncoding(const EncodedData& data); // Added for decompression
     void printStats() const;
+    
+    // Method to check if the encoded data is an image
+    bool isImageData() const;
 
     // Methods to access word encoder's vocabulary state for serialization
     const std::vector<std::string>& getWordVocabulary() const;
@@ -88,12 +98,11 @@ public:
     const std::vector<EncodedData>& getTokenEncodings() const;
 
 private:
-    // Removed vocabulary_ and wordToIndex_ members
     EncodedData currentEncoding_;
+    double sparsity_ = 0.002; // Default 0.2% active bits (very sparse for high compression)
+
     std::unique_ptr<WordEncoding> wordEncoder_;
     std::unique_ptr<DateTimeEncoding> dateTimeEncoder_;
-    std::unique_ptr<SpecialCharacterEncoding> specialCharEncoder_;
-    std::unique_ptr<SpecialCharEncodingAdapter> specialCharSDREncoder_;
     std::unique_ptr<GeoEncodingAdapter> geoEncoder_;
     std::unique_ptr<NumberEncoding> numberEncoder_;
     std::unique_ptr<ImageEncoding> imageEncoder_;

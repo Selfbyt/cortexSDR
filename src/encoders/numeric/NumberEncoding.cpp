@@ -7,6 +7,7 @@
 #include <stdexcept> // Added for exceptions
 #include <memory>    // Added for std::make_unique
 #include <limits>   // Added for numeric_limits
+#include <iostream> // Added for debug output
 
 // BucketStats struct is now defined in the header file
 
@@ -86,6 +87,9 @@ std::vector<size_t> NumberEncoding::encodeNumber(double number) const {
         // }
     }
 
+    // Added debug statements to log numeric values during encoding and decoding.
+    std::cout << "Encoding number: " << number << std::endl;
+
     return encoded;
 }
 
@@ -156,7 +160,12 @@ double NumberEncoding::decodeExact(const std::vector<size_t>& indices) const {
     */
 
     // Return bucket midpoint for standard precision
-    return (bucketStart + bucketEnd) / 2.0;
+    double value = (bucketStart + bucketEnd) / 2.0;
+
+    // Added debug statement to log decoded value
+    std::cout << "Decoded value: " << value << std::endl;
+
+    return value;
 }
 
 std::pair<double, double> NumberEncoding::decodeRange(const std::vector<size_t>& indices) const {

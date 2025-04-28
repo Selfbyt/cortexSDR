@@ -45,7 +45,6 @@ add_library(${PROJECT_NAME}
     src/encoders/DateTimeEncoding.cpp
     src/encoders/ImageEncoding.cpp
     src/encoders/NumberEncoding.cpp
-    src/encoders/SpecialCharacterEncoding.cpp
     src/encoders/VideoEncoding.cpp
     src/encoders/WordEncoding.cpp
 )
