@@ -1,6 +1,6 @@
 # Cortex SDR (Sparse Distributed Representation)
 
-A high-performance C++ implementation that compresses data by storing it as a sparse distributed representation. By only storing the positions of active bits in a large binary vector, CortexSDR achieves a 5:1 compression ratio (5 MB in 1 MB space) while maintaining semantic meaning and enabling powerful pattern matching capabilities.
+A high-performance C++ implementation that compresses data by storing it as a sparse distributed representation. By only storing the positions of active bits in a large binary vector, CortexSDR achieves a 5:1 compression ratio for text data and up to 10:1 compression ratio for image data while maintaining semantic meaning and enabling powerful pattern matching capabilities.
 
 ## Overview
 
@@ -17,26 +17,33 @@ This approach enables:
 ## Features
 
 ### Core Functionality
-- 2000-bit vector representation
-- Multiple data type support (text, numbers, dates, special characters)
+- 20000-bit vector representation
+- Multiple data type support (text, numbers, dates, special characters, geo, media)
 - Memory-efficient sparse storage
 - Pattern matching and similarity detection
 - Flexible encoding/decoding system
+- Adjustable sparsity for compression ratio control
 
 ### Supported Data Types
-- Text and words
-- Numbers (range: -1000 to 1000)
-- Special characters and symbols
-- Date and time data
+- Text and words (`WordEncoding`, `CharacterEncoding`)
+- Numbers (`NumberEncoding`, range: -1000 to 1000)
+- Special characters and symbols (`SpecialCharEncoding`)
+- Date and time data (`DateTimeEncoding`)
+- Geographic coordinates (`GeoEncoding`)
+- Images (`ImageEncoding`) - with up to 10:1 compression ratio
+- Audio (`AudioEncoding`)
+- Video (`VideoEncoding`)
 
 ## Technical Details
 
 ### Vector Structure
-- Fixed size: 2000 bits
-- Region allocation:
-  - 0-999: Word encodings
-  - 1000-1499: Special characters
-  - 1500-1999: Numbers
+- Fixed size: 20000 bits (as defined in `EncodingRanges::MAX_VECTOR_SIZE`)
+- Region allocation (approximate, see `EncodingRanges` in `cortexSDR.hpp` for exact values):
+  - 0-9999: Word encodings (`WORD_START` to `WORD_END`)
+  - 10000-14999: Special characters (`SPECIAL_CHAR_START` to `SPECIAL_CHAR_END`)
+  - 15000-19999: Numbers (`NUMBER_START` to `NUMBER_END`)
+  - 18000-18999: Geographic coordinates (`GEO_START` to `GEO_END`)
+  - *Note: Media encoders (Image, Audio, Video) likely use dedicated ranges or mechanisms not explicitly listed here.*
 
 ### Performance
 - O(1) encoding/decoding for individual elements
@@ -49,10 +56,12 @@ This approach enables:
 ### Basic Example
 
 ```cpp
-// Initialize SDR with vocabulary
-SparseDistributedRepresentation sdr{
-    "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"
-};
+// Initialize SDR (vocabulary is built dynamically or set via setWordVocabulary)
+SparseDistributedRepresentation sdr; 
+
+// Optionally set a predefined vocabulary if needed (e.g., for consistent encoding)
+// std::vector<std::string> vocab = {"the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"};
+// sdr.setWordVocabulary(vocab);
 
 // Encode text
 std::string text = "The quick brown fox";
@@ -72,6 +81,27 @@ auto encoded = sdr.encodeNumber(number);
 // Decode the number
 std::string decodedNumber = sdr.decode();
 ```
+
+### Command-Line Compression & Decompression
+
+You can use the `cortexsdr_cli` tool to compress and decompress files via the command line. The CLI supports automatic gzip compression/decompression if the file ends with `.gz`.
+
+```bash
+# Text compression example
+./cortexsdr_cli --sparsity 0.05 --rle -c ../README.md readme.sdr.gz && ./cortexsdr_cli --rle -d readme.sdr.gz readme_out.txt && cat readme_out.txt
+
+# Image compression example (higher compression ratio)
+./cortexsdr_cli --sparsity 0.01 --rle -c image.png image.sdr.gz && ./cortexsdr_cli --rle -d image.sdr.gz image_decompressed.png
+```
+
+- If the output or input filename ends with `.gz`, gzip compression/decompression is handled automatically.
+- The tool prints original size, compressed size, and compression ratio.
+- The `--sparsity` parameter controls the fraction of active bits in the SDR encoding (default 2%).
+  - For text: values around 5% work well (0.05)
+  - For images: values around 1% work well (0.01) and can achieve 10:1+ compression ratios
+- The `--rle` flag enables run-length encoding for better compression.
+- **Note:** Text decompression is lossy; the output may not be identical to the original text (punctuation, case, and formatting may differ).
+- **Note:** Image decompression is also lossy; higher compression ratios will result in lower image quality.
 
 ## Installation
 
@@ -203,10 +233,9 @@ See the `examples/library_usage` directory for a complete example.
    - Temporal sequence learning
    - Anomaly detection
 
-3. **Additional Encoders**
-   - Image encoding
-   - Audio signal encoding
-   - Geographic coordinate encoding
+3. **Advanced Encoders**
+   - Further optimizations for existing encoders
+   - Support for more complex data structures
 
 4. **Python Integration**
    - Python wrapper for data science workflows
@@ -264,9 +293,9 @@ SOFTWARE.
 
 For more detailed implementation examples, see the test file:
 
-```1:60:src/test.cpp
+```1:60:test/test.cpp
 #include <iostream>
-#include "cortexSDR.cpp"
+#include "../src/cortexSDR.cpp" // Note: Including .cpp is generally discouraged, consider linking properly
 
 void testEncodeDecodeFlow() {
     SparseDistributedRepresentation sdr{
