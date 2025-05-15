@@ -1,0 +1,29 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Add the exported targets
+include("${CMAKE_CURRENT_LIST_DIR}/cortexsdrTargets.cmake")
+
+# Check if we need Qt for this configuration
+if(NOT DEFINED CORTEXSDR_USE_QT)
+  set(CORTEXSDR_USE_QT @BUILD_DESKTOP@)
+endif()
+
+# Find dependencies based on configuration
+if(CORTEXSDR_USE_QT)
+  find_dependency(Qt6 COMPONENTS Widgets)
+endif()
+
+# Define the component configuration
+set(cortexsdr_FOUND TRUE)
+set(cortexsdr_VERSION @CORTEXSDR_VERSION@)
+set(cortexsdr_LIBRARIES cortexsdr::cortexsdr)
+set(cortexsdr_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/include/cortexsdr")
+
+# Log configuration
+if(NOT cortexsdr_FIND_QUIETLY)
+  message(STATUS "Found cortexsdr: ${cortexsdr_VERSION}")
+  message(STATUS "  Library: ${cortexsdr_LIBRARIES}")
+  message(STATUS "  Include: ${cortexsdr_INCLUDE_DIRS}")
+endif()

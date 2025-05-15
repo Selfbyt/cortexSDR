@@ -1,0 +1,26 @@
+build/
+.vscode/
+.idea/
+*.o
+moc_*
+*.pro.user
+*.user
+.DS_Store
+
+# Compressed files
+*.zip
+*.tar.gz
+*.tgz
+*.tar
+*.gz
+
+# ONNX model files
+*.onnx
+
+# Library directories (to be downloaded by users)
+libtensorflow/
+libtorch/
+onnxruntime/
+*.sdr
+*.png
+test/build/
