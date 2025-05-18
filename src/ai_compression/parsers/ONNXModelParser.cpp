@@ -3,7 +3,8 @@
 #include <regex>
 #include <algorithm>
 #include <cstring>
-#include <iostream>
+#include <iostream> // For potential debug output
+#include <iomanip> // For std::setw, std::setfill
 #include <sstream> // For string stream serialization
 #include <fstream> // For file reading
 #include <unordered_set> // For initializer check
@@ -343,18 +344,85 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
     // Process graph structure
     const auto& graph_proto = model_proto.graph();
     
-    // Create a segment for graph structure
+    // Create a segment for the entire model structure (not just graph)
     ModelSegment graph_segment;
-    graph_segment.name = "graph_structure";
+    graph_segment.name = "model_structure";
     graph_segment.type = SegmentType::GRAPH_STRUCTURE_PROTO;
     
-    // Serialize the graph structure
-    std::string serialized_data;
-    if (!graph_proto.SerializeToString(&serialized_data)) {
-        throw std::runtime_error("Failed to serialize graph structure");
+    // Serialize the model structure using SerializeToString
+    // Make sure we have a valid model with all required fields set
+    if (!model_proto.has_ir_version()) {
+        model_proto.set_ir_version(onnx::Version::IR_VERSION);
     }
     
-    std::cout << "Successfully serialized graph structure: " << serialized_data.size() << " bytes" << std::endl;
+    if (!model_proto.has_producer_name() && !model_proto.producer_name().empty()) {
+        model_proto.set_producer_name("CortexSDR");
+    }
+    
+    // Make sure the graph has a name if it doesn't already
+    if (model_proto.has_graph() && !model_proto.graph().has_name()) {
+        model_proto.mutable_graph()->set_name("main_graph");
+    }
+    
+    // Add opset import if missing
+    if (model_proto.opset_import_size() == 0) {
+        auto* opset = model_proto.add_opset_import();
+        opset->set_domain("");
+        opset->set_version(12); // Use a stable opset version
+    }
+    
+    // Now serialize the model
+    std::string serialized_data;
+    if (!model_proto.SerializeToString(&serialized_data)) {
+        throw std::runtime_error("Failed to serialize model structure");
+    }
+    
+    // If serialization produced an empty string or all zeros, fall back to reading the original file
+    bool all_zeros = true;
+    for (char c : serialized_data) {
+        if (c != '\0') {
+            all_zeros = false;
+            break;
+        }
+    }
+    
+    if (serialized_data.empty() || all_zeros) {
+        std::cerr << "Warning: SerializeToString produced empty or all-zero data, falling back to original file" << std::endl;
+        // Read the original file as a fallback
+        std::ifstream serialization_file(modelPath, std::ios::binary);
+        if (!serialization_file) {
+            throw std::runtime_error("Failed to open model file for serialization: " + modelPath);
+        }
+        
+        serialization_file.seekg(0, std::ios::end);
+        size_t file_size = serialization_file.tellg();
+        serialization_file.seekg(0, std::ios::beg);
+        
+        serialized_data.resize(file_size);
+        if (!serialization_file.read(&serialized_data[0], file_size)) {
+            throw std::runtime_error("Failed to read model file: " + modelPath);
+        }
+    }
+    
+    // Add debug information about the serialized data
+    std::cout << "Successfully serialized model structure: " << serialized_data.size() << " bytes" << std::endl;
+    std::cout << "Model IR Version: " << model_proto.ir_version() << std::endl;
+    std::cout << "Model has graph: " << (model_proto.has_graph() ? "yes" : "no") << std::endl;
+    if (model_proto.has_graph()) {
+        const auto& graph = model_proto.graph();
+        std::cout << "  Graph name: " << (graph.has_name() ? graph.name() : "<unnamed>") << std::endl;
+        std::cout << "  Inputs: " << graph.input_size() << std::endl;
+        std::cout << "  Outputs: " << graph.output_size() << std::endl;
+        std::cout << "  Nodes: " << graph.node_size() << std::endl;
+        std::cout << "  Initializers: " << graph.initializer_size() << std::endl;
+    }
+    
+    // Print first few bytes of serialized data for debugging
+    std::cout << "  First 16 bytes of serialized data: ";
+    for (size_t i = 0; i < std::min(size_t(16), serialized_data.size()); i++) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)serialized_data[i] << " ";
+    }
+    std::cout << std::dec << std::endl;
     
     // Create the segment with the serialized data
     graph_segment.data.assign(
@@ -422,6 +490,7 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
     throw std::runtime_error("ONNX model support is disabled. Please enable ENABLE_ONNX_PROTOBUF to use this feature.");
 #endif
 }
+
 
 std::vector<ModelSegment> ONNXModelParser::parseWithChunking(const std::string& modelPath) const {
     // For simplicity, just call the regular parse method
