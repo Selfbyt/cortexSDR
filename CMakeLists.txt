@@ -74,6 +74,8 @@ set(COMMON_SOURCES
     src/ai_compression/strategies/GzipStrategy.cpp
     src/ai_compression/strategies/NumericalRLE.cpp
     src/ai_compression/strategies/SDRIndexStorage.cpp
+    src/ai_compression/strategies/MetadataSDRStrategy.cpp
+    src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
     src/ai_compression/streaming/StreamingCompressor.cpp
     src/ai_compression/parsers/GGUFModelParser.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp

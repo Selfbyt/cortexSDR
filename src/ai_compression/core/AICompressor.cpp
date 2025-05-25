@@ -190,15 +190,101 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
     stats_.compressionRatio = stats_.originalSize > 0 ? static_cast<double>(stats_.originalSize) / stats_.compressedSize : 0.0;
 }
 
-// New: Helper for parallel compression of segments
+// Helper for sequential compression of a single segment
+std::pair<CompressedSegmentHeader, std::vector<std::byte>>
+AICompressor::compressSegment(const ModelSegment& segment) const {
+    CompressedSegmentHeader header;
+    header.name = segment.name;
+    header.original_type = segment.type;
+    header.original_size = segment.original_size;
+    header.tensor_metadata = segment.tensor_metadata;
+    header.layer_name = segment.layer_name;
+    header.layer_index = segment.layer_index;
+
+    const auto* strategies = selectStrategies(segment.type);
+    std::vector<std::byte> compressedData;
+    bool compressionSuccessful = false;
+    uint8_t winningStrategyId = 0;
+
+    if (strategies && !strategies->empty()) {
+        for (const auto& stratInfo : *strategies) {
+            try {
+                compressedData = stratInfo.strategy->compress(segment);
+                winningStrategyId = stratInfo.id;
+                compressionSuccessful = true;
+                // Log success
+                std::cerr << "Success: Segment '" << segment.name << "', Strategy ID " 
+                          << static_cast<int>(stratInfo.id) << std::endl;
+                break;
+            } catch (const CompressionError& e) {
+                // Log failure 
+                std::cerr << "Warning: Segment '" << segment.name << "', Strategy ID " 
+                          << static_cast<int>(stratInfo.id) << " failed: " << e.what() << std::endl;
+            }
+        }
+    }
+
+    if (!compressionSuccessful) {
+        std::cerr << "Warning: All strategies failed for segment '" << segment.name 
+                  << "'. Storing uncompressed." << std::endl;
+        winningStrategyId = 0; // Mark as uncompressed
+        compressedData = segment.data; // Store original data
+    }
+
+    header.compression_strategy_id = winningStrategyId;
+    header.compressed_size = compressedData.size();
+    return std::make_pair(header, std::move(compressedData));
+}
+
+// New: Helper for memory-efficient parallel compression of segments
 std::vector<std::pair<CompressedSegmentHeader, std::vector<std::byte>>> 
 AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments) const {
-    std::vector<std::future<std::pair<CompressedSegmentHeader, std::vector<std::byte>>>> futures;
     std::vector<std::pair<CompressedSegmentHeader, std::vector<std::byte>>> results;
     
-    // Launch compression tasks
+    // Sort segments by size - process smallest segments first to reduce memory footprint
+    std::vector<std::reference_wrapper<const ModelSegment>> sortedSegments;
     for (const auto& segment : segments) {
-        futures.push_back(std::async(std::launch::async, [this, &segment]() {
+        sortedSegments.push_back(std::ref(segment));
+    }
+    
+    std::sort(sortedSegments.begin(), sortedSegments.end(), 
+              [](const ModelSegment& a, const ModelSegment& b) {
+                  return a.data.size() < b.data.size();
+              });
+    
+    // Define size thresholds for different processing approaches
+    const size_t LARGE_SEGMENT_THRESHOLD = 100 * 1024 * 1024; // 100MB
+    const size_t MAX_BATCH_SIZE = 5; // Max segments to process in parallel
+    
+    // 1. Process large segments sequentially to avoid OOM
+    std::vector<std::reference_wrapper<const ModelSegment>> regularSegments;
+    
+    for (const auto& segmentRef : sortedSegments) {
+        const ModelSegment& segment = segmentRef.get();
+        
+        if (segment.data.size() >= LARGE_SEGMENT_THRESHOLD) {
+            std::cerr << "Processing large segment '" << segment.name << "' sequentially (" 
+                      << (segment.data.size() / (1024 * 1024)) << " MB)" << std::endl;
+            
+            // Process large segment sequentially
+            auto result = compressSegment(segment);
+            results.push_back(std::move(result));
+        } else {
+            regularSegments.push_back(segmentRef);
+        }
+    }
+    
+    // 2. Process remaining segments in batches to control memory usage
+    for (size_t i = 0; i < regularSegments.size(); i += MAX_BATCH_SIZE) {
+        size_t batchEnd = std::min(i + MAX_BATCH_SIZE, regularSegments.size());
+        std::vector<std::future<std::pair<CompressedSegmentHeader, std::vector<std::byte>>>> batchFutures;
+        
+        // Launch batch of compression tasks
+        for (size_t j = i; j < batchEnd; j++) {
+            const ModelSegment& segment = regularSegments[j].get();
+            batchFutures.push_back(std::async(std::launch::async, 
+                [this, &segment]() {
+
             CompressedSegmentHeader header;
             header.name = segment.name;
             header.original_type = segment.type;
@@ -240,11 +326,15 @@ AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments
         }));
     }
 
-    // Collect results
-    for (auto& future : futures) {
-        results.push_back(future.get());
-    }
-
+            // Collect batch results
+            for (auto& future : batchFutures) {
+                results.push_back(future.get());
+            }
+            
+            // Force cleanup of batch futures
+            batchFutures.clear();
+        }
+    
     return results;
 }
 

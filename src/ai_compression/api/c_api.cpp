@@ -5,6 +5,8 @@
 #include "../strategies/GzipStrategy.hpp"
 #include "../strategies/NumericalRLE.hpp"
 #include "../strategies/QuantizedTensorStrategy.hpp"
+#include "../strategies/MetadataSDRStrategy.hpp"
+#include "../strategies/AdaptiveSDRStrategy.hpp"
 #include "../parsers/ONNXModelParser.hpp"
 #include "../parsers/GGUFModelParser.hpp"
 #include "../utils/ModelConverter.hpp"
@@ -123,20 +125,27 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         const uint8_t GZIP_STRATEGY_ID = 3;
         const uint8_t QUANT_STRATEGY_ID = 4;
 
-        // First register Gzip for graph structure and metadata with highest priority
+        // Create compression strategies
         auto gzipStrategy = std::make_shared<GzipStrategy>(options->compression_level);
-        ai_compressor->registerStrategy(SegmentType::METADATA_JSON, 1, GZIP_STRATEGY_ID, gzipStrategy);
-        ai_compressor->registerStrategy(SegmentType::GRAPH_STRUCTURE_PROTO, 1, GZIP_STRATEGY_ID, gzipStrategy);
-
-        // Then register other strategies for weight tensors
-            if (options->use_delta_encoding) {
-                auto sdrStrategy = std::make_shared<SDRIndexStorageStrategy>();
-                sdrStrategy->setSparsity(options->sparsity);
-            ai_compressor->registerStrategy(SegmentType::SPARSE_INDICES, 2, SDR_STRATEGY_ID, sdrStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 2, SDR_STRATEGY_ID, sdrStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP16, 2, SDR_STRATEGY_ID, sdrStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT8, 2, SDR_STRATEGY_ID, sdrStrategy);
-            }
+        
+        // Create our size-adaptive SDR strategy that addresses size expansion issues with small models
+        // while maintaining the SDR-based encoding framework for all model components
+        // This strategy automatically uses direct storage for very small segments
+        // Uses the --sparsity parameter passed via CLI for SDR encoding of larger segments
+        auto adaptiveStrategy = std::make_shared<AdaptiveSDRStrategy>(options->sparsity);
+        
+        // Register for all segment types with highest priority
+        // Metadata and graph structure
+        ai_compressor->registerStrategy(SegmentType::METADATA_JSON, 1, SDR_STRATEGY_ID, adaptiveStrategy);
+        ai_compressor->registerStrategy(SegmentType::GRAPH_STRUCTURE_PROTO, 1, SDR_STRATEGY_ID, adaptiveStrategy);
+        
+        // Tensor data segments
+        if (options->use_delta_encoding) {
+            ai_compressor->registerStrategy(SegmentType::SPARSE_INDICES, 2, SDR_STRATEGY_ID, adaptiveStrategy);
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 2, SDR_STRATEGY_ID, adaptiveStrategy);
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP16, 2, SDR_STRATEGY_ID, adaptiveStrategy);
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT8, 2, SDR_STRATEGY_ID, adaptiveStrategy);
+        }
 
             if (options->use_rle) {
                 auto rleStrategy = std::make_shared<NumericalRLEStrategy>();
@@ -232,10 +241,26 @@ CortexError cortex_decompressor_create(const char* compressed_path,
         const uint8_t RLE_STRATEGY_ID = 2;
         const uint8_t GZIP_STRATEGY_ID = 3;
         const uint8_t QUANT_STRATEGY_ID = 4;
+        
+        // Create strategies for different segment types
+        // Use the size-adaptive SDR strategy for all segment types
+        // This ensures consistent handling of both compressed and decompressed data
+        auto adaptiveStrategy = std::make_shared<AdaptiveSDRStrategy>(sparsity);
+        
+        // Register the adaptive strategy for SDR-encoded segments
+        ai_decompressor->registerStrategy(SDR_STRATEGY_ID, adaptiveStrategy);
+        
+        // For backwards compatibility with files compressed using the old strategies
+        auto metadataStrategy = std::make_shared<MetadataSDRStrategy>(sparsity);
         auto sdrStrategy = std::make_shared<SDRIndexStorageStrategy>();
         sdrStrategy->setSparsity(sparsity);
-        ai_decompressor->registerStrategy(SDR_STRATEGY_ID, sdrStrategy);
+        ai_decompressor->registerStrategy(SDR_STRATEGY_ID + 10, sdrStrategy); // Legacy standard SDR strategy
+        
+        // Register RLE strategy for numerical data
         ai_decompressor->registerStrategy(RLE_STRATEGY_ID, std::make_shared<NumericalRLEStrategy>());
+        
+        // Keep Gzip strategy for backward compatibility with older archives
+        // This will be phased out as we fully transition to SDR-based compression
         ai_decompressor->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
 #ifdef ENABLE_QUANTIZATION
         ai_decompressor->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());

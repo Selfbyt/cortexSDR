@@ -6,11 +6,18 @@
 #include "ModelSegment.hpp"
 #include <string>
 #include <vector>
-#include <memory> // For std::unique_ptr, std::shared_ptr
-#include <ostream> // For writing to output stream
-#include <map>     // For mapping segment types to strategies
-#include <list>    // For storing multiple strategies per type
-#include <future>  // For async compression
+#include <memory>
+#include <ostream>
+#include <map>
+#include <list>
+#include <future>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <google/protobuf/io/coded_stream.h>
+#include <fstream>
 
 namespace CortexAICompression {
 
@@ -20,17 +27,19 @@ struct CompressionStats {
     size_t compressedSize = 0;
     double compressionRatio = 0.0;
     double compressionTimeMs = 0.0;
+    size_t numSegments = 0;
+    size_t numCompressedSegments = 0;
 };
 
 // Represents the compressed archive format structure
 struct CompressedSegmentHeader {
     SegmentType original_type;
-    uint8_t compression_strategy_id; // ID mapping to the strategy used
+    uint8_t compression_strategy_id;
     uint64_t original_size;
     uint64_t compressed_size;
     std::string name;
-    std::optional<TensorMetadata> tensor_metadata; // Added tensor metadata
-    std::string layer_name;                       // Added layer info
+    std::optional<TensorMetadata> tensor_metadata;
+    std::string layer_name;
     size_t layer_index;
 };
 
@@ -39,6 +48,93 @@ class ICompressionHandler {
 public:
     virtual ~ICompressionHandler() = default;
     virtual void handleCompressedSegment(const CompressedSegmentHeader& header, const std::vector<std::byte>& compressedData) = 0;
+};
+
+// Thread pool for parallel processing
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t numThreads) : stop(false) {
+        for(size_t i = 0; i < numThreads; ++i) {
+            workers.emplace_back([this] {
+                while(true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] { 
+                            return this->stop || !this->tasks.empty(); 
+                        });
+                        if(this->stop && this->tasks.empty()) {
+                            return;
+                        }
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if(stop) {
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            }
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(std::thread &worker: workers) {
+            worker.join();
+        }
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+};
+
+// Buffer pool for efficient memory management
+class BufferPool {
+public:
+    explicit BufferPool(size_t maxBuffers = 100) : maxBuffers(maxBuffers) {}
+
+    std::vector<std::byte> acquire(size_t size) {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto it = std::find_if(buffers.begin(), buffers.end(),
+            [size](const auto& buf) { return buf.size() >= size; });
+        
+        if (it != buffers.end()) {
+            auto buffer = std::move(*it);
+            buffers.erase(it);
+            return buffer;
+        }
+        return std::vector<std::byte>(size);
+    }
+
+    void release(std::vector<std::byte>&& buffer) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (buffers.size() < maxBuffers) {
+            buffers.push_back(std::move(buffer));
+        }
+    }
+
+private:
+    std::vector<std::vector<std::byte>> buffers;
+    std::mutex mutex;
+    size_t maxBuffers;
 };
 
 class AICompressor {
@@ -84,6 +180,8 @@ private:
     uint8_t defaultStrategyId_;
     size_t numThreads_ = 1;  // Default to single-threaded
     CompressionStats stats_; // Store compression statistics
+    std::unique_ptr<ThreadPool> threadPool_;
+    std::unique_ptr<BufferPool> bufferPool_;
 
     // Helper to select the list of appropriate strategies for a segment, ordered by priority
     const std::list<StrategyInfo>* selectStrategies(SegmentType type) const;
@@ -94,9 +192,22 @@ private:
     // Helper to write a single compressed segment (header + data)
     void writeSegment(std::ostream& stream, const CompressedSegmentHeader& header, const std::vector<std::byte>& compressedData);
 
-    // New: Helper for parallel compression of segments
+    // Helper for sequential compression of a single segment
+    std::pair<CompressedSegmentHeader, std::vector<std::byte>>
+    compressSegment(const ModelSegment& segment) const;
+    
+    // Helper for memory-efficient parallel compression of segments
     std::vector<std::pair<CompressedSegmentHeader, std::vector<std::byte>>> 
     compressSegmentsParallel(const std::vector<ModelSegment>& segments) const;
+
+    // New optimized methods
+    std::vector<std::byte> compressSegmentWithBuffer(const ModelSegment& segment, const std::list<StrategyInfo>& strategies);
+    void writeCompressedDataOptimized(std::ostream& stream, const std::vector<std::byte>& data);
+    uint8_t selectBestStrategy(const ModelSegment& segment, const std::list<StrategyInfo>& strategies);
+    
+    // ONNX parsing helpers
+    void parseONNXModelStreaming(const std::string& modelPath, ICompressionHandler& handler);
+    std::vector<ModelSegment> parseONNXModelParallel(const std::string& modelPath, size_t numThreads);
 };
 
 } // namespace CortexAICompression
