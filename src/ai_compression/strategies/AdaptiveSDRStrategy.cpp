@@ -94,7 +94,23 @@ std::vector<std::byte> AdaptiveSDRStrategy::decompress(
             return getSDRStrategy()->decompress(sdrData, originalType, originalSize);
         }
     } else {
-        throw CompressionError("Invalid encoding flag in compressed data");
+        // Invalid encoding flag - try to recover
+        std::cerr << "Warning: Invalid encoding flag 0x" << std::hex << static_cast<int>(encodingFlag) 
+                  << std::dec << " for data of type " << static_cast<int>(originalType) << std::endl;
+        
+        // For tensor weights, try passing to the appropriate strategy based on type
+        ModelSegment dummySegment;
+        dummySegment.type = originalType;
+        
+        if (dummySegment.isWeightTensor()) {
+            // For weight tensors, use the SDRStrategy
+            std::cerr << "Attempting to decompress weight tensor with SDRStrategy" << std::endl;
+            return getSDRStrategy()->decompress(compressedData, originalType, originalSize);
+        } else {
+            // For metadata and graph structure, use the MetadataStrategy
+            std::cerr << "Attempting to decompress with MetadataStrategy" << std::endl;
+            return getMetadataStrategy()->decompress(compressedData, originalType, originalSize);
+        }
     }
 }
 

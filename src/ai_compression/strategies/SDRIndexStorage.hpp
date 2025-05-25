@@ -41,6 +41,13 @@ private:
     // Varint Helpers (Static)
     static void encodeVarint(std::vector<std::byte>& buffer, size_t value);
     static size_t decodeVarint(const std::vector<std::byte>& buffer, size_t& offset);
+    
+    // Specialized tensor decoders for various formats
+    std::vector<std::byte> decodeFormat88Tensor(const std::vector<std::byte>& compressedData, size_t originalSize) const;
+    std::vector<std::byte> decodeFormat0xD0Tensor(const std::vector<std::byte>& compressedData, size_t originalSize) const;
+    std::vector<std::byte> decodeFormat0x90Tensor(const std::vector<std::byte>& compressedData, size_t originalSize) const;
+    std::vector<std::byte> decodeFormatBiasTensor(const std::vector<std::byte>& compressedData, size_t originalSize, uint8_t formatFlag) const;
+    std::vector<std::byte> createTensorWithPattern(size_t originalSize, const std::vector<std::byte>& sourceData) const;
 };
 
 } // namespace CortexAICompression
