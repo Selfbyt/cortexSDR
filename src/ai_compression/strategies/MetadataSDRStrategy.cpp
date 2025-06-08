@@ -39,50 +39,71 @@ std::vector<std::byte> MetadataSDRStrategy::compress(const ModelSegment& segment
     }
     
     try {
-        std::vector<size_t> indices;
-        std::vector<std::byte> compressedOutput;
-        
-        // Process graph structure using the current sparsity setting
-        // For large models, log memory usage information
         if (segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
-            // For binary protobuf data, we need to ensure exact byte-level preservation
-            // Treat each byte as a separate entity and encode with higher fidelity
-            if (segment.data.size() > 50 * 1024 * 1024) { // Only chunk for very large models (>50MB)
-                // Chunk large data into smaller pieces for memory-efficient processing
-                const size_t chunkSize = 1024 * 1024; // 1 MB chunks
-                size_t offset = 0;
-                std::cerr << "  Processing large graph in " << (segment.data.size() / chunkSize) + 1 << " chunks" << std::endl;
-                
-                while (offset < segment.data.size()) {
-                    size_t chunkLength = std::min(chunkSize, segment.data.size() - offset);
-                    std::vector<std::byte> chunk(segment.data.begin() + offset, segment.data.begin() + offset + chunkLength);
-                    std::vector<size_t> chunkIndices = encodeBinaryData(chunk);
-                    indices.insert(indices.end(), chunkIndices.begin(), chunkIndices.end());
-                    offset += chunkLength;
-                    
-                    // Progress reporting
-                    if (offset % (10 * chunkSize) == 0 || offset >= segment.data.size()) {
-                        std::cerr << "  Processed " << offset / (1024 * 1024) << "MB/" 
-                                  << segment.data.size() / (1024 * 1024) << "MB" << std::endl;
-                    }
-                }
-            } else {
-                // For smaller graph structures, process all at once
-                indices = encodeBinaryData(segment.data);
+            std::vector<std::byte> compressedOutput;
+            // Mode flag for direct storage
+            compressedOutput.push_back(static_cast<std::byte>(2));
+
+            // Store original data size
+            size_t dataSize = segment.data.size();
+            for (size_t i = 0; i < sizeof(size_t); i++) {
+                compressedOutput.push_back(static_cast<std::byte>((dataSize >> (i * 8)) & 0xFF));
             }
+
+            // Append the actual segment data
+            compressedOutput.insert(compressedOutput.end(), segment.data.begin(), segment.data.end());
             
-            // Store a flag indicating this is binary data (not string)
-            compressedOutput.push_back(static_cast<std::byte>(1)); // 1 = binary mode
-        } else {
+            std::cerr << "  Compressed GRAPH_STRUCTURE_PROTO using direct storage. Original size: " << dataSize
+                      << " bytes, Stored size: " << compressedOutput.size() << " bytes\n";
+            return compressedOutput;
+
+        } else if (segment.type == SegmentType::METADATA_JSON) {
+            std::vector<size_t> indices;
+            std::vector<std::byte> compressedOutput;
             // For metadata, convert to string and use string encoding
             std::string metadataStr(reinterpret_cast<const char*>(segment.data.data()), segment.data.size());
             indices = encodeString(metadataStr);
             
             // Store a flag indicating this is string data
             compressedOutput.push_back(static_cast<std::byte>(0)); // 0 = string mode
+
+            std::cerr << "  Encoded to " << indices.size() << " active bits for METADATA_JSON\n";
+
+            // Store SDR width
+            for (size_t i = 0; i < sizeof(size_t); i++) {
+                compressedOutput.push_back(static_cast<std::byte>((sdrWidth_ >> (i * 8)) & 0xFF));
+            }
+
+            // Store number of indices
+            size_t numIndices = indices.size();
+            for (size_t i = 0; i < sizeof(size_t); i++) {
+                compressedOutput.push_back(static_cast<std::byte>((numIndices >> (i * 8)) & 0xFF));
+            }
+
+            // Store indices using varint encoding
+            for (size_t index : indices) {
+                // Simple varint encoding
+                while (index >= 0x80) {
+                    compressedOutput.push_back(static_cast<std::byte>((index & 0x7F) | 0x80));
+                    index >>= 7;
+                }
+                compressedOutput.push_back(static_cast<std::byte>(index));
+            }
+
+            // Store original data length for verification
+            size_t dataLength = segment.data.size();
+            for (size_t i = 0; i < sizeof(size_t); i++) {
+                compressedOutput.push_back(static_cast<std::byte>((dataLength >> (i * 8)) & 0xFF));
+            }
+            return compressedOutput;
+        } else {
+            // This case should ideally be caught by the initial check, but as a fallback:
+             throw CompressionError("MetadataSDRStrategy received an unsupported segment type during configured processing paths.");
         }
         
-        std::cerr << "  Encoded to " << indices.size() << " active bits\n";
+        // The following lines are now part of the METADATA_JSON block or GRAPH_STRUCTURE_PROTO direct return
+        // Keeping the structure for the diff tool, but they are effectively moved.
+        // std::cerr << "  Encoded to " << indices.size() << " active bits\n";
         
         // Store SDR width
         for (size_t i = 0; i < sizeof(size_t); i++) {
@@ -105,32 +126,33 @@ std::vector<std::byte> MetadataSDRStrategy::compress(const ModelSegment& segment
             compressedOutput.push_back(static_cast<std::byte>(index));
         }
         
-        // Store original data length for verification
-        size_t dataLength = segment.data.size();
-        for (size_t i = 0; i < sizeof(size_t); i++) {
-            compressedOutput.push_back(static_cast<std::byte>((dataLength >> (i * 8)) & 0xFF));
-        }
-        
-        // For binary data, store a checksum for verification
-        if (segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
-            // Simple checksum - sum of all bytes
-            uint32_t checksum = 0;
-            for (const auto& b : segment.data) {
-                checksum += static_cast<uint8_t>(b);
-            }
-            
-            // Store checksum
-            for (size_t i = 0; i < sizeof(uint32_t); i++) {
-                compressedOutput.push_back(static_cast<std::byte>((checksum >> (i * 8)) & 0xFF));
-            }
-        }
-        
-        std::cerr << "  Compressed from " << segment.data.size() 
-                  << " bytes to " << compressedOutput.size() << " bytes (" 
-                  << (compressedOutput.size() * 100.0 / segment.data.size()) 
-                  << "% of original)\n";
-        
-        return compressedOutput;
+        // Store original data length for verification (This logic is now within the METADATA_JSON path)
+        // size_t dataLength = segment.data.size();
+        // for (size_t i = 0; i < sizeof(size_t); i++) {
+        //     compressedOutput.push_back(static_cast<std::byte>((dataLength >> (i * 8)) & 0xFF));
+        // }
+
+        // For binary data, store a checksum for verification (This logic is removed for GRAPH_STRUCTURE_PROTO as it's direct storage)
+        // if (segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
+        //     // Simple checksum - sum of all bytes
+        //     uint32_t checksum = 0;
+        //     for (const auto& b : segment.data) {
+        //         checksum += static_cast<uint8_t>(b);
+        //     }
+        //
+        //     // Store checksum
+        //     for (size_t i = 0; i < sizeof(uint32_t); i++) {
+        //         compressedOutput.push_back(static_cast<std::byte>((checksum >> (i * 8)) & 0xFF));
+        //     }
+        // }
+
+        // General logging and return are now per-path
+        // std::cerr << "  Compressed from " << segment.data.size()
+        //           << " bytes to " << compressedOutput.size() << " bytes ("
+        //           << (compressedOutput.size() * 100.0 / segment.data.size())
+        //           << "% of original)\n";
+
+        // return compressedOutput; // Returns are now specific to each path.
     } catch (const std::exception& e) {
         throw CompressionError(std::string("Failed to compress: ") + e.what());
     }
@@ -150,9 +172,18 @@ std::vector<std::byte> MetadataSDRStrategy::decompress(
         std::cerr << "Decompressing " << (originalType == SegmentType::METADATA_JSON ? "metadata" : "graph structure") 
                   << " with reversible SDR decoding\n";
         
+        size_t offset = 0;
+        // Read encoding mode (0 = string, 1 = binary, 2 = direct storage)
+        // In case of corrupted data, be more forgiving with the mode flag
+        if (compressedData.empty()) { // Check before accessing compressedData[0]
+            throw CompressionError("Empty compressed data");
+        }
+        uint8_t modeFlag = static_cast<uint8_t>(compressedData[offset++]);
+
         // EMERGENCY HANDLER: For graph structure specifically, which is known to have issues
-        if (originalType == SegmentType::GRAPH_STRUCTURE_PROTO) {
-            std::cerr << "NOTICE: Using special handling for graph structure data" << std::endl;
+        // This should only apply if NOT using direct storage mode 2
+        if (originalType == SegmentType::GRAPH_STRUCTURE_PROTO && modeFlag != 2) {
+            std::cerr << "NOTICE: Using special handling for graph structure data (modeFlag != 2)" << std::endl;
             
             // Create a minimal valid empty protobuf for graph structure
             // This allows the model to load even if graph structure is corrupted
@@ -181,14 +212,9 @@ std::vector<std::byte> MetadataSDRStrategy::decompress(
             throw CompressionError("Empty compressed data");
         }
         
-        // Extract header information
-        size_t offset = 0;
-        
-        // Read encoding mode (0 = string, 1 = binary, 2 = direct storage)
-        // In case of corrupted data, be more forgiving with the mode flag
-        uint8_t modeFlag = static_cast<uint8_t>(compressedData[offset++]);
         
         // For tensor weight data, be more forgiving - we've seen invalid flags in the wild
+        // This check needs to happen after modeFlag is read.
         ModelSegment dummySegment;
         dummySegment.type = originalType;
         if (dummySegment.isWeightTensor() && modeFlag > 2) {
@@ -197,53 +223,49 @@ std::vector<std::byte> MetadataSDRStrategy::decompress(
             modeFlag = 1; // Assume binary mode for tensor data with invalid flags
         }
         
-        bool isBinaryMode = modeFlag == 1;
-        bool isDirectStorage = modeFlag == 2;
-        
-        // For completely corrupted tensor segments, try to reconstruct based on name pattern
-        if (modeFlag > 2) {
-            // If the segment name contains common tensor weight patterns, treat as binary
-            // This is a special fallback for specific GPT-2 model segments that we know are problematic
-            if (originalType == SegmentType::WEIGHTS_FP32 || 
-                (originalSize > 0 && 
-                 (originalSize % 4 == 0 || originalSize % 2 == 0))) { // Likely a tensor with fp32/fp16 values
-                
-                std::cerr << "  Special handling for weight tensor with invalid flag value: " 
-                          << static_cast<int>(modeFlag) << std::endl;
-                
-                // Create tensor filled with zeros as a last resort
-                return std::vector<std::byte>(originalSize, std::byte(0));
-            }
-            
-            std::cerr << "  Warning: Invalid encoding flag " << static_cast<int>(modeFlag) 
-                      << ". Creating default zero-filled data of size " << originalSize << std::endl;
-            // Create default zero-filled data of the original size
-            return std::vector<std::byte>(originalSize, std::byte(0));
-        }
-        
-        // Handle direct storage mode first - simplest case
-        if (isDirectStorage) {
-            std::cerr << "  Using direct storage mode for large binary data" << std::endl;
+        bool isBinaryMode = (modeFlag == 1); // Ensure this is correctly scoped if modified
+        // bool isDirectStorage = modeFlag == 2; // This will be handled by the new modeFlag == 2 block
+
+        // Handle direct storage mode first (modeFlag == 2)
+        if (modeFlag == 2) {
+            bool isDirectStorage = true; // Set explicitly for this block
+            std::cerr << "  Using direct storage mode for " << (originalType == SegmentType::GRAPH_STRUCTURE_PROTO ? "graph structure" : "binary data") << std::endl;
             
             // Validate we have enough data for size
             if (offset + sizeof(size_t) > compressedData.size()) {
-                throw CompressionError("Truncated direct storage data");
+                throw CompressionError("Truncated direct storage data (size field)");
             }
             
             // Read original data size
             size_t storedDataSize = 0;
             for (size_t i = 0; i < sizeof(size_t); i++) {
+                if (offset >= compressedData.size()) { // Bounds check during loop
+                    throw CompressionError("Truncated direct storage data (during size read)");
+                }
                 storedDataSize |= static_cast<size_t>(compressedData[offset++]) << (i * 8);
             }
             
             // Validate size
             if (storedDataSize > 1024*1024*1024) { // Sanity check: max 1GB
-                throw CompressionError("Invalid direct storage size: " + std::to_string(storedDataSize));
+                throw CompressionError("Invalid direct storage size (too large): " + std::to_string(storedDataSize));
             }
-            
-            // Validate we have enough data
+            // Additional validation against originalSize if provided
+            if (originalSize != 0 && storedDataSize != originalSize) {
+                 std::cerr << "  Warning: Direct storage data size (" << storedDataSize
+                           << ") differs from expected original size (" << originalSize
+                           << "). Using stored size." << std::endl;
+                 // Depending on policy, could throw an error or prefer originalSize.
+                 // For now, we trust storedDataSize but log a warning.
+            }
+            if (storedDataSize == 0 && originalSize != 0) { // If stored size is 0 but original isn't, could be an issue
+                 std::cerr << "  Warning: Direct storage data size is 0, but original size was " << originalSize
+                           << ". Proceeding with stored size." << std::endl;
+            }
+
+
+            // Validate we have enough data for the content itself
             if (offset + storedDataSize > compressedData.size()) {
-                throw CompressionError("Truncated direct storage data");
+                throw CompressionError("Truncated direct storage data (content): expected " + std::to_string(storedDataSize) + " bytes, but only " + std::to_string(compressedData.size() - offset) + " available");
             }
             
             // Extract the stored data directly
@@ -255,8 +277,34 @@ std::vector<std::byte> MetadataSDRStrategy::decompress(
             std::cerr << "  Successfully extracted " << decompressedData.size() << " bytes directly" << std::endl;
             return decompressedData;
         }
+
+        // Fallthrough for modeFlag 0 or 1, or other invalid flags handled below
+        bool isDirectStorage = false; // Explicitly false if not mode 2
+
+        // For completely corrupted tensor segments, try to reconstruct based on name pattern (handles modeFlag > 2)
+        if (modeFlag > 2) { // This check should come after modeFlag == 2 is handled
+            // If the segment name contains common tensor weight patterns, treat as binary
+            // This is a special fallback for specific GPT-2 model segments that we know are problematic
+            if (originalType == SegmentType::WEIGHTS_FP32 ||
+                (originalSize > 0 &&
+                 (originalSize % 4 == 0 || originalSize % 2 == 0))) { // Likely a tensor with fp32/fp16 values
+
+                std::cerr << "  Special handling for weight tensor with invalid flag value: "
+                          << static_cast<int>(modeFlag) << std::endl;
+
+                // Create tensor filled with zeros as a last resort
+                return std::vector<std::byte>(originalSize, std::byte(0));
+            }
+
+            std::cerr << "  Warning: Invalid encoding flag " << static_cast<int>(modeFlag)
+                      << ". Creating default zero-filled data of size " << originalSize << std::endl;
+            // Create default zero-filled data of the original size
+            return std::vector<std::byte>(originalSize, std::byte(0));
+        }
+
         
-        // For SDR-encoded data, continue with normal processing
+        // For SDR-encoded data (modeFlag 0 or 1), continue with normal processing
+        // The 'isDirectStorage' variable is already false if we reach here.
         // Read SDR width
         if (offset + sizeof(size_t) > compressedData.size()) {
             throw CompressionError("Truncated SDR width data");
