@@ -82,6 +82,7 @@ set(COMMON_SOURCES
     src/ai_compression/utils/ModelConverter.cpp
     src/ai_compression/api/c_api.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
+    src/ai_compression/SparseInferenceEngine.cpp
 )
 
 # Add UI sources only for desktop build
@@ -94,6 +95,7 @@ endif()
 # Find required packages
 find_package(ZLIB REQUIRED)
 find_package(Protobuf REQUIRED) # Protobuf is often a dependency for ONNX
+find_package(nlohmann_json REQUIRED)
 
 # Optional model format support
 option(ENABLE_GGUF "Enable GGUF model support" ON)

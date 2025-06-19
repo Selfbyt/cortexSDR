@@ -1,13 +1,16 @@
 #include "ai_compression/api/c_api.hpp"
+#include "ai_compression/SparseInferenceEngine.hpp"
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <vector>
+#include <fstream>
 
 void printUsage(const char* programName) {
     std::cout << "CortexSDR AI Model Compression CLI\n";
     std::cout << "Usage:\n";
     std::cout << "  " << programName << " -c <model_path> <format> <output_path> [sparsity]   (Compress)\n";
-    std::cout << "  " << programName << " -d <compressed_path> <output_path> [sparsity]      (Decompress)\n";
+    std::cout << "  " << programName << " -i <archive_path> <input_indices_file>              (Inference)\n";
     std::cout << "\nSupported formats:\n";
     std::cout << "  - onnx: ONNX models\n";
     std::cout << "  - tensorflow: TensorFlow models (will be converted to ONNX)\n";
@@ -18,8 +21,20 @@ void printUsage(const char* programName) {
     std::cout << "\nExamples:\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr 0.01\n";
-    std::cout << "  " << programName << " -d compressed_model.sdr decompressed_model.onnx\n";
-    std::cout << "  " << programName << " -d compressed_model.sdr decompressed_model.onnx 0.01\n";
+    std::cout << "  " << programName << " -i compressed_model.sdr input_indices.txt\n";
+}
+
+std::vector<size_t> loadInputIndices(const char* input_path) {
+    std::vector<size_t> indices;
+    std::ifstream file(input_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open input indices file");
+    }
+    size_t idx;
+    while (file >> idx) {
+        indices.push_back(idx);
+    }
+    return indices;
 }
 
 int main(int argc, char** argv) {
@@ -111,56 +126,37 @@ int main(int argc, char** argv) {
         cortex_compressor_free(compressor);
         std::cout << "Compression complete.\n";
 
-    } else if (mode == "-d") {
-        // Decompression mode
+    } else if (mode == "-i") {
+        // Inference mode
         if (argc < 4) {
-            std::cerr << "Error: Decompression mode requires at least 2 arguments.\n";
+            std::cerr << "Error: Inference mode requires 2 arguments.\n";
             printUsage(argv[0]);
             return 1;
         }
+        const char* archive_path = argv[2];
+        const char* input_path = argv[3];
 
-        const char* compressed_path = argv[2];
-        const char* output_path = argv[3];
-        float sparsity = 0.02f; // Default sparsity (2%)
-
-        // Check if sparsity is provided
-        if (argc > 4) {
-            try {
-                sparsity = std::stof(argv[4]);
-                if (sparsity <= 0.0f || sparsity >= 1.0f) {
-                    std::cerr << "Error: Sparsity must be between 0 and 1.\n";
-                    return 1;
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "Error: Invalid sparsity value.\n";
-                return 1;
+        try {
+            // Load input indices from file
+            std::vector<size_t> input_indices = loadInputIndices(input_path);
+            
+            // Load model and run inference
+            std::cout << "Loading compressed model from: " << archive_path << "\n";
+            CortexAICompression::SDRModelLoader loader(archive_path);
+            CortexAICompression::SDRInferenceEngine engine(loader);
+            
+            std::cout << "Running inference with " << input_indices.size() << " input indices...\n";
+            auto output_indices = engine.run(input_indices);
+            
+            std::cout << "Inference complete. Output active indices: ";
+            for (auto idx : output_indices) {
+                std::cout << idx << " ";
             }
-        }
-
-        // Create decompressor
-        std::cout << "Decompressing model from: " << compressed_path << " to: " << output_path << "\n";
-        std::cout << "Using sparsity: " << sparsity << " (" << (sparsity * 100) << "%)\n";
-        CortexDecompressorHandle decompressor;
-        CortexError error = cortex_decompressor_create(compressed_path, &decompressor, sparsity);
-        if (error.code != 0) {
-            std::cerr << "Error creating decompressor: " << error.message << " (code: " << error.code << ")\n";
-            cortex_error_free(&error);
+            std::cout << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error during inference: " << e.what() << std::endl;
             return 1;
         }
-
-        // Decompress - Pass both compressed_path and output_path
-        error = cortex_decompressor_decompress(decompressor, compressed_path, output_path);
-        if (error.code != 0) {
-            std::cerr << "Error decompressing model: " << error.message << " (code: " << error.code << ")\n";
-            cortex_error_free(&error);
-            cortex_decompressor_free(decompressor);
-            return 1;
-        }
-
-        // Free the decompressor
-        cortex_decompressor_free(decompressor);
-        std::cout << "Decompression complete.\n";
-
     } else {
         std::cerr << "Error: Invalid mode '" << mode << "'.\n";
         printUsage(argv[0]);

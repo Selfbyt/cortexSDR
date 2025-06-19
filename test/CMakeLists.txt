@@ -1,19 +1,28 @@
-# Qt is already found in the parent CMakeLists.txt
+# Find GTest package
+find_package(GTest REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
-# Enable Qt features (these should be inherited from parent, but adding for clarity)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
-
-add_executable(sdr_test
-    test.cpp # Updated path
+# Add test executable
+add_executable(test_compressed_inference
+    test_compressed_inference.cpp
 )
 
-target_link_libraries(sdr_test
+# Add include directories
+target_include_directories(test_compressed_inference
     PRIVATE
-        cortexsdr
-        Qt6::Widgets
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/include
 )
 
-# Added src directory to include paths for the test target.
-target_include_directories(sdr_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# Link against our library and GTest
+target_link_libraries(test_compressed_inference
+    PRIVATE
+    cortexsdr
+    nlohmann_json::nlohmann_json
+    ${GTEST_LIBRARIES}
+    ${GTEST_MAIN_LIBRARIES}
+    pthread
+)
+
+# Add test to CTest
+add_test(NAME test_compressed_inference COMMAND test_compressed_inference)

@@ -361,108 +361,83 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
     structMetadata.sparsity_ratio = 0.1f; // Higher sparsity (10%) for model structure
     graph_segment.tensor_metadata = structMetadata;
     
-    // Serialize the model structure using SerializeToString
-    // Make sure we have a valid model with all required fields set
-    if (!model_proto.has_ir_version()) {
-        model_proto.set_ir_version(onnx::Version::IR_VERSION);
+    // Create a new ModelProto with minimal required fields
+    onnx::ModelProto minimal_model;
+    minimal_model.set_ir_version(model_proto.ir_version());
+    minimal_model.set_producer_name(model_proto.producer_name());
+    minimal_model.set_producer_version(model_proto.producer_version());
+    minimal_model.set_domain(model_proto.domain());
+    minimal_model.set_model_version(model_proto.model_version());
+    minimal_model.set_doc_string(model_proto.doc_string());
+
+    // Copy graph
+    *minimal_model.mutable_graph() = model_proto.graph();
+
+    // Copy opset imports
+    for (const auto& opset : model_proto.opset_import()) {
+        *minimal_model.add_opset_import() = opset;
     }
-    
-    if (!model_proto.has_producer_name() && !model_proto.producer_name().empty()) {
-        model_proto.set_producer_name("CortexSDR");
-    }
-    
-    // Make sure the graph has a name if it doesn't already
-    if (model_proto.has_graph() && !model_proto.graph().has_name()) {
-        model_proto.mutable_graph()->set_name("main_graph");
-    }
-    
-    // Add opset import if missing
-    if (model_proto.opset_import_size() == 0) {
-        auto* opset = model_proto.add_opset_import();
-        opset->set_domain("");
-        opset->set_version(12); // Use a stable opset version
-    }
-    
-    // Now serialize the model
-    std::string serialized_data;
-    if (!model_proto.SerializeToString(&serialized_data)) {
-        throw std::runtime_error("Failed to serialize model structure");
-    }
-    
-    // If serialization produced an empty string or all zeros, fall back to reading the original file
-    bool all_zeros = true;
-    for (char c : serialized_data) {
-        if (c != '\0') {
-            all_zeros = false;
-            break;
+
+    // Add metadata properties
+    auto* props = minimal_model.mutable_metadata_props();
+    for (const auto& prop : model_proto.metadata_props()) {
+        auto* new_prop = props->Add();
+        new_prop->set_key(prop.key());
+        new_prop->set_value(prop.value());
         }
-    }
-    
-    if (serialized_data.empty() || all_zeros) {
-        std::cerr << "Warning: SerializeToString produced empty or all-zero data, falling back to original file" << std::endl;
-        // Read the original file as a fallback
-        std::ifstream serialization_file(modelPath, std::ios::binary);
-        if (!serialization_file) {
-            throw std::runtime_error("Failed to open model file for serialization: " + modelPath);
-        }
-        
-        serialization_file.seekg(0, std::ios::end);
-        size_t file_size = serialization_file.tellg();
-        serialization_file.seekg(0, std::ios::beg);
-        
-        serialized_data.resize(file_size);
-        if (!serialization_file.read(&serialized_data[0], file_size)) {
-            throw std::runtime_error("Failed to read model file: " + modelPath);
-        }
-    }
-    
-    // Add debug information about the serialized data
-    std::cout << "Successfully serialized model structure: " << serialized_data.size() << " bytes" << std::endl;
-    std::cout << "Model IR Version: " << model_proto.ir_version() << std::endl;
-    std::cout << "Model has graph: " << (model_proto.has_graph() ? "yes" : "no") << std::endl;
-    if (model_proto.has_graph()) {
-        const auto& graph = model_proto.graph();
-        std::cout << "  Graph name: " << (graph.has_name() ? graph.name() : "<unnamed>") << std::endl;
+
+    // Debug output
+    std::cout << "Minimal ModelProto state before serialization:" << std::endl;
+    std::cout << "  IR Version: " << minimal_model.ir_version() << std::endl;
+    std::cout << "  Producer: " << minimal_model.producer_name() << " (" << minimal_model.producer_version() << ")" << std::endl;
+    std::cout << "  Domain: " << minimal_model.domain() << std::endl;
+    std::cout << "  Model Version: " << minimal_model.model_version() << std::endl;
+    std::cout << "  Opset Imports: " << minimal_model.opset_import_size() << std::endl;
+    std::cout << "  Has Graph: " << (minimal_model.has_graph() ? "yes" : "no") << std::endl;
+    if (minimal_model.has_graph()) {
+        const auto& graph = minimal_model.graph();
+        std::cout << "  Graph Name: " << graph.name() << std::endl;
+        std::cout << "  Nodes: " << graph.node_size() << std::endl;
         std::cout << "  Inputs: " << graph.input_size() << std::endl;
         std::cout << "  Outputs: " << graph.output_size() << std::endl;
-        std::cout << "  Nodes: " << graph.node_size() << std::endl;
         std::cout << "  Initializers: " << graph.initializer_size() << std::endl;
     }
     
-    // Print first few bytes of serialized data for debugging
-    std::cout << "  First 16 bytes of serialized data: ";
-    for (size_t i = 0; i < std::min(size_t(16), serialized_data.size()); i++) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)serialized_data[i] << " ";
-    }
-    std::cout << std::dec << std::endl;
-    
-    // Create the segment with the serialized data
+    // Try to serialize the minimal model using SerializeToString first
+    std::string serialized_data;
+    bool success = false;
+    try {
+        std::cout << "Attempting SerializeToString on minimal ModelProto..." << std::endl;
+        if (minimal_model.SerializeToString(&serialized_data)) {
+            std::cout << "SerializeToString on ModelProto succeeded. Size: " << serialized_data.size() << " bytes." << std::endl;
+            success = true;
+        } else {
+            std::cerr << "SerializeToString on ModelProto failed. Trying GraphProto..." << std::endl;
+            // Try serializing just the graph
+            serialized_data.clear();
+            if (minimal_model.has_graph() && minimal_model.graph().SerializeToString(&serialized_data)) {
+                std::cout << "SerializeToString on GraphProto succeeded. Size: " << serialized_data.size() << " bytes." << std::endl;
+                success = true;
+            } else {
+                std::cerr << "SerializeToString on GraphProto also failed." << std::endl;
+            }
+        }
+
+        if (success && !serialized_data.empty()) {
+            // Add model structure segment
     graph_segment.data.assign(
         reinterpret_cast<const std::byte*>(serialized_data.data()),
         reinterpret_cast<const std::byte*>(serialized_data.data() + serialized_data.size())
     );
     graph_segment.original_size = graph_segment.data.size();
-    graph_segment.data_format = "protobuf";
-    
-    // Store metadata in tensor_metadata with ultra-aggressive sparsity
-    TensorMetadata metadata;
-    metadata.dimensions = {
-        static_cast<size_t>(graph_proto.input_size()),
-        static_cast<size_t>(graph_proto.output_size()),
-        static_cast<size_t>(graph_proto.node_size()),
-        static_cast<size_t>(graph_proto.initializer_size())
-    };
-    // Use ultra-aggressive sparsity for model structure
-    metadata.sparsity_ratio = 0.0000001f; // Ultra-aggressive sparsity (0.00001%)
-    metadata.is_sorted = true;
-    metadata.scale = static_cast<float>(model_proto.ir_version());
-    metadata.zero_point = 0.0f;
-    
-    graph_segment.tensor_metadata = metadata;
     segments.push_back(std::move(graph_segment));
-    
-    std::cout << "Successfully added graph structure segment" << std::endl;
-    printSegmentMetadata(segments.back());
+            std::cout << "Added model structure segment (" << graph_segment.original_size << " bytes)." << std::endl;
+        } else {
+            std::cerr << "Model structure serialization failed: produced empty data." << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Exception during model structure serialization: " << e.what() << std::endl;
+    }
     
     // Process initializers (weights)
     std::cout << "Processing " << graph_proto.initializer_size() << " initializers..." << std::endl;

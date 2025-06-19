@@ -11,7 +11,6 @@ extern "C" {
 
 // Opaque handle types
 typedef struct CortexCompressor* CortexCompressorHandle;
-typedef struct CortexDecompressor* CortexDecompressorHandle;
 
 // Error handling
 typedef struct {
@@ -60,19 +59,6 @@ CortexError cortex_compressor_get_stats(
 
 // Free a compressor instance
 CortexError cortex_compressor_free(CortexCompressorHandle handle);
-
-// Create a decompressor instance
-CortexError cortex_decompressor_create(const char* compressed_path, CortexDecompressorHandle* handle, float sparsity = 0.02f);
-
-// Decompress a model from a specified compressed file path
-CortexError cortex_decompressor_decompress(
-    CortexDecompressorHandle handle,
-    const char* compressed_path, // Added: Path to the compressed file
-    const char* output_path
-);
-
-// Free a decompressor instance
-CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
 
 // Free error message
 void cortex_error_free(CortexError* error);
