@@ -454,6 +454,22 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         weight_segment.layer_name = extractLayerName(initializer.name());
         weight_segment.layer_index = extractLayerIndex(initializer.name());
         weight_segment.type = onnxTensorTypeToSegmentType(initializer.data_type());
+        // Infer true layer type from name
+        std::string lname = initializer.name();
+        std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+        if (lname.find("conv") != std::string::npos) {
+            weight_segment.layer_type = "CONV2D";
+        } else if (lname.find("norm") != std::string::npos) {
+            weight_segment.layer_type = "BATCH_NORM";
+        } else if (lname.find("pool") != std::string::npos) {
+            weight_segment.layer_type = "POOLING";
+        } else if (lname.find("activation") != std::string::npos) {
+            weight_segment.layer_type = "ACTIVATION";
+        } else if (lname.find("weight") != std::string::npos || lname.find("fc") != std::string::npos || lname.find("linear") != std::string::npos) {
+            weight_segment.layer_type = "LINEAR";
+        } else {
+            weight_segment.layer_type = "UNKNOWN";
+        }
         
         if (weight_segment.type == SegmentType::UNKNOWN) {
             std::cerr << "Warning: Unknown segment type for initializer " << initializer.name() << std::endl;

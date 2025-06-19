@@ -16,8 +16,8 @@ bool readBasicType(std::istream& stream, T& value) {
 
 // Helper function to read string (length prefixed)
 bool readString(std::istream& stream, std::string& str) {
-    uint16_t len;
-    std::cerr << "  DEBUG readString: Attempting to read length (uint16_t)..." << std::endl; // DEBUG
+    uint32_t len;
+    std::cerr << "  DEBUG readString: Attempting to read length (uint32_t)..." << std::endl; // DEBUG
     if (!readBasicType(stream, len)) {
         std::cerr << "  DEBUG readString: Failed to read length. Stream state good: " << stream.good() << ", eof: " << stream.eof() << ", fail: " << stream.fail() << ", bad: " << stream.bad() << std::endl; // DEBUG
         return false;
@@ -54,13 +54,13 @@ void AIDecompressor::registerStrategy(uint8_t strategy_id, std::shared_ptr<IComp
 
 std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istream& stream) {
     // 1. Read and Verify Magic Number & Version
-    char magic[4];
+    char magic[8];
     stream.read(magic, sizeof(magic));
     if (!stream || std::memcmp(magic, ARCHIVE_MAGIC, sizeof(ARCHIVE_MAGIC)) != 0) {
         throw CompressionError("Invalid or missing archive magic number.");
     }
 
-    uint16_t version;
+    uint32_t version;
     if (!readBasicType(stream, version) || version != ARCHIVE_VERSION) {
          throw CompressionError("Unsupported archive version.");
     }

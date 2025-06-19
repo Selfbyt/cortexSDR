@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
     size_t original_size, compressed_size;
     double compression_ratio, compression_time_ms;
     error = cortex_compressor_get_stats(compressor, &original_size, &compressed_size, 
-                                      &compression_ratio, &compression_time_ms);
+                                        &compression_ratio, &compression_time_ms);
     if (error.code != 0) {
         std::cerr << "Error getting stats: " << error.message << " (code: " << error.code << ")\n";
         cortex_error_free(&error);

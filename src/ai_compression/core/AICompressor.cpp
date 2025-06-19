@@ -93,7 +93,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         CompressedSegmentHeader header;
         header.name = segment.name;
         header.original_type = segment.type;
-        header.original_size = segment.original_size;
+        header.original_size = static_cast<uint64_t>(segment.original_size);
 
         const auto* strategies = selectStrategies(segment.type);
         std::vector<std::byte> compressedData;
@@ -128,7 +128,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
             compressedData = segment.data; // Store original data
         }
 
-        header.compressed_size = compressedData.size();
+        header.compressed_size = static_cast<uint64_t>(compressedData.size());
         stats_.originalSize += header.original_size;
         stats_.compressedSize += header.compressed_size;
         headers.push_back(header);
@@ -166,6 +166,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         currentOffset += headers[i].compressed_size; // Update offset for the *next* block
 
         writeString(outputArchiveStream, headers[i].name);
+        writeString(outputArchiveStream, segments[i].layer_type);
         uint8_t type_val = static_cast<uint8_t>(headers[i].original_type);
         writeBasicType(outputArchiveStream, type_val);
         writeBasicType(outputArchiveStream, headers[i].compression_strategy_id);
@@ -196,7 +197,7 @@ AICompressor::compressSegment(const ModelSegment& segment) const {
     CompressedSegmentHeader header;
     header.name = segment.name;
     header.original_type = segment.type;
-    header.original_size = segment.original_size;
+    header.original_size = static_cast<uint64_t>(segment.original_size);
     header.tensor_metadata = segment.tensor_metadata;
     header.layer_name = segment.layer_name;
     header.layer_index = segment.layer_index;
@@ -232,7 +233,7 @@ AICompressor::compressSegment(const ModelSegment& segment) const {
     }
 
     header.compression_strategy_id = winningStrategyId;
-    header.compressed_size = compressedData.size();
+    header.compressed_size = static_cast<uint64_t>(compressedData.size());
     return std::make_pair(header, std::move(compressedData));
 }
 
@@ -288,7 +289,7 @@ AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments
             CompressedSegmentHeader header;
             header.name = segment.name;
             header.original_type = segment.type;
-            header.original_size = segment.original_size;
+            header.original_size = static_cast<uint64_t>(segment.original_size);
             header.tensor_metadata = segment.tensor_metadata;
             header.layer_name = segment.layer_name;
             header.layer_index = segment.layer_index;
@@ -321,7 +322,7 @@ AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments
             }
 
             header.compression_strategy_id = winningStrategyId;
-            header.compressed_size = compressedData.size();
+            header.compressed_size = static_cast<uint64_t>(compressedData.size());
             return std::make_pair(header, std::move(compressedData));
         }));
     }
@@ -367,7 +368,7 @@ void AICompressor::compressModelStreaming(const std::string& modelPath, ICompres
             CompressedSegmentHeader header;
             header.name = segment.name;
             header.original_type = segment.type;
-            header.original_size = segment.original_size;
+            header.original_size = static_cast<uint64_t>(segment.original_size);
             header.tensor_metadata = segment.tensor_metadata;
             header.layer_name = segment.layer_name;
             header.layer_index = segment.layer_index;
@@ -405,7 +406,7 @@ void AICompressor::compressModelStreaming(const std::string& modelPath, ICompres
                 compressedData = segment.data; // Store original data
             }
 
-            header.compressed_size = compressedData.size();
+            header.compressed_size = static_cast<uint64_t>(compressedData.size());
             // Update statistics
             stats_.originalSize += header.original_size;
             stats_.compressedSize += header.compressed_size;

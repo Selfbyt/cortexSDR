@@ -6,8 +6,8 @@
 namespace CortexAICompression {
 
 // Define simple magic number and version for the archive format
-extern const char ARCHIVE_MAGIC[4];
-extern const uint16_t ARCHIVE_VERSION;
+extern const char ARCHIVE_MAGIC[8];
+extern const uint32_t ARCHIVE_VERSION;
 
 } // namespace CortexAICompression
 
