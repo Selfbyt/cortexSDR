@@ -94,6 +94,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         header.name = segment.name;
         header.original_type = segment.type;
         header.original_size = static_cast<uint64_t>(segment.original_size);
+        header.layer_type = segment.layer_type;
 
         const auto* strategies = selectStrategies(segment.type);
         std::vector<std::byte> compressedData;
@@ -198,6 +199,7 @@ AICompressor::compressSegment(const ModelSegment& segment) const {
     header.name = segment.name;
     header.original_type = segment.type;
     header.original_size = static_cast<uint64_t>(segment.original_size);
+    header.layer_type = segment.layer_type;
     header.tensor_metadata = segment.tensor_metadata;
     header.layer_name = segment.layer_name;
     header.layer_index = segment.layer_index;
@@ -290,6 +292,7 @@ AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments
             header.name = segment.name;
             header.original_type = segment.type;
             header.original_size = static_cast<uint64_t>(segment.original_size);
+            header.layer_type = segment.layer_type;
             header.tensor_metadata = segment.tensor_metadata;
             header.layer_name = segment.layer_name;
             header.layer_index = segment.layer_index;
@@ -369,6 +372,7 @@ void AICompressor::compressModelStreaming(const std::string& modelPath, ICompres
             header.name = segment.name;
             header.original_type = segment.type;
             header.original_size = static_cast<uint64_t>(segment.original_size);
+            header.layer_type = segment.layer_type;
             header.tensor_metadata = segment.tensor_metadata;
             header.layer_name = segment.layer_name;
             header.layer_index = segment.layer_index;

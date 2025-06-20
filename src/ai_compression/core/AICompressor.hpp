@@ -41,6 +41,7 @@ struct CompressedSegmentHeader {
     std::optional<TensorMetadata> tensor_metadata;
     std::string layer_name;
     size_t layer_index;
+    std::string layer_type; // ONNX op type (e.g., "Conv", "MatMul")
 };
 
 // Interface for handling compressed segments during streaming

@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstring>
 #include "core/ModelSegment.hpp"  // Include for SegmentType
+#include <optional>
+#include "onnx_proto/onnx.pb.h"
 
 namespace CortexAICompression {
 
@@ -85,13 +87,23 @@ public:
     LayerInfo loadLayerByName(const std::string& name) const;
     // Helper to decode varint-encoded indices from SDR data
     static std::vector<size_t> decode_varint_indices(const std::vector<std::byte>& data);
+#ifdef ENABLE_ONNX_PROTOBUF
+    // Getter for loaded ONNX ModelProto (if present)
+    const std::optional<onnx::ModelProto>& getLoadedModelProto() const;
+#endif
+    // New: Get a map of layer names to LayerInfo for selective inference
+    const std::unordered_map<std::string, LayerInfo>& getLayerMap() const { return layer_map_; }
 private:
     std::string archive_path_;
     std::vector<SegmentInfo> segments_;
     std::vector<LayerInfo> layers; // legacy: all layers loaded
+    std::unordered_map<std::string, LayerInfo> layer_map_; // For fast lookup by name
     void loadFromArchive(const std::string& archive_path);
     void parseLayerMetadata(const std::string& metadata, LayerInfo& layer);
     std::vector<std::byte> decompressSDR(const std::vector<std::byte>& compressed_data, size_t original_size) const;
+#ifdef ENABLE_ONNX_PROTOBUF
+    std::optional<onnx::ModelProto> loaded_model_proto_;
+#endif
 };
 
 class SDRInferenceEngine {
@@ -105,11 +117,17 @@ public:
     void enableDropout(bool enable);
     void setInferenceMode(bool training);
     
+    // New: Run a single layer by name
+    std::vector<float> runLayer(const std::string& layer_name, const std::vector<float>& input);
+    // New: Run a sequence of layers by name
+    std::vector<float> runLayers(const std::vector<std::string>& layer_names, const std::vector<float>& input);
+    
 private:
     std::vector<LayerInfo> layers;
     size_t batch_size;
     bool dropout_enabled;
     bool training_mode;
+    std::unordered_map<std::string, LayerInfo> layer_map_; // For fast lookup by name
     
     // Helper functions for neural network operations
     std::vector<float> applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input);

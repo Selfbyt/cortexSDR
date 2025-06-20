@@ -258,6 +258,72 @@ TEST_F(CompressedInferenceTest, CompressAndInfer) {
     }
 }
 
+TEST_F(CompressedInferenceTest, SelectiveInference) {
+    std::string compressed_path = "compressed_cnn.sdr";
+    // Assume the model has already been compressed by the previous test
+    SDRModelLoader loader(compressed_path);
+    SDRInferenceEngine engine(loader);
+
+    // List all available layers
+    const auto& layer_map = loader.getLayerMap();
+    std::cout << "\n[SelectiveInference] Available layers:" << std::endl;
+    for (const auto& kv : layer_map) {
+        std::cout << "  " << kv.first << " (type: " << kv.second.layer_type << ")" << std::endl;
+    }
+
+    // Select a subset of layers to run (e.g., first and second layer)
+    std::vector<std::string> selected_layers;
+    auto it = layer_map.begin();
+    if (it != layer_map.end()) {
+        selected_layers.push_back(it->first); // First layer
+        if (++it != layer_map.end()) {
+            selected_layers.push_back(it->first); // Second layer (if exists)
+        }
+    }
+    std::cout << "\n[SelectiveInference] Running layers:";
+    for (const auto& name : selected_layers) std::cout << " " << name;
+    std::cout << std::endl;
+
+    // Generate input tensor matching the input shape of the first selected layer
+    const auto& first_layer = layer_map.at(selected_layers.front());
+    size_t input_size = 1;
+    for (size_t d : first_layer.input_shape) input_size *= d;
+    auto input_tensor = generateInputTensor(input_size);
+
+    // Run only the selected layers in sequence, with debug prints
+    std::vector<float> current = input_tensor;
+    for (const auto& name : selected_layers) {
+        const auto& layer = layer_map.at(name);
+        std::cout << "[SelectiveInference] Running layer: " << name << " (type: " << layer.layer_type << ")\n";
+        std::cout << "  Input size: " << current.size() << ", expected: ";
+        size_t expected_in = 1;
+        for (size_t d : layer.input_shape) expected_in *= d;
+        std::cout << expected_in << "\n";
+        std::cout << "  Input shape: [";
+        for (size_t i = 0; i < layer.input_shape.size(); ++i) {
+            std::cout << layer.input_shape[i] << (i < layer.input_shape.size() - 1 ? ", " : "");
+        }
+        std::cout << "]\n";
+        current = engine.runLayer(name, current);
+        std::cout << "  Output size: " << current.size() << ", expected: ";
+        size_t expected_out = 1;
+        for (size_t d : layer.output_shape) expected_out *= d;
+        std::cout << expected_out << "\n";
+        std::cout << "  Output shape: [";
+        for (size_t i = 0; i < layer.output_shape.size(); ++i) {
+            std::cout << layer.output_shape[i] << (i < layer.output_shape.size() - 1 ? ", " : "");
+        }
+        std::cout << "]\n";
+        std::cout << "  Output preview: ";
+        for (size_t i = 0; i < std::min<size_t>(5, current.size()); ++i) {
+            std::cout << current[i] << " ";
+        }
+        std::cout << (current.size() > 5 ? "..." : "") << std::endl;
+    }
+    std::cout << "[SelectiveInference] Output size after running selected layers: " << current.size() << std::endl;
+    ASSERT_FALSE(current.empty());
+}
+
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

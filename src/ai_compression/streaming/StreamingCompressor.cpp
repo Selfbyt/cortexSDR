@@ -90,7 +90,8 @@ void StreamingCompressor::finalizeArchive() {
         const auto& header = segmentPair.first;
         // Calculate size of this header entry in the index
         uint64_t headerEntrySize = 0;
-        headerEntrySize += sizeof(uint16_t) + header.name.length(); // Name length + name
+        headerEntrySize += sizeof(uint32_t) + header.name.length(); // Name length + name
+        headerEntrySize += sizeof(uint32_t) + header.layer_type.length(); // Layer type length + type
         headerEntrySize += sizeof(uint8_t); // Type
         headerEntrySize += sizeof(uint8_t); // Strategy ID
         headerEntrySize += sizeof(uint64_t); // Original Size (now 8 bytes)
@@ -118,6 +119,7 @@ void StreamingCompressor::finalizeArchive() {
 
         // Write segment header
         writeStringLocal(outputFile_, header.name);
+        writeStringLocal(outputFile_, header.layer_type);
         writeBasicTypeLocal(outputFile_, static_cast<uint8_t>(header.original_type));
         writeBasicTypeLocal(outputFile_, header.compression_strategy_id);
         writeBasicTypeLocal(outputFile_, static_cast<uint64_t>(header.original_size));

@@ -439,54 +439,35 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         std::cerr << "Exception during model structure serialization: " << e.what() << std::endl;
     }
     
-    // Process initializers (weights)
-    std::cout << "Processing " << graph_proto.initializer_size() << " initializers..." << std::endl;
-    
-    for (int i = 0; i < graph_proto.initializer_size(); ++i) {
-        const auto& initializer = graph_proto.initializer(i);
-        if (!initializer.has_name()) {
-            std::cerr << "Warning: Skipping initializer without name at index " << i << std::endl;
-            continue;
+    // Map tensor names to their producing node's op_type
+    std::unordered_map<std::string, std::string> tensor_to_op_type;
+    for (const auto& node : graph_proto.node()) {
+        for (const auto& output_name : node.output()) {
+            tensor_to_op_type[output_name] = node.op_type();
         }
-        
-        ModelSegment weight_segment;
-        weight_segment.name = initializer.name();
-        weight_segment.layer_name = extractLayerName(initializer.name());
-        weight_segment.layer_index = extractLayerIndex(initializer.name());
-        weight_segment.type = onnxTensorTypeToSegmentType(initializer.data_type());
-        // Infer true layer type from name
-        std::string lname = initializer.name();
-        std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
-        if (lname.find("conv") != std::string::npos) {
-            weight_segment.layer_type = "CONV2D";
-        } else if (lname.find("norm") != std::string::npos) {
-            weight_segment.layer_type = "BATCH_NORM";
-        } else if (lname.find("pool") != std::string::npos) {
-            weight_segment.layer_type = "POOLING";
-        } else if (lname.find("activation") != std::string::npos) {
-            weight_segment.layer_type = "ACTIVATION";
-        } else if (lname.find("weight") != std::string::npos || lname.find("fc") != std::string::npos || lname.find("linear") != std::string::npos) {
-            weight_segment.layer_type = "LINEAR";
-        } else {
-            weight_segment.layer_type = "UNKNOWN";
+    }
+
+    // Process initializers (weights, biases)
+    for (const auto& tensor_proto : graph_proto.initializer()) {
+        ModelSegment segment;
+        segment.name = tensor_proto.name();
+        segment.type = onnxTensorTypeToSegmentType(tensor_proto.data_type());
+        segment.data = tensorProtoToBytes(tensor_proto);
+        segment.original_size = segment.data.size();
+        segment.tensor_metadata = extractTensorMetadataProto(tensor_proto);
+
+        // Assign the op_type from the node that uses this initializer as input
+        for (const auto& node : graph_proto.node()) {
+            for (const auto& input_name : node.input()) {
+                if (input_name == tensor_proto.name()) {
+                    segment.layer_type = node.op_type();
+                    goto found_node;
+                }
+            }
         }
-        
-        if (weight_segment.type == SegmentType::UNKNOWN) {
-            std::cerr << "Warning: Unknown segment type for initializer " << initializer.name() << std::endl;
-            continue;
-        }
-        
-        weight_segment.tensor_metadata = extractTensorMetadataProto(initializer);
-        weight_segment.data = tensorProtoToBytes(initializer);
-        weight_segment.original_size = weight_segment.data.size();
-        
-        if (weight_segment.original_size > 0) {
-            segments.push_back(std::move(weight_segment));
-            std::cout << "Added weight segment for " << initializer.name() 
-                      << " (" << weight_segment.original_size << " bytes)." << std::endl;
-        } else {
-            std::cerr << "Warning: Empty data for initializer " << initializer.name() << std::endl;
-        }
+        found_node:;
+
+        segments.push_back(segment);
     }
     
     return segments;
