@@ -137,6 +137,26 @@ void StreamingCompressor::finalizeArchive() {
                 writeBasicTypeLocal(outputFile_, static_cast<uint32_t>(dim));
             }
         }
+        // Write input_shape
+        uint8_t has_input_shape = header.input_shape.empty() ? 0 : 1;
+        writeBasicTypeLocal(outputFile_, has_input_shape);
+        if (has_input_shape) {
+            uint8_t num_in = static_cast<uint8_t>(header.input_shape.size());
+            writeBasicTypeLocal(outputFile_, num_in);
+            for (size_t dim : header.input_shape) {
+                writeBasicTypeLocal(outputFile_, static_cast<uint32_t>(dim));
+            }
+        }
+        // Write output_shape
+        uint8_t has_output_shape = header.output_shape.empty() ? 0 : 1;
+        writeBasicTypeLocal(outputFile_, has_output_shape);
+        if (has_output_shape) {
+            uint8_t num_out = static_cast<uint8_t>(header.output_shape.size());
+            writeBasicTypeLocal(outputFile_, num_out);
+            for (size_t dim : header.output_shape) {
+                writeBasicTypeLocal(outputFile_, static_cast<uint32_t>(dim));
+            }
+        }
     }
 
     // --- Write Compressed Data Blocks ---

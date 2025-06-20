@@ -439,12 +439,88 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         std::cerr << "Exception during model structure serialization: " << e.what() << std::endl;
     }
     
-    // Map tensor names to their producing node's op_type
+    // Map tensor names to their producing node's op_type and attributes
     std::unordered_map<std::string, std::string> tensor_to_op_type;
+    std::unordered_map<std::string, std::string> tensor_to_metadata;
     for (const auto& node : graph_proto.node()) {
         for (const auto& output_name : node.output()) {
             tensor_to_op_type[output_name] = node.op_type();
+            // Serialize all attributes for this node
+            std::ostringstream meta;
+            meta << "op_type " << node.op_type() << " ";
+            for (const auto& attr : node.attribute()) {
+                meta << attr.name() << " ";
+                switch (attr.type()) {
+                    case onnx::AttributeProto::INT:
+                        meta << attr.i() << " ";
+                        break;
+                    case onnx::AttributeProto::FLOAT:
+                        meta << attr.f() << " ";
+                        break;
+                    case onnx::AttributeProto::STRING:
+                        meta << attr.s() << " ";
+                        break;
+                    case onnx::AttributeProto::INTS:
+                        for (int i = 0; i < attr.ints_size(); ++i) {
+                            meta << attr.ints(i);
+                            if (i + 1 < attr.ints_size()) meta << ",";
+                        }
+                        meta << " ";
+                        break;
+                    case onnx::AttributeProto::FLOATS:
+                        for (int i = 0; i < attr.floats_size(); ++i) {
+                            meta << attr.floats(i);
+                            if (i + 1 < attr.floats_size()) meta << ",";
+                        }
+                        meta << " ";
+                        break;
+                    case onnx::AttributeProto::STRINGS:
+                        for (int i = 0; i < attr.strings_size(); ++i) {
+                            meta << attr.strings(i);
+                            if (i + 1 < attr.strings_size()) meta << ",";
+                        }
+                        meta << " ";
+                        break;
+                    default:
+                        break;
+                }
+            }
+            tensor_to_metadata[output_name] = meta.str();
         }
+    }
+
+    // Build a map from tensor name to its shape from ValueInfoProto
+    std::unordered_map<std::string, std::vector<size_t>> tensor_shapes;
+    for (const auto& value_info : graph_proto.value_info()) {
+        std::vector<size_t> shape;
+        if (value_info.has_type() && value_info.type().has_tensor_type() && value_info.type().tensor_type().has_shape()) {
+            const auto& shape_proto = value_info.type().tensor_type().shape();
+            for (const auto& dim : shape_proto.dim()) {
+                if (dim.has_dim_value()) shape.push_back(static_cast<size_t>(dim.dim_value()));
+            }
+        }
+        tensor_shapes[value_info.name()] = shape;
+    }
+    // Also add input/output shapes from graph inputs/outputs
+    for (const auto& input : graph_proto.input()) {
+        std::vector<size_t> shape;
+        if (input.has_type() && input.type().has_tensor_type() && input.type().tensor_type().has_shape()) {
+            const auto& shape_proto = input.type().tensor_type().shape();
+            for (const auto& dim : shape_proto.dim()) {
+                if (dim.has_dim_value()) shape.push_back(static_cast<size_t>(dim.dim_value()));
+            }
+        }
+        tensor_shapes[input.name()] = shape;
+    }
+    for (const auto& output : graph_proto.output()) {
+        std::vector<size_t> shape;
+        if (output.has_type() && output.type().has_tensor_type() && output.type().tensor_type().has_shape()) {
+            const auto& shape_proto = output.type().tensor_type().shape();
+            for (const auto& dim : shape_proto.dim()) {
+                if (dim.has_dim_value()) shape.push_back(static_cast<size_t>(dim.dim_value()));
+            }
+        }
+        tensor_shapes[output.name()] = shape;
     }
 
     // Process initializers (weights, biases)
@@ -456,11 +532,22 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         segment.original_size = segment.data.size();
         segment.tensor_metadata = extractTensorMetadataProto(tensor_proto);
 
-        // Assign the op_type from the node that uses this initializer as input
+        // Assign the op_type and metadata from the node that uses this initializer as input
         for (const auto& node : graph_proto.node()) {
             for (const auto& input_name : node.input()) {
                 if (input_name == tensor_proto.name()) {
                     segment.layer_type = node.op_type();
+                    // Use the first output as key for metadata
+                    if (!node.output().empty() && tensor_to_metadata.count(node.output(0))) {
+                        segment.data_format = tensor_to_metadata[node.output(0)];
+                    }
+                    // Store true input/output shapes for this node
+                    if (!node.input().empty() && tensor_shapes.count(node.input(0))) {
+                        segment.input_shape = tensor_shapes[node.input(0)];
+                    }
+                    if (!node.output().empty() && tensor_shapes.count(node.output(0))) {
+                        segment.output_shape = tensor_shapes[node.output(0)];
+                    }
                     goto found_node;
                 }
             }

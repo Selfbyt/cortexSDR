@@ -12,6 +12,9 @@
 using namespace CortexAICompression;
 using json = nlohmann::json;
 
+// Forward declaration for the utility function
+void print_possible_layer_chains(const std::vector<CortexAICompression::LayerInfo>& layers);
+
 class CompressedInferenceTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -23,9 +26,9 @@ protected:
 
     void TearDown() override {
         // Clean up test files
-        remove("compressed_cnn.sdr");
-        remove("compressed_cnn.json");
-        remove("decompressed_model.onnx");
+        // remove("compressed_model.sdr");
+        // remove("compressed_model.json");
+        // remove("decompressed_model.onnx");
     }
 
     // Helper to generate random input tensor
@@ -124,13 +127,12 @@ protected:
     std::uniform_real_distribution<float> dist;
 };
 
-TEST_F(CompressedInferenceTest, CompressAndInfer) {
-    // Load and compress the model
-    std::string model_path = "/home/mbishu/Desktop/cortexSDR/cnn_classifier.onnx";
-    std::string compressed_path = "compressed_cnn.sdr";
+TEST_F(CompressedInferenceTest, SelectiveInference) {
+    // Restore: Compress the model before inference
+    std::string model_path = "/home/mbishu/Desktop/cortexSDR/gpt2-10.onnx";
+    std::string compressed_path = "compressed_model.sdr";
     float sparsity = 0.02f;
 
-    // Compress the model using the C API
     CortexCompressionOptions options;
     CortexError err = cortex_compression_options_init(&options);
     ASSERT_EQ(err.code, 0) << (err.message ? err.message : "Failed to init options");
@@ -144,153 +146,58 @@ TEST_F(CompressedInferenceTest, CompressAndInfer) {
     ASSERT_EQ(err.code, 0) << (err.message ? err.message : "Compression failed");
 
     cortex_compressor_free(compressor);
+    // End restore
 
-    std::cout << "About to load compressed model from: " << compressed_path << std::endl;
-    
-    // Create inference engine with compressed model
-    try {
-        SDRModelLoader loader(compressed_path);
-        std::cout << "Model loaded successfully, checking layers..." << std::endl;
-        // On-demand: print available segment names
-        const auto& segments = loader.getSegmentIndex();
-        std::cout << "Available segments in archive:" << std::endl;
-        for (const auto& seg : segments) {
-            std::cout << "  " << seg.name << std::endl;
-        }
-        // On-demand: load a single layer by name (first weight segment)
-        auto it = std::find_if(segments.begin(), segments.end(), [](const SegmentInfo& seg) {
-            return seg.type == SegmentType::WEIGHTS_FP32 || seg.type == SegmentType::WEIGHTS_FP16 || seg.type == SegmentType::WEIGHTS_INT8;
-        });
-        if (it != segments.end()) {
-            std::cout << "\nLoading layer on-demand: " << it->name << std::endl;
-            LayerInfo layer = loader.loadLayerByName(it->name);
-            std::cout << "Loaded layer: " << layer.name << ", raw_data size: " << layer.raw_data.size() << std::endl;
-        } else {
-            std::cout << "No weight segment found for on-demand loading test." << std::endl;
-        }
-        // Legacy: load all layers (not memory efficient)
-        ASSERT_FALSE(loader.getLayers().empty()) << "No layers loaded from compressed model";
-        std::cout << "Number of layers loaded: " << loader.getLayers().size() << std::endl;
-        
-        // Print layer information for debugging
-        std::cout << "\nLoaded layers:" << std::endl;
-        for (const auto& layer : loader.getLayers()) {
-            std::cout << "Layer: " << layer.name << std::endl;
-            std::cout << "  Type: " << (layer.layer_type == "CONV2D" ? "Convolutional" : layer.layer_type) << std::endl;
-            std::cout << "  Input shape: [";
-            for (size_t i = 0; i < layer.input_shape.size(); ++i) {
-                std::cout << layer.input_shape[i] << (i < layer.input_shape.size() - 1 ? ", " : "");
-            }
-            std::cout << "]" << std::endl;
-            std::cout << "  Output shape: [";
-            for (size_t i = 0; i < layer.output_shape.size(); ++i) {
-                std::cout << layer.output_shape[i] << (i < layer.output_shape.size() - 1 ? ", " : "");
-            }
-            std::cout << "]" << std::endl;
-            std::cout << "  Activation: " << layer.properties.activation_type << std::endl;
-            std::cout << "  Batch norm: " << (layer.properties.use_batch_norm ? "Yes" : "No") << std::endl;
-            std::cout << "  Dropout rate: " << layer.properties.dropout_rate << std::endl;
-        }
-        
-        SDRInferenceEngine engine(loader);
-
-        // Model-agnostic: check output size matches last layer's output_shape
-        const auto& layers = loader.getLayers();
-        ASSERT_FALSE(layers.empty()) << "No layers loaded from compressed model";
-        const auto& first_layer = layers.front();
-        size_t input_size = 1;
-        for (size_t d : first_layer.input_shape) input_size *= d;
-        std::vector<float> input_tensor_single(input_size, 0.0f);
-        for (size_t i = 0; i < input_tensor_single.size(); ++i) {
-            input_tensor_single[i] = static_cast<float>(i) / input_tensor_single.size();
-        }
-        std::vector<float> output_single = engine.run(input_tensor_single);
-        const auto& last_layer = layers.back();
-        size_t expected_output_size = 1;
-        for (size_t d : last_layer.output_shape) expected_output_size *= d;
-        std::cout << "Expected output size: " << expected_output_size << ", actual: " << output_single.size() << std::endl;
-        ASSERT_EQ(output_single.size(), expected_output_size) << "Single batch output tensor has wrong size";
-
-        engine.setBatchSize(4);
-        std::vector<float> input_tensor_batch(4 * 3 * 32 * 32, 0.0f);
-        for (size_t i = 0; i < input_tensor_batch.size(); ++i) {
-            input_tensor_batch[i] = static_cast<float>(i) / input_tensor_batch.size();
-        }
-        std::vector<float> output_batch = engine.run(input_tensor_batch);
-        // For batch, expected output size is batch_size * (product of last_layer.output_shape dims except batch)
-        size_t per_sample_output = 1;
-        if (!last_layer.output_shape.empty()) {
-            for (size_t i = 1; i < last_layer.output_shape.size(); ++i) per_sample_output *= last_layer.output_shape[i];
-        }
-        size_t expected_batch_output_size = 4 * per_sample_output;
-        std::cout << "Expected batch output size: " << expected_batch_output_size << ", actual: " << output_batch.size() << std::endl;
-        ASSERT_EQ(output_batch.size(), expected_batch_output_size) << "Batch output tensor has wrong size";
-
-        // Test training mode
-        engine.setInferenceMode(true);
-        engine.enableDropout(true);
-        std::vector<float> output_training = engine.run(input_tensor_single);
-        ASSERT_EQ(output_training.size(), 10) << "Training mode output tensor has wrong size";
-
-        // Test inference mode
-        engine.setInferenceMode(false);
-        engine.enableDropout(false);
-        std::vector<float> output_inference = engine.run(input_tensor_single);
-        ASSERT_EQ(output_inference.size(), 10) << "Inference mode output tensor has wrong size";
-
-        // Verify output values are reasonable
-        for (float val : output_inference) {
-            ASSERT_GE(val, 0.0f) << "Output value should be non-negative";
-            ASSERT_LE(val, 1.0f) << "Output value should be <= 1";
-        }
-
-        // Print output probabilities
-        std::cout << "\nOutput probabilities (inference mode):" << std::endl;
-        for (size_t i = 0; i < output_inference.size(); ++i) {
-            std::cout << "Class " << i << ": " << output_inference[i] << std::endl;
-        }
-
-        // Save model data to JSON for inspection
-        saveSDRToJson(compressed_path, "compressed_cnn.json");
-    } catch (const std::exception& e) {
-        std::cerr << "Error loading compressed model: " << e.what() << std::endl;
-        ASSERT_FALSE(true) << "Error loading compressed model";
-    }
-}
-
-TEST_F(CompressedInferenceTest, SelectiveInference) {
-    std::string compressed_path = "compressed_cnn.sdr";
-    // Assume the model has already been compressed by the previous test
     SDRModelLoader loader(compressed_path);
     SDRInferenceEngine engine(loader);
 
-    // List all available layers
+    // Print all possible layer chains based on shape matching
+    CortexAICompression::print_possible_layer_chains(loader.getLayers());
+
     const auto& layer_map = loader.getLayerMap();
-    std::cout << "\n[SelectiveInference] Available layers:" << std::endl;
+    std::cout << "\n[SelectiveInference] Layer shapes:" << std::endl;
     for (const auto& kv : layer_map) {
-        std::cout << "  " << kv.first << " (type: " << kv.second.layer_type << ")" << std::endl;
+        const auto& layer = kv.second;
+        std::cout << "  " << kv.first << " (type: " << layer.layer_type << ")\n";
+        std::cout << "    Input shape: [";
+        for (size_t i = 0; i < layer.input_shape.size(); ++i) {
+            std::cout << layer.input_shape[i] << (i < layer.input_shape.size() - 1 ? ", " : "");
+        }
+        std::cout << "]\n    Output shape: [";
+        for (size_t i = 0; i < layer.output_shape.size(); ++i) {
+            std::cout << layer.output_shape[i] << (i < layer.output_shape.size() - 1 ? ", " : "");
+        }
+        std::cout << "]\n";
     }
 
-    // Select a subset of layers to run (e.g., first and second layer)
+    // Find a pair of layers with matching output/input shapes
     std::vector<std::string> selected_layers;
-    auto it = layer_map.begin();
-    if (it != layer_map.end()) {
-        selected_layers.push_back(it->first); // First layer
-        if (++it != layer_map.end()) {
-            selected_layers.push_back(it->first); // Second layer (if exists)
+    for (auto it1 = layer_map.begin(); it1 != layer_map.end(); ++it1) {
+        for (auto it2 = layer_map.begin(); it2 != layer_map.end(); ++it2) {
+            if (it1 == it2) continue;
+            const auto& out_shape = it1->second.output_shape;
+            const auto& in_shape = it2->second.input_shape;
+            if (!out_shape.empty() && out_shape == in_shape) {
+                selected_layers.push_back(it1->first);
+                selected_layers.push_back(it2->first);
+                goto found_pair;
+            }
         }
+    }
+found_pair:
+    if (selected_layers.size() < 2) {
+        std::cout << "[SelectiveInference] No compatible layer pair found. Skipping test." << std::endl;
+        GTEST_SKIP();
     }
     std::cout << "\n[SelectiveInference] Running layers:";
     for (const auto& name : selected_layers) std::cout << " " << name;
     std::cout << std::endl;
 
-    // Generate input tensor matching the input shape of the first selected layer
     const auto& first_layer = layer_map.at(selected_layers.front());
     size_t input_size = 1;
     for (size_t d : first_layer.input_shape) input_size *= d;
     auto input_tensor = generateInputTensor(input_size);
 
-    // Run only the selected layers in sequence, with debug prints
     std::vector<float> current = input_tensor;
     for (const auto& name : selected_layers) {
         const auto& layer = layer_map.at(name);

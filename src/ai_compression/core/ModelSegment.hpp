@@ -53,6 +53,8 @@ struct ModelSegment {
     size_t layer_index;            // Index of the layer in the model
     std::string data_format;       // Format of the data (e.g., "NCHW", "NHWC")
     std::string layer_type;         // layer_type is now a free-form string for extensibility
+    std::vector<size_t> input_shape;  // True input tensor shape for the layer (from ONNX graph)
+    std::vector<size_t> output_shape; // True output tensor shape for the layer (from ONNX graph)
 
     ModelSegment(SegmentType t, std::string n, std::vector<std::byte> d)
         : type(t), name(std::move(n)), data(std::move(d)), original_size(data.size()),

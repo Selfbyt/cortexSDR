@@ -196,6 +196,44 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
                 std::cerr << "    DEBUG Zero Point: " << zp_val << std::endl;
             }
         }
+        // Read input_shape
+        uint8_t has_input_shape = 0;
+        if (!readBasicType(stream, has_input_shape)) {
+            throw CompressionError("Failed to read input_shape presence flag.");
+        }
+        if (has_input_shape) {
+            uint8_t num_in = 0;
+            if (!readBasicType(stream, num_in)) {
+                throw CompressionError("Failed to read input_shape num dims.");
+            }
+            header.input_shape.resize(num_in);
+            for (uint8_t d = 0; d < num_in; ++d) {
+                uint32_t dim = 0;
+                if (!readBasicType(stream, dim)) {
+                    throw CompressionError("Failed to read input_shape dimension value.");
+                }
+                header.input_shape[d] = dim;
+            }
+        }
+        // Read output_shape
+        uint8_t has_output_shape = 0;
+        if (!readBasicType(stream, has_output_shape)) {
+            throw CompressionError("Failed to read output_shape presence flag.");
+        }
+        if (has_output_shape) {
+            uint8_t num_out = 0;
+            if (!readBasicType(stream, num_out)) {
+                throw CompressionError("Failed to read output_shape num dims.");
+            }
+            header.output_shape.resize(num_out);
+            for (uint8_t d = 0; d < num_out; ++d) {
+                uint32_t dim = 0;
+                if (!readBasicType(stream, dim)) {
+                    throw CompressionError("Failed to read output_shape dimension value.");
+                }
+                header.output_shape[d] = dim;
+            }
+        }
         headers.push_back(header);
     }
     return headers;

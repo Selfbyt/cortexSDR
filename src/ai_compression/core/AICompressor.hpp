@@ -42,6 +42,8 @@ struct CompressedSegmentHeader {
     std::string layer_name;
     size_t layer_index;
     std::string layer_type; // ONNX op type (e.g., "Conv", "MatMul")
+    std::vector<size_t> input_shape;  // True input tensor shape for the layer (from ONNX graph)
+    std::vector<size_t> output_shape; // True output tensor shape for the layer (from ONNX graph)
 };
 
 // Interface for handling compressed segments during streaming

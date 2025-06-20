@@ -114,6 +114,14 @@ static void fillLayerInfoFromSegment(const SegmentInfo& seg, const std::unordere
             std::memcpy(layer.weights.data(), layer.raw_data.data(), num_elements * sizeof(float));
         }
     }
+
+    // Propagate true input/output shapes from ModelSegment if present
+    if (!seg.input_shape.empty()) {
+        layer.input_shape = seg.input_shape;
+    }
+    if (!seg.output_shape.empty()) {
+        layer.output_shape = seg.output_shape;
+    }
 }
 
 // Example SDR archive format:
@@ -177,7 +185,7 @@ void SDRModelLoader::loadFromArchive(const std::string& archive_path) {
         } else {
             seg.layer_type.clear();
         }
-
+        
         uint8_t type_val;
         infile.read(reinterpret_cast<char*>(&type_val), sizeof(type_val));
         seg.type = static_cast<SegmentType>(type_val);
@@ -222,6 +230,32 @@ void SDRModelLoader::loadFromArchive(const std::string& archive_path) {
             tensor_shapes[seg.name] = seg.shape;
         } else {
             seg.shape.clear();
+        }
+        // Read input_shape
+        uint8_t has_input_shape = 0;
+        infile.read(reinterpret_cast<char*>(&has_input_shape), sizeof(has_input_shape));
+        if (has_input_shape) {
+            uint8_t num_in = 0;
+            infile.read(reinterpret_cast<char*>(&num_in), sizeof(num_in));
+            seg.input_shape.resize(num_in);
+            for (uint8_t d = 0; d < num_in; ++d) {
+                uint32_t dim = 0;
+                infile.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+                seg.input_shape[d] = dim;
+            }
+        }
+        // Read output_shape
+        uint8_t has_output_shape = 0;
+        infile.read(reinterpret_cast<char*>(&has_output_shape), sizeof(has_output_shape));
+        if (has_output_shape) {
+            uint8_t num_out = 0;
+            infile.read(reinterpret_cast<char*>(&num_out), sizeof(num_out));
+            seg.output_shape.resize(num_out);
+            for (uint8_t d = 0; d < num_out; ++d) {
+                uint32_t dim = 0;
+                infile.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+                seg.output_shape[d] = dim;
+            }
         }
         segments_.push_back(seg);
         // --- NEW: Check for model_structure segment and parse as ONNX ---
@@ -402,44 +436,46 @@ void SDRInferenceEngine::setInferenceMode(bool training) {
 }
 
 std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    if (layer.weights.empty()) {
-        std::cerr << "[SDRInferenceEngine] No weights for layer: " << layer.name << std::endl;
-        return input;
+    // Validate input and layer shapes
+    if (layer.input_shape.empty() || layer.output_shape.empty()) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Missing input/output shape for linear layer: " << layer.name << std::endl;
+        return {};
     }
-    // Generalized batch handling: if input.size() is a multiple of input_size, treat as batch
-    size_t input_size = layer.input_shape.empty() ? 0 : layer.input_shape.back();
-    size_t output_size = layer.output_shape.empty() ? 0 : layer.output_shape.back();
-    if (input_size == 0 || output_size == 0) {
-        std::cerr << "[SDRInferenceEngine] Invalid input/output size for layer: " << layer.name << std::endl;
-        return input;
+    size_t input_size = 1;
+    for (size_t d : layer.input_shape) input_size *= d;
+    size_t output_size = 1;
+    for (size_t d : layer.output_shape) output_size *= d;
+    if (input.size() != input_size) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size() << " does not match expected " << input_size << " for linear layer: " << layer.name << std::endl;
+        return {};
     }
-    size_t batch_size = input.size() / input_size;
-    if (input.size() % input_size != 0) {
-        std::cerr << "[SDRInferenceEngine] Input size " << input.size() << " is not a multiple of input_size " << input_size << " for layer: " << layer.name << std::endl;
-        return input;
+    if (layer.weights.size() != input_size * output_size) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Weights size " << layer.weights.size() << " does not match input*output " << input_size * output_size << " for linear layer: " << layer.name << std::endl;
+        return {};
     }
-    std::vector<float> output(batch_size * output_size, 0.0f);
-    for (size_t b = 0; b < batch_size; ++b) {
-        const float* in_ptr = input.data() + b * input_size;
-        float* out_ptr = output.data() + b * output_size;
+    if (!layer.biases.empty() && layer.biases.size() != output_size) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Biases size " << layer.biases.size() << " does not match output " << output_size << " for linear layer: " << layer.name << std::endl;
+        return {};
+    }
+    std::vector<float> output(output_size, 0.0f);
     for (size_t i = 0; i < output_size; ++i) {
         for (size_t j = 0; j < input_size; ++j) {
-                out_ptr[i] += in_ptr[j] * layer.weights[i * input_size + j];
+            output[i] += input[j] * layer.weights[i * input_size + j];
         }
         if (!layer.biases.empty()) {
-                out_ptr[i] += layer.biases[i];
-            }
+            output[i] += layer.biases[i];
         }
     }
     return output;
 }
 
 std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    if (layer.weights.empty()) {
-        std::cerr << "[SDRInferenceEngine] No weights for layer: " << layer.name << std::endl;
-        return input;
+    // Validate input and layer shapes
+    if (layer.input_shape.size() != 4 || layer.output_shape.size() != 4 ||
+        layer.properties.kernel_shape.size() != 2 || layer.properties.strides.size() != 2 || layer.properties.padding.size() != 2) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Invalid or missing shape/params for convolutional layer: " << layer.name << std::endl;
+        return {};
     }
-
     size_t batch_size = layer.input_shape[0];
     size_t in_channels = layer.input_shape[1];
     size_t in_height = layer.input_shape[2];
@@ -451,11 +487,21 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
     size_t stride_w = layer.properties.strides[1];
     size_t pad_h = layer.properties.padding[0];
     size_t pad_w = layer.properties.padding[1];
-
     size_t out_height = (in_height + 2 * pad_h - kernel_h) / stride_h + 1;
     size_t out_width = (in_width + 2 * pad_w - kernel_w) / stride_w + 1;
+    if (input.size() != batch_size * in_channels * in_height * in_width) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size() << " does not match expected " << (batch_size * in_channels * in_height * in_width) << " for convolutional layer: " << layer.name << std::endl;
+        return {};
+    }
+    if (layer.weights.size() != out_channels * in_channels * kernel_h * kernel_w) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Weights size " << layer.weights.size() << " does not match expected " << (out_channels * in_channels * kernel_h * kernel_w) << " for convolutional layer: " << layer.name << std::endl;
+        return {};
+    }
+    if (!layer.biases.empty() && layer.biases.size() != out_channels) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Biases size " << layer.biases.size() << " does not match out_channels " << out_channels << " for convolutional layer: " << layer.name << std::endl;
+        return {};
+    }
     std::vector<float> output(batch_size * out_channels * out_height * out_width, 0.0f);
-
     // Convolution operation with im2col optimization
     for (size_t b = 0; b < batch_size; ++b) {
         for (size_t oc = 0; oc < out_channels; ++oc) {
@@ -490,7 +536,6 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
             }
         }
     }
-
     return output;
 }
 
@@ -749,6 +794,15 @@ std::vector<float> SDRInferenceEngine::runLayer(const std::string& layer_name, c
         return input;
     }
     const LayerInfo& layer = it->second;
+    // Strict shape validation
+    size_t expected_input_size = 1;
+    for (size_t d : layer.input_shape) expected_input_size *= d;
+    if (input.size() != expected_input_size) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Input tensor size " << input.size()
+                  << " does not match expected input_shape product " << expected_input_size
+                  << " for layer: " << layer.name << std::endl;
+        return {};
+    }
     if (layer.layer_type == "Conv") {
         return applyConvolutionalLayer(layer, input);
     } else if (layer.layer_type == "MatMul" || layer.layer_type == "Gemm" || layer.layer_type == "LINEAR") {
@@ -768,8 +822,31 @@ std::vector<float> SDRInferenceEngine::runLayers(const std::vector<std::string>&
     std::vector<float> current = input;
     for (const auto& name : layer_names) {
         current = runLayer(name, current);
+        if (current.empty()) {
+            std::cerr << "[SDRInferenceEngine] ERROR: Aborting runLayers due to previous error or shape mismatch." << std::endl;
+            break;
+        }
     }
     return current;
+}
+
+// Suggest all possible layer chains (pairs) based on output/input shape matching
+void print_possible_layer_chains(const std::vector<LayerInfo>& layers) {
+    std::cout << "\n[Heuristic Layer Chaining] Possible layer chains (output_shape == input_shape):" << std::endl;
+    bool found = false;
+    for (const auto& l1 : layers) {
+        for (const auto& l2 : layers) {
+            if (l1.name == l2.name) continue;
+            if (l1.output_shape == l2.input_shape && !l1.output_shape.empty()) {
+                std::cout << "  " << l1.name << " (" << l1.layer_type << ") -> "
+                          << l2.name << " (" << l2.layer_type << ")" << std::endl;
+                found = true;
+            }
+        }
+    }
+    if (!found) {
+        std::cout << "  [None found]" << std::endl;
+    }
 }
 
 } // namespace CortexAICompression 

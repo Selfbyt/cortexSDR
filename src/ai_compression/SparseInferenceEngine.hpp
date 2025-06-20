@@ -41,6 +41,8 @@ struct SegmentInfo {
     size_t offset;
     std::vector<size_t> shape;  // Tensor shape for weights/biases
     std::string layer_type; // Free-form layer type string
+    std::vector<size_t> input_shape;  // True input tensor shape for the layer (from ONNX graph)
+    std::vector<size_t> output_shape; // True output tensor shape for the layer (from ONNX graph)
 };
 
 // LayerInfo holds SDR indices and metadata for a layer
@@ -143,5 +145,8 @@ private:
     std::vector<float> reshapeTensor(const std::vector<float>& input, const std::vector<size_t>& shape);
     std::vector<float> flattenTensor(const std::vector<float>& input);
 };
+
+// Utility: Print all possible layer chains (pairs) based on output/input shape matching
+void print_possible_layer_chains(const std::vector<LayerInfo>& layers);
 
 } // namespace CortexAICompression 
