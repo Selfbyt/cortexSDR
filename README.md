@@ -1,5 +1,30 @@
 # Cortex SDR (Sparse Distributed Representation)
 
+## Project Vision & Goals
+
+CortexSDR aims to make even the largest AI models (up to 70B+ parameters) accessible on low-end devices by:
+- Compressing models to a fraction of their original size using Sparse Distributed Representations (SDR)
+- Enabling selective, layer-wise, and "brain-like" inference for ultra-low memory and compute cost
+- Supporting robust, lossy compression for ONNX, PyTorch, and TensorFlow models
+- Democratizing AI by making state-of-the-art models run on phones, edge devices, and microcontrollers
+
+## Recent Achievements
+
+- Successfully compressed and ran inference on GPT-2 and other large models using SDR
+- Implemented robust per-layer metadata extraction and shape propagation
+- Enabled selective inference: run any layer or sequence of layers independently
+- Added utilities for heuristic layer chaining without the computation graph
+- Demonstrated end-to-end embedding lookup and inference on compressed models
+- Achieved safe, non-segfaulting inference with clear error reporting
+
+## Roadmap & Next Steps
+
+- Add efficient support for transformer blocks and attention layers
+- Integrate quantization and further compression for even smaller models
+- Expand documentation and provide more real-world examples
+- Release Python bindings and easy-to-use APIs for data science workflows
+- Benchmark on-device LLMs and edge AI deployments
+
 A high-performance C++ implementation that compresses data by storing it as a sparse distributed representation. By only storing the positions of active bits in a large binary vector, CortexSDR achieves a 5:1 compression ratio for text data and up to 10:1 compression ratio for image data while maintaining semantic meaning and enabling powerful pattern matching capabilities.
 
 ## Overview
