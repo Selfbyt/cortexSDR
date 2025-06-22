@@ -149,19 +149,18 @@ std::string detokenize(const std::vector<int>& tokens) {
             auto it = id_to_token.find(token_id);
             if (it != id_to_token.end()) {
                 std::string token = it->second;
-                
                 // Handle special tokens
                 if (token == "<|endoftext|>") {
                     break;
                 } else if (token == "<|unk|>") {
                     result += "[UNK]";
                 } else {
-                    // Handle GPT-2's special space token
-                    if (token.substr(0, 3) == "\u0120") {
+                    // Insert a space if token starts with \u0120 (GPT-2's space marker)
+                    if (token.rfind("\\u0120", 0) == 0) {
                         if (!result.empty() && result.back() != ' ') {
-                            result += " ";
+                            result += ' ';
                         }
-                        token = token.substr(3);
+                        token = token.substr(6); // Remove the '\u0120'
                     }
                     result += token;
                 }
@@ -169,7 +168,16 @@ std::string detokenize(const std::vector<int>& tokens) {
                 result += "[UNK]";
             }
         }
-        return result;
+        // Post-process: add space after punctuation if needed
+        std::string final_result;
+        for (size_t i = 0; i < result.length(); i++) {
+            final_result += result[i];
+            if ((result[i] == ',' || result[i] == '.' || result[i] == '!' || result[i] == '?') &&
+                i + 1 < result.length() && std::isalpha(result[i + 1])) {
+                final_result += ' ';
+            }
+        }
+        return final_result;
     }
 };
 
