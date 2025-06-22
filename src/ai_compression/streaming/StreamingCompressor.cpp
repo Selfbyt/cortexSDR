@@ -97,12 +97,12 @@ void StreamingCompressor::finalizeArchive() {
         headerEntrySize += sizeof(uint64_t); // Original Size (now 8 bytes)
         headerEntrySize += sizeof(uint64_t); // Compressed Size (now 8 bytes)
         headerEntrySize += sizeof(uint64_t); // Offset
-        
+
         // Add size for tensor metadata if present
         if (header.tensor_metadata.has_value()) {
             headerEntrySize += sizeof(uint8_t); // Number of dimensions
             headerEntrySize += header.tensor_metadata->dimensions.size() * sizeof(uint32_t); // Each dimension
-        }
+            }
         
         indexTableSize += headerEntrySize;
     }

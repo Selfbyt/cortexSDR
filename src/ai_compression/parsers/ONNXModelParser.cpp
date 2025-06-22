@@ -521,8 +521,8 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
             }
         }
         tensor_shapes[output.name()] = shape;
-    }
-
+        }
+        
     // Process initializers (weights, biases)
     for (const auto& tensor_proto : graph_proto.initializer()) {
         ModelSegment segment;
@@ -547,7 +547,7 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
                     }
                     if (!node.output().empty() && tensor_shapes.count(node.output(0))) {
                         segment.output_shape = tensor_shapes[node.output(0)];
-                    }
+        }
                     goto found_node;
                 }
             }

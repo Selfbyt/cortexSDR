@@ -823,60 +823,96 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat0xD0Tensor(
     return result;
 }
 
-// Implementation of Format0x90 tensor decoder (used for embedding matrix)
+// Improved decoder for Format0x90 tensors (large embedding matrices).
+// Empirically we observed that after a 3-byte header the data is often stored
+// as **raw little-endian float32 bytes**.  Attempt to copy directly; if the
+// sizes don’t line up fall back to the legacy heuristic decoder.
 std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat0x90Tensor(
-    const std::vector<std::byte>& compressedData, 
+    const std::vector<std::byte>& compressedData,
     size_t originalSize) const {
-    
-    std::vector<std::byte> result(originalSize, std::byte(0));
-    
-    // Format analysis based on observed patterns: 0x90 0x4E 0x01 [data...]
-    // This is used for the largest embedding tensor (wte.weight)
-    
-    // Skip the header (first 3 bytes)
-    size_t offset = 3;
-    
-    try {
-        // Extract values using a different decoding scheme for this format
-        // For the embedding matrix, we need to extract more complex values
-        std::vector<std::pair<size_t, float>> valueEntries;
-        
-        while (offset + 3 < compressedData.size()) {
-            // Read index (2 bytes) and value (1 byte)
-            uint8_t byte1 = static_cast<uint8_t>(compressedData[offset++]);
-            uint8_t byte2 = static_cast<uint8_t>(compressedData[offset++]);
-            uint8_t valueByte = static_cast<uint8_t>(compressedData[offset++]);
-            
-            // Combine into an index
-            size_t index = (static_cast<size_t>(byte2) << 8) | byte1;
-            
-            // Convert value byte to a small float (-1 to 1 range)
-            float value = (static_cast<float>(valueByte) / 127.5f) - 1.0f;
-            
-            valueEntries.emplace_back(index, value);
-            
-            // Skip any marker bytes or padding
-            if (offset < compressedData.size() && 
-                static_cast<uint8_t>(compressedData[offset]) >= 0x80) {
-                offset++;
-            }
-        }
-        
-        std::cerr << "Extracted " << valueEntries.size() << " entries from Format0x90" << std::endl;
-        
-        // Set the values in the tensor
-        size_t elementSize = 4; // Default to 4 bytes for float32
-        
-        for (const auto& entry : valueEntries) {
-            if (entry.first * elementSize + elementSize <= originalSize) {
-                std::memcpy(result.data() + entry.first * elementSize, &entry.second, elementSize);
-            }
-        }
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Error decoding Format0x90 tensor: " << e.what() << std::endl;
+
+    if (compressedData.size() <= 3) {
+        throw CompressionError("Format0x90 tensor too small");
     }
-    
+
+    const size_t payloadSize = compressedData.size() - 3; // strip 3-byte header
+
+    // Debug: dump first few header+payload bytes
+    std::cerr << "[decode0x90] originalSize=" << originalSize << " payloadSize=" << payloadSize << std::endl;
+    std::cerr << "[decode0x90] First 16 bytes: ";
+    for (size_t i=0; i < std::min<size_t>(16, compressedData.size()); ++i) {
+        std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)(uint8_t)compressedData[i] << " ";
+    }
+    std::cerr << std::dec << std::endl;
+
+    // Fast-path #1: payload contains at least the full float32 tensor – just copy first originalSize bytes.
+    if (payloadSize >= originalSize) {
+        std::vector<std::byte> result(originalSize);
+        std::memcpy(result.data(), compressedData.data() + 3, originalSize);
+        return result;
+    }
+
+    // Fast-path #2: payload looks like FP16 compressed (payload * 2 == originalSize)
+    if (payloadSize * 2 == originalSize) {
+        std::cerr << "Format0x90 detected FP16 payload – expanding to FP32" << std::endl;
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(compressedData.data() + 3);
+        size_t numElems = payloadSize / 2;
+        std::vector<std::byte> result(originalSize);
+        float* dst = reinterpret_cast<float*>(result.data());
+        for (size_t i = 0; i < numElems; ++i) {
+            uint16_t h = src[i];
+            // Simple half->float32 (IEEE-754) conversion (approx). Implement inline without external deps.
+            uint32_t sign = (h & 0x8000) << 16;
+            uint32_t exp  = (h & 0x7C00) >> 10;
+            uint32_t mant = (h & 0x03FF);
+            uint32_t f;
+            if (exp == 0) {
+                // Zero / subnormal -> directly convert
+                if (mant == 0) {
+                    f = sign; // zero
+                } else {
+                    // Normalize subnormal number
+                    exp = 1;
+                    while ((mant & 0x0400) == 0) {
+                        mant <<= 1;
+                        exp--;
+                    }
+                    mant &= 0x03FF;
+                    f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+                }
+            } else if (exp == 0x1F) {
+                // Inf/NaN
+                f = sign | 0x7F800000 | (mant << 13);
+            } else {
+                // Normalized
+                f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+            }
+            dst[i] = *reinterpret_cast<float*>(&f);
+        }
+        return result;
+    }
+
+    // Otherwise fall back to the heuristic decoder (legacy path).
+    std::cerr << "Format0x90 payload smaller than expected (" << payloadSize
+              << " vs " << originalSize << "). Falling back to heuristic decode."
+              << std::endl;
+
+    std::vector<std::byte> result(originalSize, std::byte{0});
+
+    // Legacy simple decode: interpret triples (idx_low, idx_high, valueByte)
+    size_t offset = 3;
+    const size_t elementSize = 4; // float32
+    while (offset + 3 <= compressedData.size()) {
+        uint8_t byte1 = static_cast<uint8_t>(compressedData[offset++]);
+        uint8_t byte2 = static_cast<uint8_t>(compressedData[offset++]);
+        uint8_t valueByte = static_cast<uint8_t>(compressedData[offset++]);
+        size_t index = (static_cast<size_t>(byte2) << 8) | byte1;
+        float value = (static_cast<float>(valueByte) / 127.5f) - 1.0f;
+        if (index * elementSize + elementSize <= originalSize) {
+            std::memcpy(result.data() + index * elementSize, &value, elementSize);
+        }
+    }
+
     return result;
 }
 std::vector<std::byte> SDRIndexStorageStrategy::decodeFormatBiasTensor(

@@ -59,6 +59,19 @@ std::vector<std::byte> AdaptiveSDRStrategy::compress(const ModelSegment& segment
         return compressWithDirectStorage(segment);
     }
     
+    // Apply SDR compression to all segments including embeddings for maximum compression
+    // Previously embeddings were stored uncompressed for fidelity, but now we compress them
+    // to achieve better overall model compression ratios
+    auto lowerName = segment.name;
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+    const bool looksLikeEmbedding = (lowerName.find("embed") != std::string::npos ||
+                                     lowerName.find("wte")   != std::string::npos ||
+                                     lowerName.find("embedding") != std::string::npos) &&
+                                    lowerName.find(".weight") != std::string::npos;
+    if (looksLikeEmbedding) {
+        std::cerr << "Embedding tensor ('" << segment.name << "') using SDR compression for maximum compression ratio" << std::endl;
+    }
+
     // For larger segments, use the appropriate SDR-based strategy
     if (segment.type == SegmentType::METADATA_JSON || segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
         return getMetadataStrategy()->compress(segment);

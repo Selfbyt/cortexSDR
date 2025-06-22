@@ -1,5 +1,5 @@
 # CortexSDR: Achievements
-
+ 
 - SDR compression for ONNX, PyTorch, and TensorFlow models
 - Layer-wise metadata and shape extraction
 - Selective inference and layer chaining utilities

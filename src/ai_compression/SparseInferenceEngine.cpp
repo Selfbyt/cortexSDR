@@ -104,14 +104,120 @@ static void fillLayerInfoFromSegment(const SegmentInfo& seg, const std::unordere
 
     // Check if the segment is weights or biases based on name suffix
     if (seg.name.find(".bias") != std::string::npos) {
-        if (seg.type == SegmentType::WEIGHTS_FP32 && !layer.raw_data.empty()) {
-            layer.biases.resize(num_elements);
-            std::memcpy(layer.biases.data(), layer.raw_data.data(), num_elements * sizeof(float));
+        if (!layer.raw_data.empty()) {
+            if (layer.raw_data.size() == num_elements * 2) {
+                // Stored in FP16
+                layer.biases.resize(num_elements);
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
+                for (size_t i = 0; i < num_elements; ++i) {
+                    uint16_t h = src[i];
+                    uint32_t sign = (h & 0x8000) << 16;
+                    uint32_t exp  = (h & 0x7C00) >> 10;
+                    uint32_t mant = (h & 0x03FF);
+                    uint32_t f;
+                    if (exp == 0) {
+                        if (mant == 0) f = sign;
+                        else {
+                            exp = 1;
+                            while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
+                            mant &= 0x03FF;
+                            f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+                        }
+                    } else if (exp == 0x1F) {
+                        f = sign | 0x7F800000 | (mant << 13);
+                    } else {
+                        f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+                    }
+                    layer.biases[i] = *reinterpret_cast<float*>(&f);
+                }
+            } else {
+                // Detect possible endianness mismatch for FP32 biases
+                layer.biases.resize(num_elements);
+                const uint8_t* srcBytes = reinterpret_cast<const uint8_t*>(layer.raw_data.data());
+                float probeLittle;
+                std::memcpy(&probeLittle, srcBytes, 4);
+                uint32_t tmp;
+                std::memcpy(&tmp, srcBytes, 4);
+                uint32_t swappedTmp = ((tmp & 0x000000FFU) << 24) |
+                                       ((tmp & 0x0000FF00U) << 8)  |
+                                       ((tmp & 0x00FF0000U) >> 8)  |
+                                       ((tmp & 0xFF000000U) >> 24);
+                float probeSwap;
+                std::memcpy(&probeSwap, &swappedTmp, 4);
+                bool needSwap = (std::fabs(probeLittle) < 1e-35f && std::fabs(probeSwap) > 1e-6f && std::fabs(probeSwap) < 1e4f);
+                if (!needSwap) {
+                    std::memcpy(layer.biases.data(), layer.raw_data.data(), num_elements * sizeof(float));
+                } else {
+                    for (size_t i = 0; i < num_elements; ++i) {
+                        uint32_t word;
+                        std::memcpy(&word, srcBytes + i * 4, 4);
+                        uint32_t swapped = ((word & 0x000000FFU) << 24) |
+                                           ((word & 0x0000FF00U) << 8)  |
+                                           ((word & 0x00FF0000U) >> 8)  |
+                                           ((word & 0xFF000000U) >> 24);
+                        std::memcpy(&layer.biases[i], &swapped, 4);
+                    }
+                }
+            }
         }
     } else { // Assume it's weights if not bias
-        if (seg.type == SegmentType::WEIGHTS_FP32 && !layer.raw_data.empty()) {
-            layer.weights.resize(num_elements);
-            std::memcpy(layer.weights.data(), layer.raw_data.data(), num_elements * sizeof(float));
+        if (!layer.raw_data.empty()) {
+            // Determine encoding by comparing byte-size
+            if (layer.raw_data.size() == num_elements * 4) {
+                // FP32 tensor but check for endianness mismatch
+                layer.weights.resize(num_elements);
+                const uint8_t* srcBytes = reinterpret_cast<const uint8_t*>(layer.raw_data.data());
+                float probeLittle;
+                std::memcpy(&probeLittle, srcBytes, 4);
+                uint32_t tmp;
+                std::memcpy(&tmp, srcBytes, 4);
+                uint32_t swappedTmp = ((tmp & 0x000000FFU) << 24) |
+                                       ((tmp & 0x0000FF00U) << 8)  |
+                                       ((tmp & 0x00FF0000U) >> 8)  |
+                                       ((tmp & 0xFF000000U) >> 24);
+                float probeSwap;
+                std::memcpy(&probeSwap, &swappedTmp, 4);
+                bool needSwap = (std::fabs(probeLittle) < 1e-35f && std::fabs(probeSwap) > 1e-6f && std::fabs(probeSwap) < 1e4f);
+                if (!needSwap) {
+                    std::memcpy(layer.weights.data(), layer.raw_data.data(), num_elements * sizeof(float));
+                } else {
+                    for (size_t i = 0; i < num_elements; ++i) {
+                        uint32_t word;
+                        std::memcpy(&word, srcBytes + i * 4, 4);
+                        uint32_t swapped = ((word & 0x000000FFU) << 24) |
+                                           ((word & 0x0000FF00U) << 8)  |
+                                           ((word & 0x00FF0000U) >> 8)  |
+                                           ((word & 0xFF000000U) >> 24);
+                        std::memcpy(&layer.weights[i], &swapped, 4);
+                    }
+                }
+            } else if (layer.raw_data.size() == num_elements * 2) {
+                // Promote FP16 -> FP32
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
+                layer.weights.resize(num_elements);
+                for (size_t i = 0; i < num_elements; ++i) {
+                    uint16_t h = src[i];
+                    uint32_t sign = (h & 0x8000) << 16;
+                    uint32_t exp  = (h & 0x7C00) >> 10;
+                    uint32_t mant = (h & 0x03FF);
+                    uint32_t f;
+                    if (exp == 0) {
+                        if (mant == 0) {
+                            f = sign; // zero
+                        } else {
+                            exp = 1;
+                            while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
+                            mant &= 0x03FF;
+                            f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+                        }
+                    } else if (exp == 0x1F) {
+                        f = sign | 0x7F800000 | (mant << 13);
+                    } else {
+                        f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+                    }
+                    layer.weights[i] = *reinterpret_cast<float*>(&f);
+                }
+            }
         }
     }
 
@@ -260,32 +366,36 @@ void SDRModelLoader::loadFromArchive(const std::string& archive_path) {
         segments_.push_back(seg);
         // --- NEW: Check for model_structure segment and parse as ONNX ---
 #ifdef ENABLE_ONNX_PROTOBUF
+        // Preserve the GRAPH_STRUCTURE_PROTO segment but **skip** expensive parsing.
         if (seg.type == SegmentType::GRAPH_STRUCTURE_PROTO && seg.name == "model_structure") {
-            std::ifstream data_infile(archive_path, std::ios::binary);
-            data_infile.seekg(seg.offset, std::ios::beg);
-            std::vector<std::byte> compressed_buffer(seg.compressed_size);
-            data_infile.read(reinterpret_cast<char*>(compressed_buffer.data()), seg.compressed_size);
-            std::vector<std::byte> decompressed_bytes;
-            if (seg.strategy_id == 0) {
-                decompressed_bytes = compressed_buffer;
-            } else if (seg.strategy_id == 1) {
-                decompressed_bytes = decompressSDR(compressed_buffer, seg.original_size);
-            } else {
-                std::cerr << "[SDRModelLoader] Unknown compression strategy for model_structure segment: " << (int)seg.strategy_id << std::endl;
-                continue;
-            }
-            if (decompressed_bytes.empty()) {
-                std::cerr << "[SDRModelLoader] Failed to decompress model_structure segment." << std::endl;
-            } else {
-                std::string model_str(reinterpret_cast<const char*>(decompressed_bytes.data()), decompressed_bytes.size());
-                onnx::ModelProto proto;
-                if (proto.ParseFromString(model_str)) {
-                    loaded_model_proto_ = proto;
-                    std::cout << "[SDRModelLoader] Loaded ONNX ModelProto from model_structure segment." << std::endl;
-                } else {
-                    std::cerr << "[SDRModelLoader] Failed to parse ONNX ModelProto from model_structure segment after decompression." << std::endl;
-                }
-            }
+            // std::ifstream data_infile(archive_path, std::ios::binary);
+            // data_infile.seekg(seg.offset, std::ios::beg);
+            // std::vector<std::byte> compressed_buffer(seg.compressed_size);
+            // data_infile.read(reinterpret_cast<char*>(compressed_buffer.data()), seg.compressed_size);
+            // std::vector<std::byte> decompressed_bytes;
+            // if (seg.strategy_id == 0) {
+            //     decompressed_bytes = compressed_buffer;
+            // } else if (seg.strategy_id == 1) {
+            //     decompressed_bytes = decompressSDR(compressed_buffer, seg.original_size);
+            // } else {
+            //     std::cerr << "[SDRModelLoader] Unknown compression strategy for model_structure segment: " << (int)seg.strategy_id << std::endl;
+            //     continue;
+            // }
+            // if (decompressed_bytes.empty()) {
+            //     std::cerr << "[SDRModelLoader] Failed to decompress model_structure segment." << std::endl;
+            // } else {
+            //     std::string model_str(reinterpret_cast<const char*>(decompressed_bytes.data()), decompressed_bytes.size());
+            //     onnx::ModelProto proto;
+            //     if (proto.ParseFromString(model_str)) {
+            //         loaded_model_proto_ = proto;
+            //         std::cout << "[SDRModelLoader] Loaded ONNX ModelProto from model_structure segment." << std::endl;
+            //     } else {
+            //         std::cerr << "[SDRModelLoader] Failed to parse ONNX ModelProto from model_structure segment after decompression." << std::endl;
+            //     }
+            // }
+            std::cout << "[SDRModelLoader] Graph structure segment detected (" << seg.original_size
+                      << " bytes). Skipping ONNX parse – not required for inference." << std::endl;
+            continue; // Nothing else to do for this segment
         }
 #endif
     }

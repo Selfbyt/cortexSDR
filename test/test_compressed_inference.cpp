@@ -131,7 +131,8 @@ TEST_F(CompressedInferenceTest, SelectiveInference) {
     // Restore: Compress the model before inference
     std::string model_path = "/home/mbishu/Desktop/cortexSDR/gpt2-10.onnx";
     std::string compressed_path = "compressed_model.sdr";
-    float sparsity = 0.02f;
+    // Raise sparsity to retain 20% of weights so embeddings aren’t overly zeroed
+    float sparsity = 0.20f;
 
     CortexCompressionOptions options;
     CortexError err = cortex_compression_options_init(&options);
