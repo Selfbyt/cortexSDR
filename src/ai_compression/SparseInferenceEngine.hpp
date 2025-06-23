@@ -12,9 +12,12 @@
 #include <sstream>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include "core/ModelSegment.hpp"  // Include for SegmentType
 #include <optional>
 #include "onnx_proto/onnx.pb.h"
+#include "core/AIDecompressor.hpp" // For AIDecompressor
+#include <functional>
 
 namespace CortexAICompression {
 
@@ -29,20 +32,6 @@ enum class LayerType {
     BATCH_NORM,
     POOLING,
     ACTIVATION
-};
-
-// Structure to hold segment information
-struct SegmentInfo {
-    std::string name;
-    SegmentType type;
-    uint8_t strategy_id;
-    size_t original_size;
-    size_t compressed_size;
-    size_t offset;
-    std::vector<size_t> shape;  // Tensor shape for weights/biases
-    std::string layer_type; // Free-form layer type string
-    std::vector<size_t> input_shape;  // True input tensor shape for the layer (from ONNX graph)
-    std::vector<size_t> output_shape; // True output tensor shape for the layer (from ONNX graph)
 };
 
 // LayerInfo holds SDR indices and metadata for a layer
@@ -84,9 +73,11 @@ public:
     // Legacy: loads all layers into memory (not memory efficient for large models)
     const std::vector<LayerInfo>& getLayers() const;
     // On-demand: get segment index (headers only, no data loaded)
-    const std::vector<SegmentInfo>& getSegmentIndex() const { return segments_; }
+    const std::vector<CompressedSegmentHeader>& getSegmentIndex() const;
     // On-demand: load a single layer by name
     LayerInfo loadLayerByName(const std::string& name) const;
+    // On-demand: load a single layer by name asynchronously
+    std::shared_future<LayerInfo> loadLayerByNameAsync(const std::string& name) const;
     // Helper to decode varint-encoded indices from SDR data
     static std::vector<size_t> decode_varint_indices(const std::vector<std::byte>& data);
 #ifdef ENABLE_ONNX_PROTOBUF
@@ -97,9 +88,11 @@ public:
     const std::unordered_map<std::string, LayerInfo>& getLayerMap() const { return layer_map_; }
 private:
     std::string archive_path_;
-    std::vector<SegmentInfo> segments_;
+    std::vector<CompressedSegmentHeader> segments_;
     std::vector<LayerInfo> layers; // legacy: all layers loaded
     std::unordered_map<std::string, LayerInfo> layer_map_; // For fast lookup by name
+    mutable std::unordered_map<std::string, std::shared_future<LayerInfo>> layer_cache_;
+    std::unique_ptr<AIDecompressor> decompressor_;
     void loadFromArchive(const std::string& archive_path);
     void parseLayerMetadata(const std::string& metadata, LayerInfo& layer);
     std::vector<std::byte> decompressSDR(const std::vector<std::byte>& compressed_data, size_t original_size) const;
@@ -110,22 +103,25 @@ private:
 
 class SDRInferenceEngine {
 public:
-    explicit SDRInferenceEngine(const SDRModelLoader& model);
+    // Constructor now takes the loader directly for on-demand loading
+    explicit SDRInferenceEngine(SDRModelLoader& model_loader);
     // Given input tensor, run inference and return output tensor
     std::vector<float> run(const std::vector<float>& input_tensor);
     
     // Additional inference options
-    void setBatchSize(size_t batch_size);
+    void setBatchSize(size_t size);
     void enableDropout(bool enable);
     void setInferenceMode(bool training);
     
     // New: Run a single layer by name
-    std::vector<float> runLayer(const std::string& layer_name, const std::vector<float>& input);
-    // New: Run a sequence of layers by name
+    std::vector<float> runLayer(const LayerInfo& layer, const std::vector<float>& input);
+    // Run a sequence of layers by name, loading them on-demand
     std::vector<float> runLayers(const std::vector<std::string>& layer_names, const std::vector<float>& input);
     
 private:
-    std::vector<LayerInfo> layers;
+    // Engine no longer stores all layers. It holds a reference to the loader.
+    SDRModelLoader& loader_; 
+
     size_t batch_size;
     bool dropout_enabled;
     bool training_mode;
@@ -144,9 +140,14 @@ private:
     void updateBatchNormStats(const LayerInfo& layer, const std::vector<float>& input);
     std::vector<float> reshapeTensor(const std::vector<float>& input, const std::vector<size_t>& shape);
     std::vector<float> flattenTensor(const std::vector<float>& input);
+
+    // Dynamic dispatch table for op type -> handler
+    std::unordered_map<std::string, std::function<std::vector<float>(const LayerInfo&, const std::vector<float>&)>> op_dispatch_;
+    // Default handler for unknown ops
+    std::function<std::vector<float>(const LayerInfo&, const std::vector<float>&)> default_handler_;
 };
 
-// Utility: Print all possible layer chains (pairs) based on output/input shape matching
+// Heuristic to get a plausible execution order by sorting layer names
 void print_possible_layer_chains(const std::vector<LayerInfo>& layers);
 
 } // namespace CortexAICompression 

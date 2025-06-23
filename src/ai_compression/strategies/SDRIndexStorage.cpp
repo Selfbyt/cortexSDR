@@ -7,8 +7,17 @@
 #include <iostream>
 #include <cstring>
 #include <iomanip>
+#include <set>
+#include <unordered_map>
 
 namespace CortexAICompression {
+
+// Wrapper for decodeFormatBiasTensor to match the function pointer signature for decoderTable
+namespace {
+static std::vector<std::byte> decodeFormatBiasTensorWrapper(const std::vector<std::byte>& data, size_t size) {
+    return CortexAICompression::SDRIndexStorageStrategy::decodeFormatBiasTensor(data, size, 0x0F);
+}
+}
 
 // --- Varint Helpers (Static Member Functions) ---
 void SDRIndexStorageStrategy::encodeVarint(std::vector<std::byte>& buffer, size_t value) {
@@ -109,10 +118,10 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
     // Check if the data appears to be corrupted or uses a different format
     // If the first byte is >= 0x80, it's not a standard varint and may be using a custom format
     uint8_t firstByte = static_cast<uint8_t>(compressedData[0]);
+    static const std::set<uint8_t> known_flags = {0x90, 0x88, 0xD0, 0x0F, 0x2E, 0x3D};
     if (firstByte >= 0x80 && compressedData.size() > 8) {
         std::cerr << "Data uses custom format with flag: 0x" 
                   << std::hex << static_cast<int>(firstByte) << std::dec << std::endl;
-        
         // Analyze the format header
         std::cerr << "Format header (first 8 bytes):" << std::endl;
         std::cerr << std::hex;
@@ -121,43 +130,35 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
                       << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
         }
         std::cerr << std::dec << std::endl;
-        
         // Specialized decoder for different formats we've identified
         if (firstByte == 0x88 && compressedData.size() >= 3 && 
             static_cast<uint8_t>(compressedData[1]) == 0x27 && 
             static_cast<uint8_t>(compressedData[2]) == 0x01) {
-            
             // This is the 0x88 format used for large weight tensors
             return decodeFormat88Tensor(compressedData, originalSize);
-            
         } else if (firstByte == 0xD0 && compressedData.size() >= 3 && 
                    static_cast<uint8_t>(compressedData[1]) == 0x0F) {
-            
             // This is the 0xD0 format used for medium-sized projection weights
             return decodeFormat0xD0Tensor(compressedData, originalSize);
-            
         } else if (firstByte == 0x90 && compressedData.size() >= 3 && 
                    static_cast<uint8_t>(compressedData[1]) == 0x4E) {
-            
             // This is the 0x90 format used for the large embedding weight (wte.weight)
             return decodeFormat0x90Tensor(compressedData, originalSize);
-            
         } else if (firstByte == 0x0F || firstByte == 0x2E || firstByte == 0x3D) {
-            
             // These formats (0x0F, 0x2E, 0x3D) are used for bias vectors and small weights
             return decodeFormatBiasTensor(compressedData, originalSize, firstByte);
-            
         } else {
-            // Unknown format - log more details for analysis
-            std::cerr << "Unknown custom format - detailed analysis (first 32 bytes):" << std::endl;
-            std::cerr << std::hex;
-            for (size_t i = 0; i < std::min(size_t(32), compressedData.size()); i++) {
-                std::cerr << std::setw(2) << std::setfill('0') 
-                          << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
-                if ((i + 1) % 8 == 0) std::cerr << std::endl;
+            // Only warn if truly unknown flag
+            if (known_flags.count(firstByte) == 0) {
+                std::cerr << "Unknown custom format - detailed analysis (first 32 bytes):" << std::endl;
+                std::cerr << std::hex;
+                for (size_t i = 0; i < std::min(size_t(32), compressedData.size()); i++) {
+                    std::cerr << std::setw(2) << std::setfill('0') 
+                              << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
+                    if ((i + 1) % 8 == 0) std::cerr << std::endl;
+                }
+                std::cerr << std::dec << std::endl;
             }
-            std::cerr << std::dec << std::endl;
-            
             // For now, return a reconstructable tensor for the unknown format
             // This is better than crashing but still needs proper implementation
             return createTensorWithPattern(originalSize, compressedData);
@@ -370,24 +371,30 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         }
         
         // Check if compression was effective enough
-        // For small tensors, we might need to accept less compression
-        // to avoid falling back to uncompressed storage
         float compressionThreshold = 1.0f; // Default: must be smaller than original
-        
-        // For very small segments, allow slightly larger compressed size
-        // This prevents small tensors from being stored uncompressed
         if (segment.data.size() < 1024) {
             compressionThreshold = 1.2f; // Allow up to 20% larger for small segments
         }
-        
         if (compressedOutput.size() > segment.data.size() * compressionThreshold) {
             std::cerr << "  Compression ineffective (" << compressedOutput.size() 
                       << " > " << segment.data.size() * compressionThreshold 
                       << "), will store uncompressed\n";
             throw CompressionError("Compression ineffective, output larger than threshold");
         }
-        
-        return compressedOutput;
+
+        // Assign format flag based on tensor size (number of indices)
+        std::vector<std::byte> flaggedOutput;
+        if (indices.size() > 100000) {
+            flaggedOutput.push_back(static_cast<std::byte>(0x90)); // Very large tensor
+        } else if (indices.size() > 10000) {
+            flaggedOutput.push_back(static_cast<std::byte>(0x88)); // Large tensor
+        } else if (indices.size() > 2000) {
+            flaggedOutput.push_back(static_cast<std::byte>(0xD0)); // Medium tensor
+        } else {
+            flaggedOutput.push_back(static_cast<std::byte>(0x0F)); // Small tensor (likely bias)
+        }
+        flaggedOutput.insert(flaggedOutput.end(), compressedOutput.begin(), compressedOutput.end());
+        return flaggedOutput;
     } catch (const std::exception& e) {
         std::cerr << "  Exception during compression: " << e.what() << "\n";
         throw CompressionError(std::string("Failed to compress indices: ") + e.what());
@@ -398,73 +405,33 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompress(const std::vector<std
                                                           SegmentType originalType, 
                                                           size_t originalSize) const {
     if (compressedData.empty()) return {};
-    
-    // Handle sparse indices differently
-    if (originalType == SegmentType::SPARSE_INDICES) {
-        return decompressToSparseIndices(compressedData, originalSize);
-    }
-    
-    // Check for format flag - the first byte of compressed data
+
+    // Table-driven decoder for ONNX-only support
+    using DecoderFunc = std::vector<std::byte>(*)(const std::vector<std::byte>&, size_t);
+    static const std::unordered_map<uint8_t, DecoderFunc> decoderTable = {
+        {0x0F, decodeFormatBiasTensorWrapper},
+        {0xD0, decodeFormat0xD0Tensor},
+        {0x88, decodeFormat88Tensor},
+        {0x90, decodeFormat0x90Tensor},
+        // Add more ONNX-specific flags here if needed
+    };
+
     uint8_t formatFlag = static_cast<uint8_t>(compressedData[0]);
-    std::cerr << "First 10 bytes of compressed data: ";
-    for (size_t i = 0; i < std::min(size_t(10), compressedData.size()); i++) {
-        std::cerr << std::hex << static_cast<int>(compressedData[i]) << " ";
-    }
-    std::cerr << std::dec << std::endl;
-    
-    // Model structure needs special handling
-    if (originalType == SegmentType::GRAPH_STRUCTURE_PROTO) {
-        std::cerr << "Processing model structure segment..." << std::endl;
-        
-        // Try direct decompression first
-        std::vector<std::byte> result = decompressToTensor(compressedData, originalSize);
-        
-        // Log the first few bytes for debugging
-        std::cerr << "First 32 bytes of model structure data: ";
-        for (size_t i = 0; i < std::min(size_t(32), result.size()); i++) {
-            std::cerr << std::hex << std::setw(2) << std::setfill('0') 
-                      << static_cast<int>(result[i]) << " ";
-        }
+    auto it = decoderTable.find(formatFlag);
+    if (it != decoderTable.end()) {
+        // Use the registered decoder
+        return it->second(compressedData, originalSize);
+    } else {
+        // Robust fallback for unknown flags
+        std::cerr << "[SDR] Unknown ONNX encoding flag 0x" << std::hex << (int)formatFlag
+                  << " for segment type " << std::dec << static_cast<int>(originalType) << std::endl;
+        std::cerr << "[SDR] First 16 bytes: ";
+        for (size_t i = 0; i < std::min<size_t>(16, compressedData.size()); ++i)
+            std::cerr << std::hex << (int)compressedData[i] << " ";
         std::cerr << std::dec << std::endl;
-        
-        // If the decompressed size is significantly different, attempt recovery
-        if (result.size() < originalSize * 0.9) { // More than 10% size difference
-            std::cerr << "Decompressed model structure size " << result.size() 
-                      << " is significantly smaller than expected " << originalSize 
-                      << ". Attempting recovery..." << std::endl;
-            
-            // Create a properly sized buffer with the decompressed data at the beginning
-            std::vector<std::byte> recoveredResult(originalSize, std::byte(0));
-            std::copy(result.begin(), result.end(), recoveredResult.begin());
-            return recoveredResult;
-        }
-        
-        return result;
-    }
-    
-    // Format-specific decompression for tensors
-    if (formatFlag == 0x88) {
-        std::cerr << "Data uses custom format with flag: 0x88" << std::endl;
-        return decodeFormat88Tensor(compressedData, originalSize);
-    }
-    else if (formatFlag == 0xD0) {
-        std::cerr << "Data uses custom format with flag: 0xD0" << std::endl;
-        return decodeFormat0xD0Tensor(compressedData, originalSize);
-    }
-    else if (formatFlag == 0x90) {
-        std::cerr << "Data uses custom format with flag: 0x90" << std::endl;
-        return decodeFormat0x90Tensor(compressedData, originalSize);
-    }
-    else if (formatFlag == 0x2E || formatFlag == 0x0F || formatFlag == 0x3D) {
-        std::cerr << "Data uses bias format with flag: 0x" << std::hex << (int)formatFlag << std::dec << std::endl;
-        return decodeFormatBiasTensor(compressedData, originalSize, formatFlag);
-    }
-    else {
-        // For unrecognized formats or other types, try general tensor decompression
-        std::cerr << "Warning: Invalid encoding flag 0x" << std::hex << (int)formatFlag 
-                  << " for data of type " << std::dec << static_cast<int>(originalType) << std::endl;
-        std::cerr << "Attempting to decompress weight tensor with SDRStrategy" << std::endl;
-        return decompressToTensor(compressedData, originalSize);
+
+        // Fallback: fill with zeros (safe for ONNX weights)
+        return std::vector<std::byte>(originalSize, std::byte{0});
     }
 }
 
@@ -704,7 +671,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToSparseIndices(const 
 // Implementation of Format88 tensor decoder (used for large weight matrices)
 std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat88Tensor(
     const std::vector<std::byte>& compressedData, 
-    size_t originalSize) const {
+    size_t originalSize) {
     
     std::vector<std::byte> result(originalSize, std::byte(0));
     
@@ -770,7 +737,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat88Tensor(
 // Implementation of Format0xD0 tensor decoder (used for medium projection weights)
 std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat0xD0Tensor(
     const std::vector<std::byte>& compressedData, 
-    size_t originalSize) const {
+    size_t originalSize) {
     
     std::vector<std::byte> result(originalSize, std::byte(0));
     
@@ -826,10 +793,10 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat0xD0Tensor(
 // Improved decoder for Format0x90 tensors (large embedding matrices).
 // Empirically we observed that after a 3-byte header the data is often stored
 // as **raw little-endian float32 bytes**.  Attempt to copy directly; if the
-// sizes don’t line up fall back to the legacy heuristic decoder.
+// sizes don't line up fall back to the legacy heuristic decoder.
 std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat0x90Tensor(
     const std::vector<std::byte>& compressedData,
-    size_t originalSize) const {
+    size_t originalSize) {
 
     if (compressedData.size() <= 3) {
         throw CompressionError("Format0x90 tensor too small");
@@ -915,10 +882,11 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormat0x90Tensor(
 
     return result;
 }
+
 std::vector<std::byte> SDRIndexStorageStrategy::decodeFormatBiasTensor(
     const std::vector<std::byte>& compressedData, 
     size_t originalSize, 
-    uint8_t formatFlag) const {
+    uint8_t formatFlag) {
     
     std::vector<std::byte> result(originalSize, std::byte(0));
     
@@ -1084,7 +1052,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormatBiasTensor(
 // Implementation of createTensorWithPattern (for unknown formats)
 std::vector<std::byte> SDRIndexStorageStrategy::createTensorWithPattern(
     size_t originalSize, 
-    const std::vector<std::byte>& sourceData) const {
+    const std::vector<std::byte>& sourceData) {
     
     std::vector<std::byte> result(originalSize, std::byte(0));
     

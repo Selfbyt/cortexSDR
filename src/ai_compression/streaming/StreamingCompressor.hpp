@@ -34,9 +34,10 @@ private:
     std::mutex writeMutex_; // Mutex might still be needed if handleCompressedSegment is called concurrently
     size_t totalCompressedSize_ = 0;
     size_t totalOriginalSize_ = 0;
+    uint64_t currentDataOffset_ = 0;
 
-    // Storage for segments before final writing
-    std::vector<std::pair<CompressedSegmentHeader, std::vector<std::byte>>> segments_;
+    // Storage for segment headers and their file offsets
+    std::vector<std::pair<CompressedSegmentHeader, uint64_t>> segment_headers_;
 };
 
 } // namespace CortexAICompression

@@ -33,8 +33,11 @@ public:
     // Throws CompressionError on failure or format errors.
     void decompressModelStream(std::istream& inputArchiveStream, ISegmentHandler& handler);
 
+    // New method for on-demand segment decompression from a file path and a known header/info
+    ModelSegment decompressSegment(const std::string& archivePath, const CompressedSegmentHeader& segmentInfo, uint64_t offset);
+
     // Optional: Method to read just the archive index/headers first
-    // std::vector<CompressedSegmentHeader> readArchiveHeaders(std::istream& inputArchiveStream);
+    std::vector<CompressedSegmentHeader> readArchiveHeaders(std::istream& inputArchiveStream);
 
     // Optional: Method to decompress a specific named segment on demand
     // ModelSegment decompressSegmentByName(std::istream& inputArchiveStream, const std::string& segmentName);

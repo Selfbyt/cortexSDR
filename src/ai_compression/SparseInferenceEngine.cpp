@@ -9,6 +9,16 @@
 #include <random>
 #include "core/ArchiveConstants.hpp"
 #include <functional>
+#include <future>
+#include <thread>
+
+// Added for the new implementation
+#include "strategies/AdaptiveSDRStrategy.hpp"
+#include "strategies/GzipStrategy.hpp"
+#include "strategies/NumericalRLE.hpp"
+#include "strategies/QuantizedTensorStrategy.hpp"
+#include "strategies/SDRIndexStorage.hpp"
+
 #ifdef ENABLE_ONNX_PROTOBUF
 #include <../onnx_proto/onnx.pb.h>
 #endif
@@ -72,161 +82,102 @@ void SDRModelLoader::parseLayerMetadata(const std::string& metadata, LayerInfo& 
 }
 
 SDRModelLoader::SDRModelLoader(const std::string& archive_path) : archive_path_(archive_path) {
+    // Initialize the decompressor and register all potential strategies
+    decompressor_ = std::make_unique<AIDecompressor>();
+    
+    // These IDs MUST match the ones used in c_api.cpp during compression
+    const uint8_t SDR_STRATEGY_ID = 1;
+    const uint8_t RLE_STRATEGY_ID = 2;
+    const uint8_t GZIP_STRATEGY_ID = 3;
+    const uint8_t QUANT_STRATEGY_ID = 4;
+    
+    // The AdaptiveSDRStrategy is the main one used for SDR compression.
+    // Sparsity value is only needed for compression, so a default is fine for decompression.
+    auto adaptiveStrategy = std::make_shared<AdaptiveSDRStrategy>(0.02f); 
+    
+    decompressor_->registerStrategy(SDR_STRATEGY_ID, adaptiveStrategy);
+    decompressor_->registerStrategy(RLE_STRATEGY_ID, std::make_shared<NumericalRLEStrategy>());
+    decompressor_->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
+#ifdef ENABLE_QUANTIZATION
+    decompressor_->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());
+#endif
+
+    // For backwards compatibility, also register the legacy SDR strategy under a different ID
+    // if older files might be loaded.
+    auto legacySdrStrategy = std::make_shared<SDRIndexStorageStrategy>();
+    decompressor_->registerStrategy(SDR_STRATEGY_ID + 10, legacySdrStrategy);
+
     loadFromArchive(archive_path);
+
+    // Eagerly populate layer_map_ with decompressed data for all segments
+    for (const auto& seg : segments_) {
+        // Only load weight/bias segments, skip metadata/structure
+        if (seg.original_type == SegmentType::WEIGHTS_FP32 ||
+            seg.original_type == SegmentType::WEIGHTS_FP16 ||
+            seg.original_type == SegmentType::WEIGHTS_INT8) {
+            try {
+                LayerInfo layer = loadLayerByName(seg.name);
+                layer_map_[seg.name] = std::move(layer);
+            } catch (const std::exception& e) {
+                std::cerr << "[SDRModelLoader] Failed to load layer '" << seg.name << "': " << e.what() << std::endl;
+            }
+        }
+    }
 }
 
-// Helper to fill in LayerInfo properties from SegmentInfo and previous layer
-static void fillLayerInfoFromSegment(const SegmentInfo& seg, const std::unordered_map<std::string, std::vector<size_t>>& tensor_shapes, LayerInfo& layer) {
-    // The layer name should be the base name, without .weights or .bias
-    // This logic will be handled in the calling loop.
-    // layer.name is assumed to be set correctly before calling.
-    
+// Helper to fill in LayerInfo properties from a decompressed ModelSegment
+static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInfo& layer) {
     // Use the true layer type from the segment
     if (layer.layer_type.empty()) {
-        layer.layer_type = seg.layer_type;
+        layer.layer_type = model_segment.layer_type;
     }
 
-    const std::vector<size_t>* shape = &seg.shape;
-    auto it_shape = tensor_shapes.find(seg.name);
-    if (it_shape != tensor_shapes.end()) {
-        shape = &it_shape->second;
-    }
-
-    if (!shape->empty()) {
-        if (layer.input_shape.empty()) {
-             layer.input_shape = *shape;
+    // Use metadata from the segment if available
+    if (model_segment.tensor_metadata) {
+        const auto& meta = model_segment.tensor_metadata.value();
+        if (layer.input_shape.empty() && !meta.dimensions.empty()) {
+             layer.input_shape = meta.dimensions;
         }
-        layer.output_shape = *shape;
+        layer.output_shape = meta.dimensions;
     }
 
-    size_t num_elements = 1;
-    for (size_t d : *shape) num_elements *= d;
+    layer.raw_data = model_segment.data;
+
+    size_t num_elements = 0;
+    size_t element_size = 4; // Default to float32
+
+    if(model_segment.type == SegmentType::WEIGHTS_FP16) element_size = 2;
+    if(model_segment.type == SegmentType::WEIGHTS_INT8) element_size = 1;
+
+    if (model_segment.original_size > 0) {
+        num_elements = model_segment.original_size / element_size;
+    }
 
     // Check if the segment is weights or biases based on name suffix
-    if (seg.name.find(".bias") != std::string::npos) {
+    if (model_segment.name.find(".bias") != std::string::npos) {
         if (!layer.raw_data.empty()) {
-            if (layer.raw_data.size() == num_elements * 2) {
-                // Stored in FP16
-                layer.biases.resize(num_elements);
-                const uint16_t* src = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
-                for (size_t i = 0; i < num_elements; ++i) {
-                    uint16_t h = src[i];
-                    uint32_t sign = (h & 0x8000) << 16;
-                    uint32_t exp  = (h & 0x7C00) >> 10;
-                    uint32_t mant = (h & 0x03FF);
-                    uint32_t f;
-                    if (exp == 0) {
-                        if (mant == 0) f = sign;
-                        else {
-                            exp = 1;
-                            while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
-                            mant &= 0x03FF;
-                            f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-                        }
-                    } else if (exp == 0x1F) {
-                        f = sign | 0x7F800000 | (mant << 13);
-                    } else {
-                        f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-                    }
-                    layer.biases[i] = *reinterpret_cast<float*>(&f);
-                }
-            } else {
-                // Detect possible endianness mismatch for FP32 biases
-                layer.biases.resize(num_elements);
-                const uint8_t* srcBytes = reinterpret_cast<const uint8_t*>(layer.raw_data.data());
-                float probeLittle;
-                std::memcpy(&probeLittle, srcBytes, 4);
-                uint32_t tmp;
-                std::memcpy(&tmp, srcBytes, 4);
-                uint32_t swappedTmp = ((tmp & 0x000000FFU) << 24) |
-                                       ((tmp & 0x0000FF00U) << 8)  |
-                                       ((tmp & 0x00FF0000U) >> 8)  |
-                                       ((tmp & 0xFF000000U) >> 24);
-                float probeSwap;
-                std::memcpy(&probeSwap, &swappedTmp, 4);
-                bool needSwap = (std::fabs(probeLittle) < 1e-35f && std::fabs(probeSwap) > 1e-6f && std::fabs(probeSwap) < 1e4f);
-                if (!needSwap) {
-                    std::memcpy(layer.biases.data(), layer.raw_data.data(), num_elements * sizeof(float));
-                } else {
-                    for (size_t i = 0; i < num_elements; ++i) {
-                        uint32_t word;
-                        std::memcpy(&word, srcBytes + i * 4, 4);
-                        uint32_t swapped = ((word & 0x000000FFU) << 24) |
-                                           ((word & 0x0000FF00U) << 8)  |
-                                           ((word & 0x00FF0000U) >> 8)  |
-                                           ((word & 0xFF000000U) >> 24);
-                        std::memcpy(&layer.biases[i], &swapped, 4);
-                    }
-                }
+            layer.biases.resize(num_elements);
+             if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+                // TODO: Handle FP16 to FP32 conversion if necessary for the engine
             }
+            std::memcpy(layer.biases.data(), layer.raw_data.data(), layer.raw_data.size());
         }
     } else { // Assume it's weights if not bias
         if (!layer.raw_data.empty()) {
-            // Determine encoding by comparing byte-size
-            if (layer.raw_data.size() == num_elements * 4) {
-                // FP32 tensor but check for endianness mismatch
-                layer.weights.resize(num_elements);
-                const uint8_t* srcBytes = reinterpret_cast<const uint8_t*>(layer.raw_data.data());
-                float probeLittle;
-                std::memcpy(&probeLittle, srcBytes, 4);
-                uint32_t tmp;
-                std::memcpy(&tmp, srcBytes, 4);
-                uint32_t swappedTmp = ((tmp & 0x000000FFU) << 24) |
-                                       ((tmp & 0x0000FF00U) << 8)  |
-                                       ((tmp & 0x00FF0000U) >> 8)  |
-                                       ((tmp & 0xFF000000U) >> 24);
-                float probeSwap;
-                std::memcpy(&probeSwap, &swappedTmp, 4);
-                bool needSwap = (std::fabs(probeLittle) < 1e-35f && std::fabs(probeSwap) > 1e-6f && std::fabs(probeSwap) < 1e4f);
-                if (!needSwap) {
-                    std::memcpy(layer.weights.data(), layer.raw_data.data(), num_elements * sizeof(float));
-                } else {
-                    for (size_t i = 0; i < num_elements; ++i) {
-                        uint32_t word;
-                        std::memcpy(&word, srcBytes + i * 4, 4);
-                        uint32_t swapped = ((word & 0x000000FFU) << 24) |
-                                           ((word & 0x0000FF00U) << 8)  |
-                                           ((word & 0x00FF0000U) >> 8)  |
-                                           ((word & 0xFF000000U) >> 24);
-                        std::memcpy(&layer.weights[i], &swapped, 4);
-                    }
-                }
-            } else if (layer.raw_data.size() == num_elements * 2) {
-                // Promote FP16 -> FP32
-                const uint16_t* src = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
-                layer.weights.resize(num_elements);
-                for (size_t i = 0; i < num_elements; ++i) {
-                    uint16_t h = src[i];
-                    uint32_t sign = (h & 0x8000) << 16;
-                    uint32_t exp  = (h & 0x7C00) >> 10;
-                    uint32_t mant = (h & 0x03FF);
-                    uint32_t f;
-                    if (exp == 0) {
-                        if (mant == 0) {
-                            f = sign; // zero
-                        } else {
-                            exp = 1;
-                            while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
-                            mant &= 0x03FF;
-                            f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-                        }
-                    } else if (exp == 0x1F) {
-                        f = sign | 0x7F800000 | (mant << 13);
-                    } else {
-                        f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-                    }
-                    layer.weights[i] = *reinterpret_cast<float*>(&f);
-                }
+            layer.weights.resize(num_elements);
+            if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+                // TODO: Handle FP16 to FP32 conversion if necessary for the engine
             }
+            std::memcpy(layer.weights.data(), layer.raw_data.data(), layer.raw_data.size());
         }
     }
 
     // Propagate true input/output shapes from ModelSegment if present
-    if (!seg.input_shape.empty()) {
-        layer.input_shape = seg.input_shape;
+    if (!model_segment.input_shape.empty()) {
+        layer.input_shape = model_segment.input_shape;
     }
-    if (!seg.output_shape.empty()) {
-        layer.output_shape = seg.output_shape;
+    if (!model_segment.output_shape.empty()) {
+        layer.output_shape = model_segment.output_shape;
     }
 }
 
@@ -234,303 +185,100 @@ static void fillLayerInfoFromSegment(const SegmentInfo& seg, const std::unordere
 // [uint16_t name_len][char name[]][uint32_t data_size][byte data[]] ...
 void SDRModelLoader::loadFromArchive(const std::string& archive_path) {
     try {
-    std::ifstream infile(archive_path, std::ios::binary);
-    if (!infile) {
-        std::cerr << "[SDRModelLoader] Failed to open archive: " << archive_path << std::endl;
-        return;
-    }
-
-    // Read archive header
-    char magic[8];
-    infile.read(magic, sizeof(magic));
-        if (std::memcmp(magic, ARCHIVE_MAGIC, sizeof(ARCHIVE_MAGIC)) != 0) {
-        std::cerr << "[SDRModelLoader] Invalid archive format" << std::endl;
-        return;
-    }
-
-    uint32_t version;
-    infile.read(reinterpret_cast<char*>(&version), sizeof(version));
-        if (version != ARCHIVE_VERSION) {
-        std::cerr << "[SDRModelLoader] Unsupported archive version" << std::endl;
-        return;
-    }
-
-    // Read number of segments
-    uint32_t num_segments;
-    infile.read(reinterpret_cast<char*>(&num_segments), sizeof(num_segments));
-
-        if (num_segments > 1000) {  // Sanity check
-            std::cerr << "[SDRModelLoader] Invalid number of segments: " << num_segments << std::endl;
+        std::ifstream infile(archive_path, std::ios::binary);
+        if (!infile) {
+            std::cerr << "[SDRModelLoader] Failed to open archive: " << archive_path << std::endl;
             return;
         }
-        
-        std::cout << "Indexing " << num_segments << " segments from archive..." << std::endl;
 
-        segments_.clear();
-        segments_.reserve(num_segments);
-    std::unordered_map<std::string, std::vector<size_t>> tensor_shapes;
-    
-    for (uint32_t i = 0; i < num_segments; ++i) {
-        SegmentInfo seg;
-        // Read name length as uint32_t
-        uint32_t name_len;
-        infile.read(reinterpret_cast<char*>(&name_len), sizeof(name_len));
-        if (name_len > 10000) { // Basic sanity check
-            std::cerr << "[SDRModelLoader] Invalid name length: " << name_len << std::endl;
-            return;
-        }
-        seg.name.resize(name_len);
-        infile.read(&seg.name[0], name_len);
-
-        // Read layer_type as a length-prefixed string (uint32_t + string)
-        uint32_t type_len = 0;
-        infile.read(reinterpret_cast<char*>(&type_len), sizeof(type_len));
-        if (type_len > 0 && type_len < 1024) { // Sanity check
-            seg.layer_type.resize(type_len);
-            infile.read(&seg.layer_type[0], type_len);
-        } else {
-            seg.layer_type.clear();
-        }
-        
-        uint8_t type_val;
-        infile.read(reinterpret_cast<char*>(&type_val), sizeof(type_val));
-        seg.type = static_cast<SegmentType>(type_val);
-        infile.read(reinterpret_cast<char*>(&seg.strategy_id), sizeof(seg.strategy_id));
-        
-        uint64_t original_size, compressed_size;
-        infile.read(reinterpret_cast<char*>(&original_size), sizeof(original_size));
-        infile.read(reinterpret_cast<char*>(&compressed_size), sizeof(compressed_size));
-        
-        const size_t MAX_SEGMENT_SIZE = 1024 * 1024 * 1024; // 1 GB
-        if (original_size > MAX_SEGMENT_SIZE || compressed_size > MAX_SEGMENT_SIZE) {
-            std::cerr << "[SDRModelLoader] Invalid segment size for " << seg.name 
-                      << ": original=" << original_size 
-                      << ", compressed=" << compressed_size << std::endl;
-            return;
-        }
-        seg.original_size = original_size;
-        seg.compressed_size = compressed_size;
-        
-        infile.read(reinterpret_cast<char*>(&seg.offset), sizeof(seg.offset));
-        
-        uint8_t has_metadata = 0;
-        infile.read(reinterpret_cast<char*>(&has_metadata), sizeof(has_metadata));
-        
-        if (has_metadata) {
-            uint8_t dims;
-            infile.read(reinterpret_cast<char*>(&dims), sizeof(dims));
-            if (dims > 8) { // Sanity check for dimensions
-                std::cerr << "[SDRModelLoader] Invalid number of dimensions: " << (int)dims << std::endl;
-                return;
-            }
-            seg.shape.resize(dims);
-            for (uint8_t d = 0; d < dims; ++d) {
-                uint32_t dim_size;
-                infile.read(reinterpret_cast<char*>(&dim_size), sizeof(dim_size));
-                if (dim_size > MAX_SEGMENT_SIZE) { // Sanity check for dimension size
-                    std::cerr << "[SDRModelLoader] Invalid dimension size: " << dim_size << std::endl;
-                    return;
-                }
-                seg.shape[d] = dim_size;
-            }
-            tensor_shapes[seg.name] = seg.shape;
-        } else {
-            seg.shape.clear();
-        }
-        // Read input_shape
-        uint8_t has_input_shape = 0;
-        infile.read(reinterpret_cast<char*>(&has_input_shape), sizeof(has_input_shape));
-        if (has_input_shape) {
-            uint8_t num_in = 0;
-            infile.read(reinterpret_cast<char*>(&num_in), sizeof(num_in));
-            seg.input_shape.resize(num_in);
-            for (uint8_t d = 0; d < num_in; ++d) {
-                uint32_t dim = 0;
-                infile.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-                seg.input_shape[d] = dim;
-            }
-        }
-        // Read output_shape
-        uint8_t has_output_shape = 0;
-        infile.read(reinterpret_cast<char*>(&has_output_shape), sizeof(has_output_shape));
-        if (has_output_shape) {
-            uint8_t num_out = 0;
-            infile.read(reinterpret_cast<char*>(&num_out), sizeof(num_out));
-            seg.output_shape.resize(num_out);
-            for (uint8_t d = 0; d < num_out; ++d) {
-                uint32_t dim = 0;
-                infile.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-                seg.output_shape[d] = dim;
-            }
-        }
-        segments_.push_back(seg);
-        // --- NEW: Check for model_structure segment and parse as ONNX ---
-#ifdef ENABLE_ONNX_PROTOBUF
-        // Preserve the GRAPH_STRUCTURE_PROTO segment but **skip** expensive parsing.
-        if (seg.type == SegmentType::GRAPH_STRUCTURE_PROTO && seg.name == "model_structure") {
-            // std::ifstream data_infile(archive_path, std::ios::binary);
-            // data_infile.seekg(seg.offset, std::ios::beg);
-            // std::vector<std::byte> compressed_buffer(seg.compressed_size);
-            // data_infile.read(reinterpret_cast<char*>(compressed_buffer.data()), seg.compressed_size);
-            // std::vector<std::byte> decompressed_bytes;
-            // if (seg.strategy_id == 0) {
-            //     decompressed_bytes = compressed_buffer;
-            // } else if (seg.strategy_id == 1) {
-            //     decompressed_bytes = decompressSDR(compressed_buffer, seg.original_size);
-            // } else {
-            //     std::cerr << "[SDRModelLoader] Unknown compression strategy for model_structure segment: " << (int)seg.strategy_id << std::endl;
-            //     continue;
-            // }
-            // if (decompressed_bytes.empty()) {
-            //     std::cerr << "[SDRModelLoader] Failed to decompress model_structure segment." << std::endl;
-            // } else {
-            //     std::string model_str(reinterpret_cast<const char*>(decompressed_bytes.data()), decompressed_bytes.size());
-            //     onnx::ModelProto proto;
-            //     if (proto.ParseFromString(model_str)) {
-            //         loaded_model_proto_ = proto;
-            //         std::cout << "[SDRModelLoader] Loaded ONNX ModelProto from model_structure segment." << std::endl;
-            //     } else {
-            //         std::cerr << "[SDRModelLoader] Failed to parse ONNX ModelProto from model_structure segment after decompression." << std::endl;
-            //     }
-            // }
-            std::cout << "[SDRModelLoader] Graph structure segment detected (" << seg.original_size
-                      << " bytes). Skipping ONNX parse – not required for inference." << std::endl;
-            continue; // Nothing else to do for this segment
-        }
-#endif
-    }
-        // Logic to group segments by layer and create LayerInfo objects
-        layers.clear();
-        layer_map_.clear();
-        std::unordered_map<std::string, LayerInfo> layer_map;
-        std::ifstream data_infile(archive_path, std::ios::binary);
-
-        for (const auto& seg : segments_) {
-            try {
-                // Only process valid weight tensors
-                if (seg.type != SegmentType::WEIGHTS_FP32 && seg.type != SegmentType::WEIGHTS_FP16 && seg.type != SegmentType::WEIGHTS_INT8) {
-                    continue;
-                }
-                
-                // Extract base layer name (e.g., "conv1.weight" -> "conv1")
-                std::string base_name = seg.name;
-                size_t pos = base_name.rfind('.');
-                if (pos != std::string::npos) {
-                    base_name = base_name.substr(0, pos);
-                }
-
-                // Find or create the LayerInfo for this base name
-                LayerInfo& layer = layer_map[base_name];
-                if (layer.name.empty()) {
-                    layer.name = base_name;
-                }
-                
-                // Decompress data for the current segment
-                data_infile.seekg(seg.offset);
-                std::vector<std::byte> compressed_data(seg.compressed_size);
-                data_infile.read(reinterpret_cast<char*>(compressed_data.data()), seg.compressed_size);
-                std::vector<std::byte> decompressed_data;
-                if (seg.strategy_id == 0) {
-                    decompressed_data = compressed_data;
-                } else if (seg.strategy_id == 1) { // Assuming strategy 1 is SDR
-                    decompressed_data = decompressSDR(compressed_data, seg.original_size);
-                }
-                
-                layer.raw_data = std::move(decompressed_data);
-                
-                // Fill layer info from this segment
-                fillLayerInfoFromSegment(seg, tensor_shapes, layer);
-
-            } catch (const std::bad_alloc& e) {
-                std::cerr << "Failed to process segment " << seg.name 
-                          << ": Memory allocation failed" << std::endl;
-                throw;
-            }
-        }
-        
-        // Move the grouped layers from the map to the final vector
-        layers.reserve(layer_map.size());
-        for (const auto& kv : layer_map) {
-            layers.push_back(kv.second);
-            layer_map_[kv.first] = kv.second;
-        }
+        // For on-demand loading, we only need to read the headers.
+        segments_ = decompressor_->readArchiveHeaders(infile);
 
     } catch (const std::exception& e) {
-        std::cerr << "Error loading compressed model: " << e.what() << std::endl;
+        std::cerr << "Error loading compressed model headers: " << e.what() << std::endl;
         throw;
     }
 }
 
 LayerInfo SDRModelLoader::loadLayerByName(const std::string& name) const {
-    auto it = std::find_if(segments_.begin(), segments_.end(), [&](const SegmentInfo& seg) { return seg.name == name; });
-    if (it == segments_.end()) {
-        throw std::runtime_error("Layer not found: " + name);
+    return loadLayerByNameAsync(name).get();
+}
+
+std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::string& name) const {
+    // Check cache first
+    auto it = layer_cache_.find(name);
+    if (it != layer_cache_.end()) {
+        return it->second;
     }
-    const SegmentInfo& seg = *it;
-    // Only allow valid weight tensors for on-demand loading
-    if (!((seg.type == SegmentType::WEIGHTS_FP32 || seg.type == SegmentType::WEIGHTS_FP16 || seg.type == SegmentType::WEIGHTS_INT8) && (seg.shape.size() == 2 || seg.shape.size() == 4))) {
-        throw std::runtime_error("Requested segment is not a valid weight tensor: " + name);
-            }
-    std::ifstream infile(archive_path_, std::ios::binary);
-    if (!infile) {
-        throw std::runtime_error("Failed to open archive for on-demand layer loading: " + archive_path_);
-    }
-    infile.seekg(seg.offset);
-    std::vector<std::byte> compressed_data(seg.compressed_size);
-    infile.read(reinterpret_cast<char*>(compressed_data.data()), seg.compressed_size);
-    std::vector<std::byte> decompressed_data;
-    if (seg.strategy_id == 0) {
-        decompressed_data = compressed_data;
-    } else if (seg.strategy_id == 1) {
-        decompressed_data = decompressSDR(compressed_data, seg.original_size);
-    }
-    LayerInfo layer;
-    layer.raw_data = std::move(decompressed_data);
-    std::unordered_map<std::string, std::vector<size_t>> tensor_shapes;
-    tensor_shapes[seg.name] = seg.shape;
-    fillLayerInfoFromSegment(seg, tensor_shapes, layer);
-    return layer;
+
+    // If not in cache, launch a new async task to load it
+    std::packaged_task<LayerInfo()> task([this, name]() {
+        // Find the segment info for the requested layer/tensor name
+        auto seg_it = std::find_if(segments_.begin(), segments_.end(), [&](const CompressedSegmentHeader& seg) { return seg.name == name; });
+        if (seg_it == segments_.end()) {
+            throw std::runtime_error("Segment info not found for layer: " + name);
+        }
+        const CompressedSegmentHeader& seg_info = *seg_it;
+
+        // Calculate the offset for streaming format
+        // In streaming format: header (magic + version + placeholder count + placeholder offset) + data blocks
+        uint64_t offset = sizeof(ARCHIVE_MAGIC) + sizeof(ARCHIVE_VERSION) + sizeof(uint64_t) + sizeof(uint64_t);
+        
+        // Add up the compressed sizes of all segments that come before this one
+        for (const auto& seg : segments_) {
+            if (seg.name == name) break;
+            offset += seg.compressed_size;
+        }
+
+        // Use the decompressor to load this specific segment
+        ModelSegment model_segment = decompressor_->decompressSegment(archive_path_, seg_info, offset);
+
+        LayerInfo layer;
+        layer.name = name;
+        fillLayerInfoFromSegment(model_segment, layer);
+        return layer;
+    });
+
+    std::shared_future<LayerInfo> future = task.get_future();
+    layer_cache_[name] = future;
+    
+    // Move the task to a detached thread to execute
+    std::thread(std::move(task)).detach();
+
+    return future;
 }
 
 // Helper function to decompress SDR data
 std::vector<std::byte> SDRModelLoader::decompressSDR(const std::vector<std::byte>& compressed_data, size_t original_size) const {
-    try {
-        // Pre-allocate with reserve to avoid reallocation
-        std::vector<std::byte> decompressed_data;
-        decompressed_data.reserve(original_size);
-        decompressed_data.resize(original_size);
-
-        // Extract indices from compressed data
-        auto indices = decode_varint_indices(compressed_data);
-        
-        // Clear the buffer first
-    std::fill(decompressed_data.begin(), decompressed_data.end(), std::byte{0});
-    
-        // Set active bits
-        for (size_t idx : indices) {
-            if (idx < original_size) {
-                decompressed_data[idx] = std::byte{1};
-        }
-    }
-
-    return decompressed_data;
-    } catch (const std::bad_alloc& e) {
-        std::cerr << "Failed to allocate memory for decompression. Required size: " 
-                  << original_size << " bytes" << std::endl;
-        throw;
-    }
+    // This method is now deprecated and should not be called.
+    // Decompression is handled by the AIDecompressor framework.
+    throw std::logic_error("SDRModelLoader::decompressSDR is deprecated.");
 }
 
 const std::vector<LayerInfo>& SDRModelLoader::getLayers() const {
+    // This method is now less useful as layers are loaded on demand.
+    // It will only return layers loaded by the initial (legacy) full load.
     return layers;
 }
 
-SDRInferenceEngine::SDRInferenceEngine(const SDRModelLoader& model)
-    : layers(model.getLayers()), batch_size(1), dropout_enabled(false), training_mode(false) {
-    // Populate layer_map_ for fast lookup
-    for (const auto& layer : layers) {
-        layer_map_[layer.name] = layer;
-    }
+const std::vector<CompressedSegmentHeader>& SDRModelLoader::getSegmentIndex() const {
+    return segments_;
+}
+
+SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
+    : loader_(model_loader), batch_size(1), dropout_enabled(false), training_mode(false) {
+    // Register op handlers
+    op_dispatch_["Conv"] = [this](const LayerInfo& l, const std::vector<float>& in) { return applyConvolutionalLayer(l, in); };
+    op_dispatch_["MatMul"] = [this](const LayerInfo& l, const std::vector<float>& in) { return applyLinearLayer(l, in); };
+    op_dispatch_["Gemm"] = [this](const LayerInfo& l, const std::vector<float>& in) { return applyLinearLayer(l, in); };
+    op_dispatch_["LINEAR"] = [this](const LayerInfo& l, const std::vector<float>& in) { return applyLinearLayer(l, in); };
+    op_dispatch_["BATCH_NORM"] = [this](const LayerInfo& l, const std::vector<float>& in) { return applyBatchNorm(l, in); };
+    op_dispatch_["ACTIVATION"] = [this](const LayerInfo& l, const std::vector<float>& in) { return applyActivation(l.properties.activation_type, in); };
+    // Default handler: log and pass through
+    default_handler_ = [](const LayerInfo& layer, const std::vector<float>& input) {
+        std::cerr << "[SDRInferenceEngine] Unhandled layer type: '" << layer.layer_type << "' for layer '" << layer.name << "'. Passing input through." << std::endl;
+        return input;
+    };
 }
 
 void SDRInferenceEngine::setBatchSize(size_t size) {
@@ -568,11 +316,21 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
         return {};
     }
     std::vector<float> output(output_size, 0.0f);
+    const int BLOCK_SIZE = 32;
+
     for (size_t i = 0; i < output_size; ++i) {
-        for (size_t j = 0; j < input_size; ++j) {
-            output[i] += input[j] * layer.weights[i * input_size + j];
+        float sum = 0.0f;
+        for (size_t j_block = 0; j_block < input_size; j_block += BLOCK_SIZE) {
+            size_t j_end = std::min(j_block + BLOCK_SIZE, input_size);
+            for (size_t j = j_block; j < j_end; ++j) {
+                sum += input[j] * layer.weights[i * input_size + j];
+            }
         }
-        if (!layer.biases.empty()) {
+        output[i] = sum;
+    }
+
+    if (!layer.biases.empty()) {
+        for (size_t i = 0; i < output_size; ++i) {
             output[i] += layer.biases[i];
         }
     }
@@ -853,41 +611,39 @@ std::vector<float> SDRInferenceEngine::flattenTensor(const std::vector<float>& i
 }
 
 std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tensor) {
-    if (layers.empty()) {
-        std::cerr << "[SDRInferenceEngine] No layers loaded!" << std::endl;
+    const auto& segments = loader_.getSegmentIndex();
+    if (segments.empty()) {
+        std::cerr << "[SDRInferenceEngine] No segments found in the model loader!" << std::endl;
         return input_tensor;
     }
 
-    // Static dispatch map from ONNX op type to member function
-    using LayerFn = std::function<std::vector<float>(SDRInferenceEngine*, const LayerInfo&, const std::vector<float>&)>;
-    static const std::unordered_map<std::string, LayerFn> dispatch = {
-        {"Conv",    [](SDRInferenceEngine* self, const LayerInfo& l, const std::vector<float>& in) { return self->applyConvolutionalLayer(l, in); }},
-        {"MatMul",  [](SDRInferenceEngine* self, const LayerInfo& l, const std::vector<float>& in) { return self->applyLinearLayer(l, in); }},
-        {"Gemm",    [](SDRInferenceEngine* self, const LayerInfo& l, const std::vector<float>& in) { return self->applyLinearLayer(l, in); }},
-        // Add more mappings as needed
-    };
-
-    std::vector<float> current = input_tensor;
-    
-    for (const auto& layer : layers) {
-        std::cout << "[SDRInferenceEngine] Processing Layer: " << layer.name 
-                  << ", Type: " << layer.layer_type
-                  << ", Input Shape: " << current.size()
-                  << ", Weights: " << layer.weights.size() 
-                  << ", Biases: " << layer.biases.size() << std::endl;
-
-        auto it = dispatch.find(layer.layer_type);
-        if (it != dispatch.end()) {
-            current = it->second(this, layer, current);
-        } else if (layer.layer_type == "Add") {
-            std::cout << "[SDRInferenceEngine] Skipping 'Add' layer, assuming bias is handled." << std::endl;
-        } else {
-            std::cerr << "[SDRInferenceEngine] Unknown or unhandled layer type: " << layer.layer_type 
-                      << " for layer " << layer.name << ". Skipping.\n";
+    // Heuristic: derive execution order by sorting segment names that look like layers.
+    std::vector<std::string> layer_names;
+    for (const auto& seg : segments) {
+        if (seg.original_type == SegmentType::WEIGHTS_FP32 ||
+            seg.original_type == SegmentType::WEIGHTS_FP16 ||
+            seg.original_type == SegmentType::WEIGHTS_INT8) {
+            // Get base name
+            std::string base_name = seg.name;
+            size_t pos = base_name.rfind('.');
+            if (pos != std::string::npos) {
+                base_name = base_name.substr(0, pos);
+            }
+            // Avoid duplicates
+            if (std::find(layer_names.begin(), layer_names.end(), base_name) == layer_names.end()) {
+                layer_names.push_back(base_name);
+            }
         }
     }
+    // A simple alphanumeric sort often works for transformer models (e.g., h.0, h.1, h.10, h.11...)
+    std::sort(layer_names.begin(), layer_names.end());
 
-    return current;
+    std::cout << "[SDRInferenceEngine] Running layers in heuristically determined order..." << std::endl;
+    for(const auto& name : layer_names) {
+        std::cout << "  -> " << name << std::endl;
+    }
+
+    return runLayers(layer_names, input_tensor);
 }
 
 #ifdef ENABLE_ONNX_PROTOBUF
@@ -897,13 +653,7 @@ const std::optional<onnx::ModelProto>& SDRModelLoader::getLoadedModelProto() con
 #endif
 
 // Run a single layer by name
-std::vector<float> SDRInferenceEngine::runLayer(const std::string& layer_name, const std::vector<float>& input) {
-    auto it = layer_map_.find(layer_name);
-    if (it == layer_map_.end()) {
-        std::cerr << "[SDRInferenceEngine] Layer not found: " << layer_name << std::endl;
-        return input;
-    }
-    const LayerInfo& layer = it->second;
+std::vector<float> SDRInferenceEngine::runLayer(const LayerInfo& layer, const std::vector<float>& input) {
     // Strict shape validation
     size_t expected_input_size = 1;
     for (size_t d : layer.input_shape) expected_input_size *= d;
@@ -913,25 +663,33 @@ std::vector<float> SDRInferenceEngine::runLayer(const std::string& layer_name, c
                   << " for layer: " << layer.name << std::endl;
         return {};
     }
-    if (layer.layer_type == "Conv") {
-        return applyConvolutionalLayer(layer, input);
-    } else if (layer.layer_type == "MatMul" || layer.layer_type == "Gemm" || layer.layer_type == "LINEAR") {
-        return applyLinearLayer(layer, input);
-    } else if (layer.layer_type == "BATCH_NORM") {
-        return applyBatchNorm(layer, input);
-    } else if (layer.layer_type == "ACTIVATION") {
-        return applyActivation(layer.properties.activation_type, input);
+    auto it = op_dispatch_.find(layer.layer_type);
+    if (it != op_dispatch_.end()) {
+        return it->second(layer, input);
     } else {
-        std::cerr << "[SDRInferenceEngine] Unknown or unhandled layer type: " << layer.layer_type << " for layer " << layer.name << ". Skipping." << std::endl;
-        return input;
+        return default_handler_(layer, input);
     }
 }
 
 // Run a sequence of layers by name
 std::vector<float> SDRInferenceEngine::runLayers(const std::vector<std::string>& layer_names, const std::vector<float>& input) {
     std::vector<float> current = input;
-    for (const auto& name : layer_names) {
-        current = runLayer(name, current);
+    if (layer_names.empty()) return current;
+
+    // Start loading the first layer
+    auto next_layer_future = loader_.loadLayerByNameAsync(layer_names[0]);
+
+    for (size_t i = 0; i < layer_names.size(); ++i) {
+        // Wait for the current layer to be loaded
+        LayerInfo current_layer = next_layer_future.get();
+
+        // Start pre-fetching the next layer (if it exists)
+        if (i + 1 < layer_names.size()) {
+            next_layer_future = loader_.loadLayerByNameAsync(layer_names[i + 1]);
+        }
+        
+        // Run computation for the current layer
+        current = runLayer(current_layer, current);
         if (current.empty()) {
             std::cerr << "[SDRInferenceEngine] ERROR: Aborting runLayers due to previous error or shape mismatch." << std::endl;
             break;

@@ -291,50 +291,9 @@ AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments
             const ModelSegment& segment = regularSegments[j].get();
             batchFutures.push_back(std::async(std::launch::async, 
                 [this, &segment]() {
-
-            CompressedSegmentHeader header;
-            header.name = segment.name;
-            header.original_type = segment.type;
-            header.original_size = static_cast<uint64_t>(segment.original_size);
-            header.layer_type = segment.layer_type;
-            header.input_shape = segment.input_shape;
-            header.output_shape = segment.output_shape;
-            header.tensor_metadata = segment.tensor_metadata;
-            header.layer_name = segment.layer_name;
-            header.layer_index = segment.layer_index;
-
-            const auto* strategies = selectStrategies(segment.type);
-            std::vector<std::byte> compressedData;
-            bool compressionSuccessful = false;
-            uint8_t winningStrategyId = 0;
-
-            if (strategies && !strategies->empty()) {
-                 for (const auto& stratInfo : *strategies) {
-                     try {
-                         compressedData = stratInfo.strategy->compress(segment);
-                         winningStrategyId = stratInfo.id;
-                         compressionSuccessful = true;
-                         // Log success (optional, could be verbose in parallel)
-                         // std::cerr << "Parallel Success: Segment '" << segment.name << "', Strategy ID " << static_cast<int>(stratInfo.id) << std::endl;
-                         break;
-                     } catch (const CompressionError& e) {
-                         // Log failure (optional, could be verbose in parallel)
-                         // std::cerr << "Parallel Warning: Segment '" << segment.name << "', Strategy ID " << static_cast<int>(stratInfo.id) << " failed: " << e.what() << std::endl;
-                     }
-                 }
-            }
-
-            if (!compressionSuccessful) {
-                // std::cerr << "Parallel Warning: All strategies failed for segment '" << segment.name << "'. Storing uncompressed." << std::endl;
-                winningStrategyId = 0; // Mark as uncompressed
-                compressedData = segment.data; // Store original data
-            }
-
-            header.compression_strategy_id = winningStrategyId;
-            header.compressed_size = static_cast<uint64_t>(compressedData.size());
-            return std::make_pair(header, std::move(compressedData));
-        }));
-    }
+                    return this->compressSegment(segment);
+                }));
+        }
 
             // Collect batch results
             for (auto& future : batchFutures) {
@@ -374,51 +333,8 @@ void AICompressor::compressModelStreaming(const std::string& modelPath, ICompres
     } else {
         // Single-threaded compression
         for (const auto& segment : segments) {
-            CompressedSegmentHeader header;
-            header.name = segment.name;
-            header.original_type = segment.type;
-            header.original_size = static_cast<uint64_t>(segment.original_size);
-            header.layer_type = segment.layer_type;
-            header.input_shape = segment.input_shape;
-            header.output_shape = segment.output_shape;
-            header.tensor_metadata = segment.tensor_metadata;
-            header.layer_name = segment.layer_name;
-            header.layer_index = segment.layer_index;
+            auto [header, compressedData] = compressSegment(segment);
 
-            const auto* strategies = selectStrategies(segment.type);
-            std::vector<std::byte> compressedData;
-            bool compressionSuccessful = false;
-
-            if (strategies && !strategies->empty()) {
-                for (const auto& stratInfo : *strategies) {
-                    try {
-                        compressedData = stratInfo.strategy->compress(segment);
-                        // If compress succeeds without throwing CompressionError, we're done
-                        header.compression_strategy_id = stratInfo.id;
-                        compressionSuccessful = true;
-                        std::cerr << "Successfully compressed segment '" << segment.name
-                                  << "' with strategy ID " << static_cast<int>(stratInfo.id)
-                                  << " (Priority: " << stratInfo.priority << ")" << std::endl;
-                        break; // Exit the strategy loop
-                    } catch (const CompressionError& e) {
-                        std::cerr << "Warning: Compression failed for segment '" << segment.name
-                                  << "' with strategy ID " << static_cast<int>(stratInfo.id)
-                                  << " (Priority: " << stratInfo.priority << "): " << e.what()
-                                  << ". Trying next strategy..." << std::endl;
-                        // Continue to the next strategy
-                    }
-                }
-            }
-
-            // If no strategy succeeded or none were registered
-            if (!compressionSuccessful) {
-                 std::cerr << "Warning: All strategies failed for segment '" << segment.name
-                           << "'. Storing uncompressed." << std::endl;
-                header.compression_strategy_id = 0; // Mark as uncompressed
-                compressedData = segment.data; // Store original data
-            }
-
-            header.compressed_size = static_cast<uint64_t>(compressedData.size());
             // Update statistics
             stats_.originalSize += header.original_size;
             stats_.compressedSize += header.compressed_size;

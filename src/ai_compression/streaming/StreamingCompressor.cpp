@@ -18,7 +18,6 @@ void writeBasicTypeLocal(std::ostream& stream, const T& value) {
 void writeStringLocal(std::ostream& stream, const std::string& str) {
     uint32_t len = static_cast<uint32_t>(str.length());
     if (str.length() > UINT32_MAX) {
-        // This check might be better placed before calling this helper
         throw std::runtime_error("Segment name or layer name too long for archive format.");
     }
     writeBasicTypeLocal(stream, len);
@@ -27,12 +26,23 @@ void writeStringLocal(std::ostream& stream, const std::string& str) {
 
 
 StreamingCompressor::StreamingCompressor(const std::string& outputPath)
-    : outputFile_(outputPath, std::ios::binary | std::ios::trunc) // Ensure file is truncated if it exists
+    : outputFile_(outputPath, std::ios::binary | std::ios::trunc)
 {
     if (!outputFile_) {
         throw std::runtime_error("Failed to open output file for writing: " + outputPath);
     }
-    // Header is no longer written immediately
+    // Write archive header placeholders
+    outputFile_.write(ARCHIVE_MAGIC, sizeof(ARCHIVE_MAGIC));
+    writeBasicTypeLocal(outputFile_, ARCHIVE_VERSION);
+
+    // Placeholders for segment count and index offset
+    uint64_t placeholder_count = 0;
+    uint64_t placeholder_offset = 0;
+    writeBasicTypeLocal(outputFile_, placeholder_count);
+    writeBasicTypeLocal(outputFile_, placeholder_offset);
+
+    // The rest of the file is segment data
+    currentDataOffset_ = outputFile_.tellp();
 }
 
 StreamingCompressor::~StreamingCompressor() {
@@ -51,80 +61,57 @@ StreamingCompressor::~StreamingCompressor() {
 void StreamingCompressor::handleCompressedSegment(const CompressedSegmentHeader& header, const std::vector<std::byte>& compressedData) {
     std::lock_guard<std::mutex> lock(writeMutex_);
 
-    // Store the segment header and data instead of writing immediately
-    segments_.emplace_back(header, compressedData);
+    // Get the offset for the current segment
+    uint64_t segmentOffset = currentDataOffset_;
+
+    // Write compressed data immediately
+    outputFile_.write(reinterpret_cast<const char*>(compressedData.data()), compressedData.size());
+    if (!outputFile_) {
+        throw std::runtime_error("Failed to write segment data to file.");
+    }
+
+    // Update the offset for the next segment
+    currentDataOffset_ += compressedData.size();
+
+    // Store the segment header and its offset (not the data)
+    segment_headers_.emplace_back(header, segmentOffset);
 
     // Update statistics
     totalCompressedSize_ += compressedData.size();
     totalOriginalSize_ += header.original_size;
-
-    // Optional: Print progress (can be verbose)
-    // std::cout << "Buffered segment '" << header.name << "': "
-    //           << header.original_size << " -> " << compressedData.size() << " bytes\n";
 }
 
 void StreamingCompressor::finalizeArchive() {
-    if (!outputFile_.is_open() || segments_.empty()) {
-        if (segments_.empty()) {
-             std::cerr << "Warning: Finalizing archive with zero segments." << std::endl;
-        }
-        if (outputFile_.is_open()) outputFile_.close();
+    if (!outputFile_.is_open()) {
+        return; // File already closed or never opened
+    }
+
+    if (segment_headers_.empty()) {
+        std::cerr << "Warning: Finalizing archive with zero segments." << std::endl;
+        outputFile_.close();
         return;
     }
 
-    // --- Write Archive Header ---
-    outputFile_.write(ARCHIVE_MAGIC, sizeof(ARCHIVE_MAGIC));
-    writeBasicTypeLocal(outputFile_, ARCHIVE_VERSION);
-
-    // --- Write Number of Segments ---
-    uint32_t numSegments = static_cast<uint32_t>(segments_.size());
-    writeBasicTypeLocal(outputFile_, numSegments);
-
-    // --- Calculate Index Table Size and Data Offsets ---
-    uint64_t currentDataOffset = sizeof(ARCHIVE_MAGIC) + sizeof(ARCHIVE_VERSION) + sizeof(numSegments);
-    uint64_t indexTableSize = 0;
-    std::vector<uint64_t> dataOffsets;
-    dataOffsets.reserve(numSegments);
-
-    for (const auto& segmentPair : segments_) {
-        const auto& header = segmentPair.first;
-        // Calculate size of this header entry in the index
-        uint64_t headerEntrySize = 0;
-        headerEntrySize += sizeof(uint32_t) + header.name.length(); // Name length + name
-        headerEntrySize += sizeof(uint32_t) + header.layer_type.length(); // Layer type length + type
-        headerEntrySize += sizeof(uint8_t); // Type
-        headerEntrySize += sizeof(uint8_t); // Strategy ID
-        headerEntrySize += sizeof(uint64_t); // Original Size (now 8 bytes)
-        headerEntrySize += sizeof(uint64_t); // Compressed Size (now 8 bytes)
-        headerEntrySize += sizeof(uint64_t); // Offset
-
-        // Add size for tensor metadata if present
-        if (header.tensor_metadata.has_value()) {
-            headerEntrySize += sizeof(uint8_t); // Number of dimensions
-            headerEntrySize += header.tensor_metadata->dimensions.size() * sizeof(uint32_t); // Each dimension
-            }
-        
-        indexTableSize += headerEntrySize;
-    }
-    currentDataOffset += indexTableSize;
+    // --- Get Index Table Offset ---
+    uint64_t index_table_offset = outputFile_.tellp();
 
     // --- Write Index Table ---
-    for (size_t i = 0; i < segments_.size(); ++i) {
-        const auto& header = segments_[i].first;
-        const auto& compressedData = segments_[i].second;
+    for (const auto& pair : segment_headers_) {
+        const auto& header = pair.first;
+        uint64_t segmentDataOffset = pair.second;
 
-        uint64_t segmentDataOffset = currentDataOffset;
-        dataOffsets.push_back(segmentDataOffset);
-        currentDataOffset += compressedData.size();
-
-        // Write segment header
+        // Write segment header to the index
         writeStringLocal(outputFile_, header.name);
         writeStringLocal(outputFile_, header.layer_type);
         writeBasicTypeLocal(outputFile_, static_cast<uint8_t>(header.original_type));
         writeBasicTypeLocal(outputFile_, header.compression_strategy_id);
         writeBasicTypeLocal(outputFile_, static_cast<uint64_t>(header.original_size));
-        writeBasicTypeLocal(outputFile_, static_cast<uint64_t>(compressedData.size()));
+        writeBasicTypeLocal(outputFile_, static_cast<uint64_t>(header.compressed_size));
         writeBasicTypeLocal(outputFile_, segmentDataOffset);
+
+        // Write layer_name and layer_index (fix for archive format)
+        writeStringLocal(outputFile_, header.layer_name);
+        writeBasicTypeLocal(outputFile_, static_cast<uint32_t>(header.layer_index));
 
         // Write tensor metadata presence flag
         uint8_t has_metadata = header.tensor_metadata.has_value() ? 1 : 0;
@@ -136,6 +123,15 @@ void StreamingCompressor::finalizeArchive() {
             for (size_t dim : meta.dimensions) {
                 writeBasicTypeLocal(outputFile_, static_cast<uint32_t>(dim));
             }
+            // Write additional tensor metadata fields
+            writeBasicTypeLocal(outputFile_, meta.sparsity_ratio);
+            writeBasicTypeLocal(outputFile_, meta.is_sorted);
+            uint8_t has_scale = meta.scale.has_value() ? 1 : 0;
+            writeBasicTypeLocal(outputFile_, has_scale);
+            if (has_scale) writeBasicTypeLocal(outputFile_, meta.scale.value());
+            uint8_t has_zero_point = meta.zero_point.has_value() ? 1 : 0;
+            writeBasicTypeLocal(outputFile_, has_zero_point);
+            if (has_zero_point) writeBasicTypeLocal(outputFile_, meta.zero_point.value());
         }
         // Write input_shape
         uint8_t has_input_shape = header.input_shape.empty() ? 0 : 1;
@@ -159,11 +155,13 @@ void StreamingCompressor::finalizeArchive() {
         }
     }
 
-    // --- Write Compressed Data Blocks ---
-    for (const auto& segmentPair : segments_) {
-        const auto& compressedData = segmentPair.second;
-        outputFile_.write(reinterpret_cast<const char*>(compressedData.data()), compressedData.size());
-    }
+    // --- Update Header with Final Values ---
+    uint64_t num_segments = segment_headers_.size();
+    
+    // Seek back to the placeholder locations and write the correct values
+    outputFile_.seekp(sizeof(ARCHIVE_MAGIC) + sizeof(ARCHIVE_VERSION), std::ios::beg);
+    writeBasicTypeLocal(outputFile_, num_segments);
+    writeBasicTypeLocal(outputFile_, index_table_offset);
 
     // --- Finalize ---
     outputFile_.flush();
@@ -173,7 +171,7 @@ void StreamingCompressor::finalizeArchive() {
     }
     outputFile_.close();
 
-    std::cout << "Archive finalized successfully. Total Segments: " << numSegments << std::endl;
+    std::cout << "Archive finalized successfully. Total Segments: " << num_segments << std::endl;
 }
 
 

@@ -281,6 +281,14 @@ int main() {
     SDRModelLoader loader(compressed_path);
     SDRInferenceEngine engine(loader);
 
+    // DEBUG: Print all layer keys and their raw_data sizes
+    const auto& debug_layer_map = loader.getLayerMap();
+    std::cout << "--- Layer keys and raw_data sizes ---" << std::endl;
+    for (const auto& pair : debug_layer_map) {
+        std::cout << "Layer: '" << pair.first << "', raw_data size: " << pair.second.raw_data.size() << std::endl;
+    }
+    std::cout << "-------------------------------------" << std::endl;
+
     // Initialize tokenizer with actual GPT-2 vocabulary
     GPT2Tokenizer tokenizer;
 
@@ -295,12 +303,18 @@ int main() {
     std::cout << std::endl;
 
     // 2. Manual embedding lookup for each token ID
-    const auto& wte_layer = loader.getLayerMap().at("wte");
+    const auto& layer_map = loader.getLayerMap();
+    auto wte_it = layer_map.find("wte.weight");
+    if (wte_it == layer_map.end()) {
+        std::cerr << "No embedding data found in layer 'wte.weight'" << std::endl;
+        return 1;
+    }
+    const auto& wte_layer = wte_it->second;
     
     // Handle compressed embeddings - decompress if needed
     std::vector<float> embedding_matrix;
     if (wte_layer.raw_data.empty()) {
-        std::cerr << "No embedding data found in layer 'wte'" << std::endl;
+        std::cerr << "No embedding data found in layer 'wte.weight' (raw_data empty)" << std::endl;
         return 1;
     }
     
@@ -358,7 +372,6 @@ int main() {
     std::vector<float> current_hidden = sequence_embeddings.back(); // Use last token for generation
     
     // Find transformer layers in the model
-    const auto& layer_map = loader.getLayerMap();
     std::vector<std::string> layer_names;
     for (const auto& pair : layer_map) {
         if (pair.first.find("h.") != std::string::npos) {
@@ -428,10 +441,9 @@ int main() {
     }
     
     // 5. Final projection to vocabulary
-    auto lm_head_it = layer_map.find("lm_head");
+    auto lm_head_it = layer_map.find("lm_head.weight");
     if (lm_head_it == layer_map.end()) {
-        // Try alternative name
-        lm_head_it = layer_map.find("wte");
+        lm_head_it = layer_map.find("wte.weight");
     }
     
     if (lm_head_it != layer_map.end()) {
@@ -454,6 +466,8 @@ int main() {
         input_ids.push_back(next_token);
         std::string generated_text = tokenizer.detokenize(input_ids);
         std::cout << "Generated text: " << generated_text << std::endl;
+    } else {
+        std::cerr << "No lm_head.weight or wte.weight found for final projection!" << std::endl;
     }
 
     return 0;

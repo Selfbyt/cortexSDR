@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <iostream> // For potential debug/error messages
 #include <cstring> // For std::memcpy, std::memcmp
+#include <fstream>
 
 namespace CortexAICompression {
 
@@ -66,16 +67,21 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
     }
 
     // 2. Read Number of Segments
-    uint32_t numSegments;
+    uint64_t numSegments;
     if (!readBasicType(stream, numSegments)) {
         throw CompressionError("Failed to read segment count.");
     }
+    uint64_t index_offset;
+    if (!readBasicType(stream, index_offset)) {
+        throw CompressionError("Failed to read index offset.");
+    }
+    stream.seekg(index_offset, std::ios::beg);
 
     // 3. Read Index Table Entries
     std::vector<CompressedSegmentHeader> headers;
     headers.reserve(numSegments);
     std::cerr << "DEBUG: Expecting " << numSegments << " segment headers." << std::endl; // DEBUG
-    for (uint32_t i = 0; i < numSegments; ++i) {
+    for (uint64_t i = 0; i < numSegments; ++i) {
         CompressedSegmentHeader header;
         uint8_t type_val;
         uint64_t offset; // Read offset, store it temporarily
@@ -86,7 +92,13 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
              std::cerr << "DEBUG: Failed reading name for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (name).");
         }
-         std::cerr << "  DEBUG Name: " << header.name << " (Length: " << header.name.length() << ")" << std::endl; // DEBUG
+        std::cerr << "  DEBUG Name: " << header.name << " (Length: " << header.name.length() << ")" << std::endl; // DEBUG
+
+        if (!readString(stream, header.layer_type)) {
+            std::cerr << "DEBUG: Failed reading layer_type for segment " << i << std::endl; // DEBUG
+            throw CompressionError("Failed to read segment header information from index (layer_type).");
+        }
+        std::cerr << "  DEBUG Layer Type: " << header.layer_type << std::endl;
 
         if (!readBasicType(stream, type_val)) {
              std::cerr << "DEBUG: Failed reading type for segment " << i << std::endl; // DEBUG
@@ -154,9 +166,11 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
             std::cerr << "    DEBUG Num Dims: " << static_cast<int>(num_dims) << std::endl;
             meta.dimensions.resize(num_dims);
             for (uint8_t d = 0; d < num_dims; ++d) {
-                if (!readBasicType(stream, meta.dimensions[d])) {
+                uint32_t dim_u32;
+                if (!readBasicType(stream, dim_u32)) {
                     throw CompressionError("Failed to read tensor metadata (dimension value).");
                 }
+                meta.dimensions[d] = static_cast<size_t>(dim_u32);
                 std::cerr << "      DEBUG Dim " << static_cast<int>(d) << ": " << meta.dimensions[d] << std::endl;
             }
 
@@ -306,6 +320,9 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
     segment.tensor_metadata = header.tensor_metadata; // Copy tensor metadata
     segment.layer_name = header.layer_name;           // Copy layer name
     segment.layer_index = header.layer_index;         // Copy layer index
+    segment.layer_type = header.layer_type;           // Copy layer type
+    segment.input_shape = header.input_shape;         // Copy input shape
+    segment.output_shape = header.output_shape;       // Copy output shape
 
     return segment;
 }
@@ -343,6 +360,68 @@ void AIDecompressor::decompressModelStream(std::istream& inputArchiveStream, ISe
     }
 
     // Optional: Check if we consumed the expected amount of data or if there's trailing data.
+}
+
+ModelSegment AIDecompressor::decompressSegment(const std::string& archivePath, const CompressedSegmentHeader& segmentInfo, uint64_t offset) {
+    std::ifstream stream(archivePath, std::ios::binary);
+    if (!stream) {
+        throw CompressionError("Failed to open archive for on-demand segment loading: " + archivePath);
+    }
+
+    // Seek to the beginning of the compressed data for this segment
+    stream.seekg(offset);
+    if (!stream) {
+        throw CompressionError("Failed to seek to offset for segment: " + segmentInfo.name);
+    }
+
+    // 1. Read Compressed Data
+    std::vector<std::byte> compressedData(segmentInfo.compressed_size);
+    stream.read(reinterpret_cast<char*>(compressedData.data()), segmentInfo.compressed_size);
+    if (!stream) {
+        throw CompressionError("Failed to read compressed data for segment: " + segmentInfo.name);
+    }
+
+    // 2. Select Decompression Strategy
+    std::vector<std::byte> decompressedData;
+    if (segmentInfo.compression_strategy_id == 0) {
+        // Strategy ID 0 means uncompressed
+        decompressedData = std::move(compressedData);
+    } else {
+        auto it = strategyMap_.find(segmentInfo.compression_strategy_id);
+        if (it == strategyMap_.end() || !it->second) {
+            throw CompressionError("Unknown or unregistered compression strategy ID: " + std::to_string(segmentInfo.compression_strategy_id));
+        }
+        std::shared_ptr<ICompressionStrategy> strategy = it->second;
+
+        // 3. Decompress
+        decompressedData = strategy->decompress(compressedData, segmentInfo.original_type, segmentInfo.original_size);
+    }
+
+    // 4. Verify Size
+    if (decompressedData.size() != segmentInfo.original_size) {
+        std::cerr << "Warning: Decompressed size (" << decompressedData.size()
+                  << ") does not match expected original size (" << segmentInfo.original_size
+                  << ") for on-demand segment '" << segmentInfo.name << "'." << std::endl;
+    }
+
+    // 5. Create ModelSegment
+    ModelSegment segment;
+    segment.name = segmentInfo.name;
+    segment.type = segmentInfo.original_type;
+    segment.original_size = segmentInfo.original_size;
+    segment.data = std::move(decompressedData);
+    segment.tensor_metadata = segmentInfo.tensor_metadata;
+    segment.layer_name = segmentInfo.layer_name;
+    segment.layer_index = segmentInfo.layer_index;
+    segment.layer_type = segmentInfo.layer_type;
+    segment.input_shape = segmentInfo.input_shape;
+    segment.output_shape = segmentInfo.output_shape;
+
+    return segment;
+}
+
+std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveHeaders(std::istream& inputArchiveStream) {
+    return readArchiveIndex(inputArchiveStream);
 }
 
 } // namespace CortexAICompression

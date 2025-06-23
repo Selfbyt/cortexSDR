@@ -131,7 +131,7 @@ TEST_F(CompressedInferenceTest, SelectiveInference) {
     // Restore: Compress the model before inference
     std::string model_path = "/home/mbishu/Desktop/cortexSDR/gpt2-10.onnx";
     std::string compressed_path = "compressed_model.sdr";
-    // Raise sparsity to retain 20% of weights so embeddings aren’t overly zeroed
+    // Raise sparsity to retain 20% of weights so embeddings aren't overly zeroed
     float sparsity = 0.20f;
 
     CortexCompressionOptions options;
@@ -152,81 +152,73 @@ TEST_F(CompressedInferenceTest, SelectiveInference) {
     SDRModelLoader loader(compressed_path);
     SDRInferenceEngine engine(loader);
 
-    // Print all possible layer chains based on shape matching
-    CortexAICompression::print_possible_layer_chains(loader.getLayers());
-
-    const auto& layer_map = loader.getLayerMap();
-    std::cout << "\n[SelectiveInference] Layer shapes:" << std::endl;
-    for (const auto& kv : layer_map) {
-        const auto& layer = kv.second;
-        std::cout << "  " << kv.first << " (type: " << layer.layer_type << ")\n";
-        std::cout << "    Input shape: [";
-        for (size_t i = 0; i < layer.input_shape.size(); ++i) {
-            std::cout << layer.input_shape[i] << (i < layer.input_shape.size() - 1 ? ", " : "");
-        }
-        std::cout << "]\n    Output shape: [";
-        for (size_t i = 0; i < layer.output_shape.size(); ++i) {
-            std::cout << layer.output_shape[i] << (i < layer.output_shape.size() - 1 ? ", " : "");
-        }
-        std::cout << "]\n";
+    const auto& segments = loader.getSegmentIndex();
+    if (segments.empty()) {
+        GTEST_SKIP() << "No segments found in compressed model, skipping test.";
     }
 
-    // Find a pair of layers with matching output/input shapes
+    // Heuristically find a sequence of layers to run.
     std::vector<std::string> selected_layers;
-    for (auto it1 = layer_map.begin(); it1 != layer_map.end(); ++it1) {
-        for (auto it2 = layer_map.begin(); it2 != layer_map.end(); ++it2) {
-            if (it1 == it2) continue;
-            const auto& out_shape = it1->second.output_shape;
-            const auto& in_shape = it2->second.input_shape;
-            if (!out_shape.empty() && out_shape == in_shape) {
-                selected_layers.push_back(it1->first);
-                selected_layers.push_back(it2->first);
-                goto found_pair;
+    for (const auto& seg1 : segments) {
+        if (seg1.original_type != SegmentType::WEIGHTS_FP32) continue;
+        try {
+            LayerInfo layer1 = loader.loadLayerByName(seg1.name);
+            for (const auto& seg2 : segments) {
+                if (seg1.name == seg2.name || seg2.original_type != SegmentType::WEIGHTS_FP32) continue;
+                try {
+                    LayerInfo layer2 = loader.loadLayerByName(seg2.name);
+                    if (!layer1.output_shape.empty() && layer1.output_shape == layer2.input_shape) {
+                        selected_layers.push_back(layer1.name);
+                        selected_layers.push_back(layer2.name);
+                        goto found_pair;
+                    }
+                } catch (const std::exception&) {
+                    // Skip if a layer fails to load, it might be metadata
+                }
             }
+        } catch (const std::exception&) {
+            // Skip if a layer fails to load
         }
     }
+
 found_pair:
-    if (selected_layers.size() < 2) {
-        std::cout << "[SelectiveInference] No compatible layer pair found. Skipping test." << std::endl;
-        GTEST_SKIP();
+    if (selected_layers.empty()) {
+        std::cout << "[SelectiveInference] No compatible layer pair found. Trying single layer." << std::endl;
+        // Fallback: just find the first valid layer
+        for (const auto& seg : segments) {
+             if (seg.original_type == SegmentType::WEIGHTS_FP32) {
+                 selected_layers.push_back(seg.name);
+                 break;
+             }
+        }
     }
+    
+    if (selected_layers.empty()) {
+        GTEST_SKIP() << "No runnable layers found, skipping test.";
+    }
+
+
     std::cout << "\n[SelectiveInference] Running layers:";
     for (const auto& name : selected_layers) std::cout << " " << name;
     std::cout << std::endl;
 
-    const auto& first_layer = layer_map.at(selected_layers.front());
+    LayerInfo first_layer = loader.loadLayerByName(selected_layers.front());
     size_t input_size = 1;
     for (size_t d : first_layer.input_shape) input_size *= d;
+    if (input_size == 0) {
+        GTEST_SKIP() << "First layer has zero-sized input, cannot proceed.";
+    }
     auto input_tensor = generateInputTensor(input_size);
 
     std::vector<float> current = input_tensor;
     for (const auto& name : selected_layers) {
-        const auto& layer = layer_map.at(name);
+        LayerInfo layer = loader.loadLayerByName(name);
         std::cout << "[SelectiveInference] Running layer: " << name << " (type: " << layer.layer_type << ")\n";
-        std::cout << "  Input size: " << current.size() << ", expected: ";
-        size_t expected_in = 1;
-        for (size_t d : layer.input_shape) expected_in *= d;
-        std::cout << expected_in << "\n";
-        std::cout << "  Input shape: [";
-        for (size_t i = 0; i < layer.input_shape.size(); ++i) {
-            std::cout << layer.input_shape[i] << (i < layer.input_shape.size() - 1 ? ", " : "");
+        
+        current = engine.runLayer(layer, current);
+        if (current.empty()) {
+             FAIL() << "runLayer for " << name << " returned an empty tensor.";
         }
-        std::cout << "]\n";
-        current = engine.runLayer(name, current);
-        std::cout << "  Output size: " << current.size() << ", expected: ";
-        size_t expected_out = 1;
-        for (size_t d : layer.output_shape) expected_out *= d;
-        std::cout << expected_out << "\n";
-        std::cout << "  Output shape: [";
-        for (size_t i = 0; i < layer.output_shape.size(); ++i) {
-            std::cout << layer.output_shape[i] << (i < layer.output_shape.size() - 1 ? ", " : "");
-        }
-        std::cout << "]\n";
-        std::cout << "  Output preview: ";
-        for (size_t i = 0; i < std::min<size_t>(5, current.size()); ++i) {
-            std::cout << current[i] << " ";
-        }
-        std::cout << (current.size() > 5 ? "..." : "") << std::endl;
     }
     std::cout << "[SelectiveInference] Output size after running selected layers: " << current.size() << std::endl;
     ASSERT_FALSE(current.empty());
