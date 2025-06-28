@@ -4,6 +4,7 @@
 #include "../core/AICompressor.hpp"
 #include <cstddef>
 #include <cstdint>
+#include "../../../include/cortex_sdk_export.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,10 +34,10 @@ typedef struct {
 } CortexCompressionOptions;
 
 // Initialize compression options with defaults
-CortexError cortex_compression_options_init(CortexCompressionOptions* options);
+CORTEXSDR_API CortexError cortex_compression_options_init(CortexCompressionOptions* options);
 
 // Create a compressor instance
-CortexError cortex_compressor_create(
+CORTEXSDR_API CortexError cortex_compressor_create(
     const char* model_path,
     const char* format,
     const CortexCompressionOptions* options,
@@ -44,13 +45,13 @@ CortexError cortex_compressor_create(
 );
 
 // Compress a model
-CortexError cortex_compressor_compress(
+CORTEXSDR_API CortexError cortex_compressor_compress(
     CortexCompressorHandle handle,
     const char* output_path
 );
 
 // Get compression statistics
-CortexError cortex_compressor_get_stats(
+CORTEXSDR_API CortexError cortex_compressor_get_stats(
     CortexCompressorHandle handle,
     size_t* original_size,
     size_t* compressed_size,
@@ -59,27 +60,27 @@ CortexError cortex_compressor_get_stats(
 );
 
 // Free a compressor instance
-CortexError cortex_compressor_free(CortexCompressorHandle handle);
+CORTEXSDR_API CortexError cortex_compressor_free(CortexCompressorHandle handle);
 
 // Create a decompressor instance
-CortexError cortex_decompressor_create(
+CORTEXSDR_API CortexError cortex_decompressor_create(
     const char* compressed_path,
     CortexDecompressorHandle* handle,
     float sparsity
 );
 
 // Decompress a model
-CortexError cortex_decompressor_decompress(
+CORTEXSDR_API CortexError cortex_decompressor_decompress(
     CortexDecompressorHandle handle,
     const char* compressed_path,
     const char* output_path
 );
 
 // Free a decompressor instance
-CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
+CORTEXSDR_API CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
 
 // Free error message
-void cortex_error_free(CortexError* error);
+CORTEXSDR_API void cortex_error_free(CortexError* error);
 
 #ifdef __cplusplus
 }

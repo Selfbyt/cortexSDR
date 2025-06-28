@@ -1,11 +1,17 @@
 #ifndef CORTEX_SDK_H
 #define CORTEX_SDK_H
 
+#include "c_api.hpp"
+#include "../../../include/cortex_sdk_export.h"
 #include <stddef.h>
 #include <stdint.h>
 
+// Include C API definitions to avoid duplication
 #ifdef __cplusplus
+#include "c_api.hpp"
 extern "C" {
+#else
+#include "c_api.h"
 #endif
 
 /**
@@ -19,67 +25,16 @@ extern "C" {
 
 /* ===== Error Handling ===== */
 
-/**
- * Error codes for SDK functions
- */
-typedef enum {
-    CORTEX_SUCCESS = 0,
-    CORTEX_ERROR_INVALID_ARGUMENT = -1,
-    CORTEX_ERROR_FILE_IO = -2,
-    CORTEX_ERROR_MEMORY = -3,
-    CORTEX_ERROR_UNSUPPORTED_FORMAT = -4,
-    CORTEX_ERROR_COMPRESSION = -5,
-    CORTEX_ERROR_DECOMPRESSION = -6,
-    CORTEX_ERROR_INFERENCE = -7,
-    CORTEX_ERROR_UNKNOWN = -99
-} CortexStatus;
-
-/**
- * Error information structure
- */
-typedef struct {
-    const char* message;
-    int code;
-} CortexError;
-
-/**
- * Free error message
- */
-void cortex_error_free(CortexError* error);
+// Error codes are defined in c_api.hpp
 
 /* ===== Opaque Handle Types ===== */
 
-/**
- * Opaque handle for compressor
- */
-typedef struct CortexCompressor* CortexCompressorHandle;
-
-/**
- * Opaque handle for decompressor
- */
-typedef void* CortexDecompressorHandle;
+// Compressor and Decompressor handles are defined in c_api.hpp
 
 /**
  * Opaque handle for inference engine
  */
 typedef struct CortexInferenceEngine* CortexInferenceEngineHandle;
-
-/* ===== Compression Options ===== */
-
-/**
- * Compression options structure
- */
-typedef struct {
-    size_t num_threads;
-    int verbose;
-    int show_stats;
-    int use_delta_encoding;
-    int use_rle;
-    int compression_level;
-    int use_quantization;      // Whether to use quantization for floating-point tensors
-    int quantization_bits;     // Number of bits for quantization (e.g., 8 for int8)
-    float sparsity;           // Fraction of active bits in SDR encoding (default 0.02 = 2%)
-} CortexCompressionOptions;
 
 /**
  * Initialize compression options with defaults

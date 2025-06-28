@@ -15,6 +15,17 @@ using namespace CortexAICompression;
 // Version information
 #define CORTEX_SDK_VERSION "1.0.0"
 
+// Error code definitions for SDK
+#define CORTEX_SUCCESS 0
+#define CORTEX_ERROR_INVALID_ARGUMENT -1
+#define CORTEX_ERROR_FILE_IO -2
+#define CORTEX_ERROR_MEMORY -3
+#define CORTEX_ERROR_UNSUPPORTED_FORMAT -4
+#define CORTEX_ERROR_COMPRESSION -5
+#define CORTEX_ERROR_DECOMPRESSION -6
+#define CORTEX_ERROR_INFERENCE -7
+#define CORTEX_ERROR_UNKNOWN -99
+
 // Internal structures for opaque handles
 struct CortexInferenceEngine {
     std::unique_ptr<SDRModelLoader> model_loader;
@@ -39,34 +50,8 @@ namespace {
     }
 }
 
-// Error handling
-void cortex_error_free(CortexError* error) {
-    if (error && error->message) {
-        delete[] error->message;
-        error->message = nullptr;
-    }
-}
-
-// Compression options initialization
-CortexError cortex_compression_options_init(CortexCompressionOptions* options) {
-    try {
-        if (!options) {
-            return {"Invalid options pointer", CORTEX_ERROR_INVALID_ARGUMENT};
-        }
-        options->num_threads = 1;
-        options->verbose = 0;
-        options->show_stats = 0;
-        options->use_delta_encoding = 1;
-        options->use_rle = 1;
-        options->compression_level = 6; 
-        options->use_quantization = 0;
-        options->quantization_bits = 8;
-        options->sparsity = 0.02f; 
-        return {nullptr, CORTEX_SUCCESS};
-    } catch (const std::exception& e) {
-        return convert_exception(e);
-    }
-}
+// Error handling and compression options initialization functions are defined in c_api.cpp
+// We don't redefine them here to avoid duplicate symbol errors when building shared libraries
 
 // Compressor functions - these are already implemented in c_api.cpp, so we'll just forward them
 extern "C" {
@@ -85,15 +70,18 @@ extern "C" {
     
     extern CortexError cortex_compressor_free(CortexCompressorHandle handle);
     
-    extern CortexError cortex_decompressor_create(const char* compressed_path,
+    // Forward declaration - implementation is in c_api.cpp
+CORTEXSDR_API CortexError cortex_decompressor_create(const char* compressed_path,
                                           CortexDecompressorHandle* handle,
                                           float sparsity);
     
-    extern CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
+    // Forward declaration - implementation is in c_api.cpp
+CORTEXSDR_API CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
                                                const char* compressed_path,
                                                const char* output_path);
     
-    extern CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
+    // Forward declaration - implementation is in c_api.cpp
+CORTEXSDR_API CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
 }
 
 // Inference Engine functions

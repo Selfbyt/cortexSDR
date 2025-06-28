@@ -1,5 +1,7 @@
 #include "QuantizedTensorStrategy.hpp"
-#include <algorithm>
+#include <iostream>
+#include <cstring> // For memcpy
+#include <algorithm> // For minmax_element
 #include <limits>
 #include <stdexcept>
 
