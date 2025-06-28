@@ -6,6 +6,7 @@ option(BUILD_FIRMWARE "Build as firmware for embedded devices" OFF)
 option(BUILD_DESKTOP "Build as desktop application" ON)
 option(BUILD_LIBRARY "Build as a standalone library" OFF)
 option(BUILD_PYTHON_WRAPPER "Build Python bindings" OFF)
+option(BUILD_SDK "Build the SDK library" ON)
 
 # Set version information
 set(CORTEXSDR_VERSION_MAJOR 1)
@@ -81,6 +82,7 @@ set(COMMON_SOURCES
     src/ai_compression/parsers/ONNXModelParser.cpp
     src/ai_compression/utils/ModelConverter.cpp
     src/ai_compression/api/c_api.cpp
+    src/ai_compression/api/cortex_sdk.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
     src/ai_compression/SparseInferenceEngine.cpp
 )
@@ -352,4 +354,71 @@ if(BUILD_LIBRARY)
         "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
     )
+endif()
+
+# SDK Library configuration
+if(BUILD_SDK)
+    include(GNUInstallDirs)
+    
+    # Define SDK library sources
+    set(SDK_SOURCES
+        src/ai_compression/api/cortex_sdk.cpp
+        src/ai_compression/api/c_api.cpp
+        src/ai_compression/SparseInferenceEngine.cpp
+        src/ai_compression/core/AICompressor.cpp
+        src/ai_compression/core/AIDecompressor.cpp
+        src/ai_compression/core/ArchiveConstants.cpp
+        src/ai_compression/strategies/GzipStrategy.cpp
+        src/ai_compression/strategies/NumericalRLE.cpp
+        src/ai_compression/strategies/SDRIndexStorage.cpp
+        src/ai_compression/strategies/MetadataSDRStrategy.cpp
+        src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
+        src/ai_compression/streaming/StreamingCompressor.cpp
+        src/ai_compression/parsers/GGUFModelParser.cpp
+        src/ai_compression/parsers/ONNXModelParser.cpp
+        src/ai_compression/utils/ModelConverter.cpp
+        src/ai_compression/onnx_proto/onnx.pb.cc
+    )
+    
+    # Create SDK library target
+    add_library(cortexsdr_sdk SHARED ${SDK_SOURCES})
+    
+    # Set properties for the SDK library
+    set_target_properties(cortexsdr_sdk PROPERTIES
+        VERSION ${CORTEXSDR_VERSION}
+        SOVERSION ${CORTEXSDR_VERSION_MAJOR}
+        PUBLIC_HEADER "src/ai_compression/api/cortex_sdk.h"
+        POSITION_INDEPENDENT_CODE ON
+    )
+    
+    # Add include directories
+    target_include_directories(cortexsdr_sdk
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+            $<INSTALL_INTERFACE:include>
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${EXTRA_INCLUDES}
+    )
+    
+    # Link dependencies
+    target_link_libraries(cortexsdr_sdk
+        PRIVATE
+            ZLIB::ZLIB
+            ${Protobuf_LIBRARIES}
+            ${EXTRA_LIBS}
+    )
+    
+    # Install the SDK library
+    install(TARGETS cortexsdr_sdk
+        EXPORT cortexsdr_sdkTargets
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cortexsdr
+    )
+    
+    # Create a simple example that uses the SDK
+    add_executable(sdk_example examples/sdk_usage/sdk_example.cpp)
+    target_link_libraries(sdk_example PRIVATE cortexsdr_sdk)
 endif()
