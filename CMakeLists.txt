@@ -30,6 +30,9 @@ if(BUILD_FIRMWARE)
     
     # Define firmware target
     add_compile_definitions(CORTEX_SDR_FIRMWARE)
+    
+    # Include firmware configuration
+    include(${CMAKE_CURRENT_SOURCE_DIR}/firmware/config/firmware_config.cmake)
 endif()
 
 # Desktop application settings
@@ -332,14 +335,15 @@ endif()
 
 # Firmware binary target
 if(BUILD_FIRMWARE)
-    # Create firmware binary
-    add_executable(${PROJECT_NAME}_firmware src/firmware_main.cpp)
-    target_link_libraries(${PROJECT_NAME}_firmware PRIVATE ${PROJECT_NAME})
+    # Include the firmware-specific CMakeLists.txt
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/firmware)
     
-    # Create hex file for flashing
-    add_custom_command(TARGET ${PROJECT_NAME}_firmware POST_BUILD
-        COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${PROJECT_NAME}_firmware> ${PROJECT_NAME}_firmware.hex
-        COMMENT "Creating HEX file for firmware"
+    # Create a symbolic link to the firmware binary in the main build directory
+    add_custom_command(TARGET cortexsdr_firmware_${CORTEX_TARGET_PLATFORM} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            $<TARGET_FILE:cortexsdr_firmware_${CORTEX_TARGET_PLATFORM}>
+            ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_firmware
+        COMMENT "Creating symbolic link to firmware binary"
     )
 endif()
 
