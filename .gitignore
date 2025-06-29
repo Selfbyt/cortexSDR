@@ -1,11 +1,31 @@
+# Build directories
 build/
+build_firmware/
+firmware/build/
+firmware/build_test/
+test/build/
+
+# IDE files
 .vscode/
 .idea/
+*.code-workspace
+
+# Compiled files
 *.o
+*.a
+*.so
+*.dll
+*.dylib
+*.lib
+*.exe
+*.out
 moc_*
 *.pro.user
 *.user
+
+# System files
 .DS_Store
+Thumbs.db
 
 # Compressed files
 *.zip
@@ -14,13 +34,26 @@ moc_*
 *.tar
 *.gz
 
-# ONNX model files
+# Model files
 *.onnx
+*.sdr
+*.pb
+*.tflite
 
 # Library directories (to be downloaded by users)
 libtensorflow/
 libtorch/
 onnxruntime/
-*.sdr
+
+# Generated documentation
+docs/generated/
+
+# Images and binary data
 *.png
-test/build/
+*.jpg
+*.jpeg
+*.bin
+
+# Commercial/internal documents
+COMMERCIAL_README.md
+POTENTIAL_CUSTOMERS.md
