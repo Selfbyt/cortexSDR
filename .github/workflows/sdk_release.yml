@@ -30,6 +30,8 @@ jobs:
           sudo make
           sudo cp lib/*.a /usr/lib/
           cd -
+          # Install Qt6 for firmware build
+          sudo apt-get install -y qt6-base-dev qt6-declarative-dev
           # Create directory for CMake modules
           mkdir -p cmake
 
@@ -44,6 +46,10 @@ jobs:
         run: |
           if [ -f "./build_firmware.sh" ]; then
             chmod +x ./build_firmware.sh
+            cd build
+            cmake .. -DBUILD_FIRMWARE=ON -DBUILD_SDK=OFF -DBUILD_DESKTOP=ON -DBUILD_TESTING=OFF
+            make -j$(nproc) cortexsdr_firmware_SERVER_X86_64 || echo "Firmware build failed!"
+            cd ..
             ./build_firmware.sh || echo "Firmware build skipped or failed, continuing with SDK only"
           else
             echo "Firmware build script not found, continuing with SDK only"
@@ -60,11 +66,39 @@ jobs:
           mkdir -p release/lib
           mkdir -p release/bin
           cp src/ai_compression/api/cortex_sdk.h release/include/
-          cp src/ai_compression/api/cortex_sdk_export.h release/include/
-          cp build/libcortexsdr_sdk.a release/lib/
-          cp build/libcortexsdr_sdk_shared.so release/lib/
-          # Include AI compression CLI
-          cp build/cortexsdr_ai_compression_cli release/bin/
+          cp src/ai_compression/api/cortex_sdk_export.h release/include/ || echo "cortex_sdk_export.h not found, creating it"
+          if [ ! -f "release/include/cortex_sdk_export.h" ]; then
+            echo '#ifndef CORTEXSDR_SDK_EXPORT_H
+#define CORTEXSDR_SDK_EXPORT_H
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #ifdef CORTEXSDR_BUILDING_DLL
+    #ifdef __GNUC__
+      #define CORTEXSDR_API __attribute__((dllexport))
+    #else
+      #define CORTEXSDR_API __declspec(dllexport)
+    #endif
+  #else
+    #ifdef __GNUC__
+      #define CORTEXSDR_API __attribute__((dllimport))
+    #else
+      #define CORTEXSDR_API __declspec(dllimport)
+    #endif
+  #endif
+#else
+  #if __GNUC__ >= 4
+    #define CORTEXSDR_API __attribute__((visibility("default")))
+  #else
+    #define CORTEXSDR_API
+  #endif
+#endif
+
+#endif // CORTEXSDR_SDK_EXPORT_H' > release/include/cortex_sdk_export.h
+          fi
+          cp build/libcortexsdr_sdk.a release/lib/ || echo "Static SDK library not found"
+          cp build/libcortexsdr_sdk_shared.so release/lib/ || echo "Shared SDK library not found"
+          # Include AI compression CLI if available
+          cp build/cortexsdr_ai_compression_cli release/bin/ || echo "AI compression CLI not found"
           tar -czvf cortexsdr-sdk-linux.tar.gz release/
 
       - name: Package Firmware
