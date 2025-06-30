@@ -22,6 +22,14 @@ jobs:
           sudo apt-get install -y build-essential libprotobuf-dev protobuf-compiler zlib1g-dev
           # Install nlohmann_json
           sudo apt-get install -y nlohmann-json3-dev
+          # Install GTest
+          sudo apt-get install -y libgtest-dev
+          # Build and install GTest
+          cd /usr/src/gtest
+          sudo cmake .
+          sudo make
+          sudo cp lib/*.a /usr/lib/
+          cd -
           # Create directory for CMake modules
           mkdir -p cmake
 
@@ -29,7 +37,7 @@ jobs:
         run: |
           mkdir -p build
           cd build
-          cmake .. -DBUILD_SDK=ON -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DBUNDLE_DEPENDENCIES=ON
+          cmake .. -DBUILD_SDK=ON -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DBUNDLE_DEPENDENCIES=ON -DBUILD_TESTING=OFF
           make -j$(nproc) || echo "Build failed but continuing to package available artifacts"
 
       - name: Build Firmware
@@ -113,6 +121,15 @@ jobs:
           cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON -Dprotobuf_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/tmp/protobuf_android
           make -j$(nproc)
           make install
+          
+          # Download and install nlohmann_json for Android
+          cd /tmp
+          git clone https://github.com/nlohmann/json.git
+          cd json
+          mkdir build && cd build
+          cmake .. -DCMAKE_INSTALL_PREFIX=/tmp/json_android -DJSON_BuildTests=OFF
+          make -j$(nproc)
+          make install
 
       - name: Build Android SDK
         run: |
@@ -124,10 +141,12 @@ jobs:
                   -DBUILD_SDK=ON \
                   -DBUILD_SHARED_LIBS=ON \
                   -DBUILD_DESKTOP=OFF \
-                  -DCMAKE_PREFIX_PATH=/tmp/protobuf_android \
+                  -DCMAKE_PREFIX_PATH="/tmp/protobuf_android;/tmp/json_android" \
                   -DProtobuf_INCLUDE_DIR=/tmp/protobuf_android/include \
                   -DProtobuf_LIBRARIES=/tmp/protobuf_android/lib/libprotobuf.a \
                   -DProtobuf_PROTOC_EXECUTABLE=/tmp/protobuf_android/bin/protoc \
+                  -Dnlohmann_json_DIR=/tmp/json_android/share/cmake/nlohmann_json \
+                  -DBUILD_TESTING=OFF \
                   -DBUNDLE_DEPENDENCIES=ON
           make -j$(nproc) || echo "Build failed but continuing to package available artifacts"
 
