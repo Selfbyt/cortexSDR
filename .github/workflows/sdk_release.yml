@@ -1,0 +1,136 @@
+name: CortexSDR SDK and Firmware Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags (e.g., v1.0.0)
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libprotobuf-dev protobuf-compiler zlib1g-dev
+
+      - name: Build SDK
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DBUILD_SDK=ON -DBUILD_SHARED_LIBS=ON
+          make -j$(nproc)
+
+      - name: Build Firmware
+        run: |
+          ./build_firmware.sh
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure
+
+      - name: Package SDK
+        run: |
+          mkdir -p release/include
+          mkdir -p release/lib
+          cp src/ai_compression/api/cortex_sdk.h release/include/
+          cp src/ai_compression/api/cortex_sdk_export.h release/include/
+          cp build/libcortexsdr_sdk.a release/lib/
+          cp build/libcortexsdr_sdk_shared.so release/lib/
+          tar -czvf cortexsdr-sdk-linux.tar.gz release/
+
+      - name: Package Firmware
+        run: |
+          mkdir -p firmware_release/bin
+          mkdir -p firmware_release/include
+          cp firmware/build/cortex_firmware firmware_release/bin/
+          cp firmware/include/*.h firmware_release/include/
+          tar -czvf cortexsdr-firmware-linux.tar.gz firmware_release/
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: cortexsdr-sdk-linux
+          path: cortexsdr-sdk-linux.tar.gz
+
+      - name: Upload Firmware artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: cortexsdr-firmware-linux
+          path: cortexsdr-firmware-linux.tar.gz
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v2
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;25.2.9519653"
+
+      - name: Build Android SDK
+        run: |
+          mkdir -p build_android
+          cd build_android
+          cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+                  -DANDROID_ABI="arm64-v8a" \
+                  -DANDROID_PLATFORM=android-21 \
+                  -DBUILD_SDK=ON \
+                  -DBUILD_SHARED_LIBS=ON
+          make -j$(nproc)
+
+      - name: Package Android SDK
+        run: |
+          mkdir -p android_release/include
+          mkdir -p android_release/lib/arm64-v8a
+          cp src/ai_compression/api/cortex_sdk.h android_release/include/
+          cp src/ai_compression/api/cortex_sdk_export.h android_release/include/
+          cp build_android/libcortexsdr_sdk.a android_release/lib/arm64-v8a/
+          cp build_android/libcortexsdr_sdk_shared.so android_release/lib/arm64-v8a/
+          tar -czvf cortexsdr-sdk-android.tar.gz android_release/
+
+      - name: Upload Android SDK artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: cortexsdr-sdk-android
+          path: cortexsdr-sdk-android.tar.gz
+
+  create-release:
+    needs: [build-linux, build-android]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            cortexsdr-sdk-linux/cortexsdr-sdk-linux.tar.gz
+            cortexsdr-firmware-linux/cortexsdr-firmware-linux.tar.gz
+            cortexsdr-sdk-android/cortexsdr-sdk-android.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
