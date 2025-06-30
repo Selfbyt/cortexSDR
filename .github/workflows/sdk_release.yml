@@ -20,6 +20,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libprotobuf-dev protobuf-compiler zlib1g-dev
+          # Install nlohmann_json
+          sudo apt-get install -y nlohmann-json3-dev
 
       - name: Build SDK
         run: |
@@ -46,10 +48,13 @@ jobs:
         run: |
           mkdir -p release/include
           mkdir -p release/lib
+          mkdir -p release/bin
           cp src/ai_compression/api/cortex_sdk.h release/include/
           cp src/ai_compression/api/cortex_sdk_export.h release/include/
           cp build/libcortexsdr_sdk.a release/lib/
           cp build/libcortexsdr_sdk_shared.so release/lib/
+          # Include AI compression CLI
+          cp build/cortexsdr_ai_compression_cli release/bin/
           tar -czvf cortexsdr-sdk-linux.tar.gz release/
 
       - name: Package Firmware
@@ -90,6 +95,12 @@ jobs:
       - name: Install Android NDK
         run: |
           sdkmanager "ndk;25.2.9519653"
+          
+      - name: Install Android dependencies
+        run: |
+          # Install Protobuf for Android
+          sudo apt-get update
+          sudo apt-get install -y libprotobuf-dev protobuf-compiler
 
       - name: Build Android SDK
         run: |
@@ -140,3 +151,54 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+  create-homebrew-formula:
+    needs: [create-release]
+    runs-on: macos-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+        
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cortexsdr-sdk-linux
+          
+      - name: Create Homebrew formula
+        run: |
+          mkdir -p Formula
+          cat > Formula/cortexsdr.rb << EOF
+          class Cortexsdr < Formula
+            desc "CortexSDR AI compression CLI tool"
+            homepage "https://github.com/Selfbyt/cortexSDR"
+            url "https://github.com/Selfbyt/cortexSDR/releases/download/v${VERSION}/cortexsdr-sdk-linux.tar.gz"
+            sha256 "$(shasum -a 256 cortexsdr-sdk-linux.tar.gz | awk '{print $1}')"
+            version "${VERSION}"
+            
+            def install
+              bin.install "release/bin/cortexsdr_ai_compression_cli" => "cortexsdr"
+              lib.install Dir["release/lib/*"]
+              include.install Dir["release/include/*"]
+            end
+            
+            test do
+              system "#{bin}/cortexsdr", "--version"
+            end
+          end
+          EOF
+          
+      - name: Setup Homebrew tap
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git clone https://github.com/Selfbyt/homebrew-cortexsdr.git
+          cp Formula/cortexsdr.rb homebrew-cortexsdr/Formula/
+          cd homebrew-cortexsdr
+          git add Formula/cortexsdr.rb
+          git commit -m "Update cortexsdr to v${VERSION}"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/Selfbyt/homebrew-cortexsdr.git
