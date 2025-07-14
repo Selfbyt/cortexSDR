@@ -83,6 +83,7 @@ set(COMMON_SOURCES
     src/ai_compression/parsers/GGUFModelParser.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp
     src/ai_compression/utils/ModelConverter.cpp
+    src/ai_compression/utils/sha256.cpp
     src/ai_compression/api/c_api.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
     src/ai_compression/SparseInferenceEngine.cpp

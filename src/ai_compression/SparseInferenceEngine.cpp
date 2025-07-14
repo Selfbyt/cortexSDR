@@ -643,7 +643,19 @@ std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tenso
         std::cout << "  -> " << name << std::endl;
     }
 
-    return runLayers(layer_names, input_tensor);
+    auto result = runLayers(layer_names, input_tensor);
+
+    // Report encountered and unhandled layer types
+    std::cout << "\n[SDRInferenceEngine] Encountered layer types:" << std::endl;
+    for (const auto& t : encountered_layer_types_) {
+        std::cout << "  " << t << std::endl;
+    }
+    std::cout << "[SDRInferenceEngine] Unhandled layer types:" << std::endl;
+    for (const auto& t : unhandled_layer_types_) {
+        std::cout << "  " << t << std::endl;
+    }
+
+    return result;
 }
 
 #ifdef ENABLE_ONNX_PROTOBUF
@@ -654,19 +666,14 @@ const std::optional<onnx::ModelProto>& SDRModelLoader::getLoadedModelProto() con
 
 // Run a single layer by name
 std::vector<float> SDRInferenceEngine::runLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    // Strict shape validation
-    size_t expected_input_size = 1;
-    for (size_t d : layer.input_shape) expected_input_size *= d;
-    if (input.size() != expected_input_size) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Input tensor size " << input.size()
-                  << " does not match expected input_shape product " << expected_input_size
-                  << " for layer: " << layer.name << std::endl;
-        return {};
-    }
+    // Track encountered layer type
+    encountered_layer_types_.insert(layer.layer_type);
     auto it = op_dispatch_.find(layer.layer_type);
     if (it != op_dispatch_.end()) {
         return it->second(layer, input);
     } else {
+        // Track unhandled layer type
+        unhandled_layer_types_.insert(layer.layer_type);
         return default_handler_(layer, input);
     }
 }

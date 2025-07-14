@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstring>
 #include <cassert>
+#include <iomanip> // Required for std::setw and std::setfill
 
 namespace CortexAICompression {
 
@@ -106,24 +107,30 @@ std::vector<std::byte> AdaptiveSDRStrategy::decompress(
         } else {
             return getSDRStrategy()->decompress(sdrData, originalType, originalSize);
         }
+    }
+    // Invalid encoding flag - try to recover
+    std::cerr << "Warning: Invalid encoding flag 0x" << std::hex << static_cast<int>(encodingFlag)
+              << std::dec << " for data of type " << static_cast<int>(originalType)
+              << ", original size: " << originalSize << std::endl;
+    std::cerr << "First 16 bytes: ";
+    for (size_t i = 0; i < std::min<size_t>(16, compressedData.size()); ++i) {
+        std::cerr << std::hex << std::setw(2) << std::setfill('0')
+                  << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
+    }
+    std::cerr << std::dec << std::endl;
+    
+    // For tensor weights, try passing to the appropriate strategy based on type
+    ModelSegment dummySegment;
+    dummySegment.type = originalType;
+    
+    if (dummySegment.isWeightTensor()) {
+        // For weight tensors, use the SDRStrategy
+        std::cerr << "Attempting to decompress weight tensor with SDRStrategy" << std::endl;
+        return getSDRStrategy()->decompress(compressedData, originalType, originalSize);
     } else {
-        // Invalid encoding flag - try to recover
-        std::cerr << "Warning: Invalid encoding flag 0x" << std::hex << static_cast<int>(encodingFlag) 
-                  << std::dec << " for data of type " << static_cast<int>(originalType) << std::endl;
-        
-        // For tensor weights, try passing to the appropriate strategy based on type
-        ModelSegment dummySegment;
-        dummySegment.type = originalType;
-        
-        if (dummySegment.isWeightTensor()) {
-            // For weight tensors, use the SDRStrategy
-            std::cerr << "Attempting to decompress weight tensor with SDRStrategy" << std::endl;
-            return getSDRStrategy()->decompress(compressedData, originalType, originalSize);
-        } else {
-            // For metadata and graph structure, use the MetadataStrategy
-            std::cerr << "Attempting to decompress with MetadataStrategy" << std::endl;
-            return getMetadataStrategy()->decompress(compressedData, originalType, originalSize);
-        }
+        // For metadata and graph structure, use the MetadataStrategy
+        std::cerr << "Attempting to decompress with MetadataStrategy" << std::endl;
+        return getMetadataStrategy()->decompress(compressedData, originalType, originalSize);
     }
 }
 

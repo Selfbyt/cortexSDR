@@ -5,6 +5,7 @@
 #include <iostream> // For potential debug/error messages
 #include <cstring> // For std::memcpy, std::memcmp
 #include <fstream>
+#include "../utils/sha256.h"
 
 namespace CortexAICompression {
 
@@ -18,23 +19,18 @@ bool readBasicType(std::istream& stream, T& value) {
 // Helper function to read string (length prefixed)
 bool readString(std::istream& stream, std::string& str) {
     uint32_t len;
-    std::cerr << "  DEBUG readString: Attempting to read length (uint32_t)..." << std::endl; // DEBUG
     if (!readBasicType(stream, len)) {
-        std::cerr << "  DEBUG readString: Failed to read length. Stream state good: " << stream.good() << ", eof: " << stream.eof() << ", fail: " << stream.fail() << ", bad: " << stream.bad() << std::endl; // DEBUG
         return false;
     }
-    std::cerr << "  DEBUG readString: Read length = " << len << ". Attempting to read " << len << " bytes for string..." << std::endl; // DEBUG
     if (len > 0) { // Avoid reading 0 bytes if length is 0
         str.resize(len);
         stream.read(&str[0], len);
         if (!stream.good()) {
-             std::cerr << "  DEBUG readString: Failed to read string data. Stream state good: " << stream.good() << ", eof: " << stream.eof() << ", fail: " << stream.fail() << ", bad: " << stream.bad() << std::endl; // DEBUG
-             return false;
+            return false;
         }
     } else {
         str.clear(); // Ensure string is empty if length is 0
     }
-    std::cerr << "  DEBUG readString: Successfully read string." << std::endl; // DEBUG
     return stream.good();
 }
 
@@ -261,6 +257,12 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
     if (!stream) {
         throw CompressionError("Failed to read compressed data for segment: " + header.name);
     }
+    // Read stored SHA256 checksum (32 bytes)
+    std::vector<uint8_t> storedChecksum(32);
+    stream.read(reinterpret_cast<char*>(storedChecksum.data()), 32);
+    if (!stream) {
+        throw CompressionError("Failed to read stored checksum for segment: " + header.name);
+    }
 
     // 2. Select Decompression Strategy
     std::vector<std::byte> decompressedData;
@@ -323,6 +325,17 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
     segment.layer_type = header.layer_type;           // Copy layer type
     segment.input_shape = header.input_shape;         // Copy input shape
     segment.output_shape = header.output_shape;       // Copy output shape
+
+    // 6. Validate checksum of decompressed data
+    CortexAICompression::SHA256 hasher;
+    hasher.update(segment.data);
+    auto computed = hasher.digest();
+    bool match = (computed == storedChecksum);
+    if (match) {
+        std::cerr << "[Checksum OK] Segment '" << segment.name << "' matches SHA256." << std::endl;
+    } else {
+        std::cerr << "[Checksum FAIL] Segment '" << segment.name << "' does NOT match SHA256!" << std::endl;
+    }
 
     return segment;
 }

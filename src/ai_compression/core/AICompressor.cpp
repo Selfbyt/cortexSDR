@@ -10,6 +10,7 @@
 #include <future>
 #include <list>    // Include list for strategy storage
 #include <algorithm> // For std::find_if
+#include "../utils/sha256.h"
 
 namespace CortexAICompression {
 
@@ -21,8 +22,8 @@ void writeBasicType(std::ostream& stream, const T& value) {
 
 // Helper function to write string (length prefixed)
 void writeString(std::ostream& stream, const std::string& str) {
-    uint16_t len = static_cast<uint16_t>(str.length());
-    if (str.length() > UINT16_MAX) {
+    uint32_t len = static_cast<uint32_t>(str.length());
+    if (str.length() > UINT32_MAX) {
         throw std::runtime_error("Segment name too long for archive format.");
     }
     writeBasicType(stream, len);
@@ -152,7 +153,8 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
     // Calculate size of the index table itself
     uint64_t indexTableSize = 0;
     for (const auto& header : headers) {
-        indexTableSize += sizeof(uint16_t) + header.name.length(); // Name length + name
+        indexTableSize += sizeof(uint32_t) + header.name.length(); // Name length + name (now uint32_t)
+        indexTableSize += sizeof(uint32_t) + segments[&header - &headers[0]].layer_type.length(); // Layer type string (now uint32_t)
         indexTableSize += sizeof(uint8_t); // Original Type
         indexTableSize += sizeof(uint8_t); // Strategy ID
         indexTableSize += sizeof(uint64_t); // Original Size
@@ -178,9 +180,14 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         writeBasicType(outputArchiveStream, dataOffsets[i]); // Write calculated offset
     }
 
-    // 4. Write Compressed Data Blocks
+    // 4. Write Compressed Data Blocks and their checksums
     for (const auto& data : compressedDatas) {
         outputArchiveStream.write(reinterpret_cast<const char*>(data.data()), data.size());
+        // Compute and write SHA256 checksum for this block
+        CortexAICompression::SHA256 hasher;
+        hasher.update(data);
+        auto digest = hasher.digest();
+        outputArchiveStream.write(reinterpret_cast<const char*>(digest.data()), digest.size());
     }
 
     // 5. Write the archive footer (if any)

@@ -18,6 +18,7 @@
 #include "onnx_proto/onnx.pb.h"
 #include "core/AIDecompressor.hpp" // For AIDecompressor
 #include <functional>
+#include <unordered_set>
 
 namespace CortexAICompression {
 
@@ -118,6 +119,11 @@ public:
     // Run a sequence of layers by name, loading them on-demand
     std::vector<float> runLayers(const std::vector<std::string>& layer_names, const std::vector<float>& input);
     
+    // New: Get all encountered layer types
+    const std::unordered_set<std::string>& getEncounteredLayerTypes() const { return encountered_layer_types_; }
+    // New: Get all unhandled layer types
+    const std::unordered_set<std::string>& getUnhandledLayerTypes() const { return unhandled_layer_types_; }
+    
 private:
     // Engine no longer stores all layers. It holds a reference to the loader.
     SDRModelLoader& loader_; 
@@ -127,6 +133,10 @@ private:
     bool training_mode;
     std::unordered_map<std::string, LayerInfo> layer_map_; // For fast lookup by name
     
+    // New: Track all encountered and unhandled layer types
+    std::unordered_set<std::string> encountered_layer_types_;
+    std::unordered_set<std::string> unhandled_layer_types_;
+
     // Helper functions for neural network operations
     std::vector<float> applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input);
     std::vector<float> applyConvolutionalLayer(const LayerInfo& layer, const std::vector<float>& input);
