@@ -53,26 +53,39 @@ jobs:
         run: |
           echo "Downloading ML libraries..."
           
-          # Download ONNX Runtime
-          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.21.1/onnxruntime-linux-x64-gpu-1.21.1.tgz
-          tar -xzf onnxruntime-linux-x64-gpu-1.21.1.tgz
-          mv onnxruntime-linux-x64-gpu-1.21.1 onnxruntime
+          # Download ONNX Runtime (latest stable version)
+          echo "Downloading ONNX Runtime..."
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.22.1/onnxruntime-linux-x64-gpu-1.22.1.tgz || (echo "ONNX Runtime download failed" && exit 1)
+          tar -xzf onnxruntime-linux-x64-gpu-1.22.1.tgz || (echo "ONNX Runtime extraction failed" && exit 1)
+          mv onnxruntime-linux-x64-gpu-1.22.1 onnxruntime || (echo "ONNX Runtime move failed" && exit 1)
           
-          # Download PyTorch
-          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.7.0%2Bcpu.zip
-          unzip -q "libtorch-cxx11-abi-shared-with-deps-2.7.0+cpu.zip"
+          # Download PyTorch (latest available version)
+          echo "Downloading PyTorch..."
+          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.7.1%2Bcpu.zip || (echo "PyTorch download failed" && exit 1)
+          unzip -q "libtorch-cxx11-abi-shared-with-deps-2.7.1+cpu.zip" || (echo "PyTorch extraction failed" && exit 1)
           
-          # Download TensorFlow (latest version)
-          wget -q https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-cpu-linux-x86_64.tar.gz
-          tar -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          # Download TensorFlow (latest stable version)
+          echo "Downloading TensorFlow..."
+          wget -q https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-cpu-linux-x86_64-2.5.2.tar.gz || (echo "TensorFlow download failed" && exit 1)
+          tar -xzf libtensorflow-cpu-linux-x86_64-2.5.2.tar.gz || (echo "TensorFlow extraction failed" && exit 1)
           # TensorFlow extracts include/ and lib/ directly to current directory
           
           # Clone ONNX repository for headers
-          git clone --depth 1 https://github.com/onnx/onnx.git onnx_src
+          echo "Cloning ONNX repository..."
+          git clone --depth 1 https://github.com/onnx/onnx.git onnx_src || (echo "ONNX repository clone failed" && exit 1)
           
           echo "ML libraries downloaded successfully"
           echo "Directory structure:"
           ls -la | grep -E "(onnxruntime|libtorch|include|lib)"
+          
+          # Verify downloads
+          echo "Verifying downloads..."
+          [ -d "onnxruntime" ] || (echo "ONNX Runtime directory not found" && exit 1)
+          [ -d "libtorch" ] || (echo "PyTorch directory not found" && exit 1)
+          [ -d "include" ] || (echo "TensorFlow include directory not found" && exit 1)
+          [ -d "lib" ] || (echo "TensorFlow lib directory not found" && exit 1)
+          [ -d "onnx_src" ] || (echo "ONNX source directory not found" && exit 1)
+          echo "All ML libraries verified successfully"
           
       - name: Verify dependencies
         run: |
@@ -136,10 +149,10 @@ jobs:
           
           if [ "$QT6_AVAILABLE" = "true" ]; then
             echo "Building with desktop support..."
-            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=ON -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch/libtorch:$(pwd)/onnxruntime/onnxruntime-linux-x64-gpu-1.21.1" -DTensorFlow_INCLUDE_DIRS="$(pwd)/include" -DTensorFlow_LIBRARIES="$(pwd)/lib" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
+            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=ON -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch/libtorch:$(pwd)/onnxruntime/onnxruntime-linux-x64-gpu-1.22.1" -DTensorFlow_INCLUDE_DIRS="$(pwd)/include" -DTensorFlow_LIBRARIES="$(pwd)/lib" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
           else
             echo "Building without desktop support..."
-            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch/libtorch:$(pwd)/onnxruntime/onnxruntime-linux-x64-gpu-1.21.1" -DTensorFlow_INCLUDE_DIRS="$(pwd)/include" -DTensorFlow_LIBRARIES="$(pwd)/lib" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
+            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch/libtorch:$(pwd)/onnxruntime/onnxruntime-linux-x64-gpu-1.22.1" -DTensorFlow_INCLUDE_DIRS="$(pwd)/include" -DTensorFlow_LIBRARIES="$(pwd)/lib" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
           fi
           
           echo "CMake configuration complete. Available targets:"
