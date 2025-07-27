@@ -62,15 +62,17 @@ jobs:
           wget -q https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.7.0%2Bcpu.zip
           unzip -q "libtorch-cxx11-abi-shared-with-deps-2.7.0+cpu.zip"
           
-          # Download TensorFlow
-          wget -q https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-cpu-linux-x86_64-2.15.0.tar.gz
-          tar -xzf libtensorflow-cpu-linux-x86_64-2.15.0.tar.gz
-          mv libtensorflow-cpu-linux-x86_64-2.15.0 libtensorflow
+          # Download TensorFlow (latest version)
+          wget -q https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-cpu-linux-x86_64.tar.gz
+          tar -xzf libtensorflow-cpu-linux-x86_64.tar.gz
+          # TensorFlow extracts include/ and lib/ directly to current directory
           
           # Clone ONNX repository for headers
           git clone --depth 1 https://github.com/onnx/onnx.git onnx_src
           
           echo "ML libraries downloaded successfully"
+          echo "Directory structure:"
+          ls -la | grep -E "(onnxruntime|libtorch|include|lib)"
           
       - name: Verify dependencies
         run: |
@@ -134,10 +136,10 @@ jobs:
           
           if [ "$QT6_AVAILABLE" = "true" ]; then
             echo "Building with desktop support..."
-            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=ON -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch:$(pwd)/libtensorflow:$(pwd)/onnxruntime" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
+            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=ON -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch/libtorch:$(pwd)/onnxruntime/onnxruntime-linux-x64-gpu-1.21.1" -DTensorFlow_INCLUDE_DIRS="$(pwd)/include" -DTensorFlow_LIBRARIES="$(pwd)/lib" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
           else
             echo "Building without desktop support..."
-            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch:$(pwd)/libtensorflow:$(pwd)/onnxruntime" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
+            cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch/libtorch:$(pwd)/onnxruntime/onnxruntime-linux-x64-gpu-1.21.1" -DTensorFlow_INCLUDE_DIRS="$(pwd)/include" -DTensorFlow_LIBRARIES="$(pwd)/lib" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
           fi
           
           echo "CMake configuration complete. Available targets:"
