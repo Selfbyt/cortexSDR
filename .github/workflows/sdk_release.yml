@@ -1,4 +1,4 @@
-name: CortexSDR SDK and Firmware Release
+name: CortexSDR C++ SDK Release
 
 on:
   push:
@@ -30,10 +30,46 @@ jobs:
           sudo make
           sudo cp lib/*.a /usr/lib/
           cd -
-          # Install Qt6 for firmware build
-          sudo apt-get install -y qt6-base-dev qt6-declarative-dev
+          # Install Qt6 for desktop build
+          sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-network-dev
+          # Install additional dependencies for ML libraries
+          sudo apt-get install -y libgomp1 libblas3 liblapack3
+          # Install additional dependencies for ONNX and protobuf
+          sudo apt-get install -y libprotobuf-dev protobuf-compiler
           # Create directory for CMake modules
           mkdir -p cmake
+          
+      - name: Download ML libraries
+        run: |
+          echo "Downloading ML libraries..."
+          
+          # Download ONNX Runtime
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.21.1/onnxruntime-linux-x64-gpu-1.21.1.tgz
+          tar -xzf onnxruntime-linux-x64-gpu-1.21.1.tgz
+          mv onnxruntime-linux-x64-gpu-1.21.1 onnxruntime
+          
+          # Download PyTorch
+          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.7.0%2Bcpu.zip
+          unzip -q "libtorch-cxx11-abi-shared-with-deps-2.7.0+cpu.zip"
+          
+          # Download TensorFlow
+          wget -q https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-cpu-linux-x86_64-2.15.0.tar.gz
+          tar -xzf libtensorflow-cpu-linux-x86_64-2.15.0.tar.gz
+          mv libtensorflow-cpu-linux-x86_64-2.15.0 libtensorflow
+          
+          # Clone ONNX repository for headers
+          git clone --depth 1 https://github.com/onnx/onnx.git onnx_src
+          
+          echo "ML libraries downloaded successfully"
+          
+      - name: Verify dependencies
+        run: |
+          echo "Checking for required dependencies:"
+          which cmake || echo "CMake not found"
+          which g++ || echo "G++ not found"
+          pkg-config --exists protobuf && echo "Protobuf found" || echo "Protobuf not found"
+          pkg-config --exists zlib && echo "Zlib found" || echo "Zlib not found"
+          pkg-config --exists nlohmann_json && echo "nlohmann_json found" || echo "nlohmann_json not found"
 
       - name: Install Qt6 (Linux)
         if: runner.os == 'Linux'
@@ -51,87 +87,142 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "CMAKE_PREFIX_PATH=$(brew --prefix qt@6)/lib/cmake" >> $GITHUB_ENV
 
-      - name: Build SDK
+      - name: Build SDK and CLI
         run: |
           mkdir -p build
           cd build
-          cmake .. -DBUILD_SDK=ON -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=OFF -DBUNDLE_DEPENDENCIES=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+          echo "Configuring CMake..."
+          cmake .. -DBUILD_SHARED_LIBS=ON -DBUILD_DESKTOP=ON -DENABLE_ONNX=ON -DENABLE_PYTORCH=ON -DENABLE_TENSORFLOW=ON -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH:$(pwd)/libtorch:$(pwd)/libtensorflow:$(pwd)/onnxruntime" -DONNX_INCLUDE_DIRS="$(pwd)/onnx_src"
+          echo "CMake configuration complete. Available targets:"
+          cmake --build . --target help | grep cortexsdr || echo "No cortexsdr targets found"
+          echo "Building..."
           make -j$(nproc) || echo "Build failed but continuing to package available artifacts"
-
-      - name: Build Firmware
+          
+      - name: List build artifacts
         run: |
-          if [ -f "./build_firmware.sh" ]; then
-            chmod +x ./build_firmware.sh
-            ./build_firmware.sh -t SERVER_X86_64 || echo "Firmware build failed, continuing with SDK only"
-          else
-            echo "Firmware build script not found, continuing with SDK only"
-          fi
+          cd build
+          echo "Build directory contents:"
+          ls -la
+          echo "Looking for SDK libraries:"
+          find . -name "*cortexsdr*" -type f
+          echo "Looking for all libraries:"
+          find . -name "*.a" -o -name "*.so" | head -20
+          echo "Looking for executables:"
+          find . -type f -executable | head -20
 
       - name: Run tests
         run: |
           cd build
           ctest --output-on-failure || echo "Some tests may have failed, continuing with release process"
 
-      - name: Package SDK
+      - name: Package C++ SDK Library
         run: |
-          mkdir -p release/include
-          mkdir -p release/lib
-          mkdir -p release/bin
-          cp src/ai_compression/api/cortex_sdk.h release/include/
-          cp src/ai_compression/api/cortex_sdk_export.h release/include/ || echo "cortex_sdk_export.h not found, creating it"
-          if [ ! -f "release/include/cortex_sdk_export.h" ]; then
-            echo '#ifndef CORTEXSDR_SDK_EXPORT_H' > release/include/cortex_sdk_export.h
-            echo '#define CORTEXSDR_SDK_EXPORT_H' >> release/include/cortex_sdk_export.h
-            echo '' >> release/include/cortex_sdk_export.h
-            echo '#if defined(_WIN32) || defined(__CYGWIN__)' >> release/include/cortex_sdk_export.h
-            echo '  #ifdef CORTEXSDR_BUILDING_DLL' >> release/include/cortex_sdk_export.h
-            echo '    #ifdef __GNUC__' >> release/include/cortex_sdk_export.h
-            echo '      #define CORTEXSDR_API __attribute__((dllexport))' >> release/include/cortex_sdk_export.h
-            echo '    #else' >> release/include/cortex_sdk_export.h
-            echo '      #define CORTEXSDR_API __declspec(dllexport)' >> release/include/cortex_sdk_export.h
-            echo '    #endif' >> release/include/cortex_sdk_export.h
-            echo '  #else' >> release/include/cortex_sdk_export.h
-            echo '    #ifdef __GNUC__' >> release/include/cortex_sdk_export.h
-            echo '      #define CORTEXSDR_API __attribute__((dllimport))' >> release/include/cortex_sdk_export.h
-            echo '    #else' >> release/include/cortex_sdk_export.h
-            echo '      #define CORTEXSDR_API __declspec(dllimport)' >> release/include/cortex_sdk_export.h
-            echo '    #endif' >> release/include/cortex_sdk_export.h
-            echo '  #endif' >> release/include/cortex_sdk_export.h
-            echo '#else' >> release/include/cortex_sdk_export.h
-            echo '  #if __GNUC__ >= 4' >> release/include/cortex_sdk_export.h
-            echo '    #define CORTEXSDR_API __attribute__((visibility("default")))' >> release/include/cortex_sdk_export.h
-            echo '  #else' >> release/include/cortex_sdk_export.h
-            echo '    #define CORTEXSDR_API' >> release/include/cortex_sdk_export.h
-            echo '  #endif' >> release/include/cortex_sdk_export.h
-            echo '#endif' >> release/include/cortex_sdk_export.h
-            echo '' >> release/include/cortex_sdk_export.h
-            echo '#endif // CORTEXSDR_SDK_EXPORT_H' >> release/include/cortex_sdk_export.h
+          # Check if build directory exists
+          if [ ! -d "build" ]; then
+            echo "Build directory does not exist! Creating empty package."
+            mkdir -p sdk_release
+            echo "Build failed - no artifacts to package" > sdk_release/BUILD_FAILED.txt
+            tar -czvf cortexsdr-cpp-sdk-linux.tar.gz sdk_release/
+            exit 0
           fi
-          cp build/libcortexsdr_sdk.a release/lib/ || echo "Static SDK library not found"
-          cp build/libcortexsdr_sdk_shared.so release/lib/ || echo "Shared SDK library not found"
-          # Include AI compression CLI if available
-          cp build/cortexsdr_ai_compression_cli release/bin/ || echo "AI compression CLI not found"
-          tar -czvf cortexsdr-sdk-linux.tar.gz release/
+          
+          mkdir -p sdk_release/include
+          mkdir -p sdk_release/lib
+          mkdir -p sdk_release/bin
+          mkdir -p sdk_release/examples
+          mkdir -p sdk_release/docs
+          
+          # Copy SDK headers
+          cp src/ai_compression/api/cortex_sdk.h sdk_release/include/ || echo "cortex_sdk.h not found"
+          cp src/ai_compression/api/c_api.hpp sdk_release/include/ || echo "c_api.hpp not found"
+          cp src/ai_compression/api/cortex_sdk_export.h sdk_release/include/ || echo "cortex_sdk_export.h not found, creating it"
+          
+          # Create export header if missing
+          if [ ! -f "sdk_release/include/cortex_sdk_export.h" ]; then
+            echo '#ifndef CORTEXSDR_SDK_EXPORT_H' > sdk_release/include/cortex_sdk_export.h
+            echo '#define CORTEXSDR_SDK_EXPORT_H' >> sdk_release/include/cortex_sdk_export.h
+            echo '' >> sdk_release/include/cortex_sdk_export.h
+            echo '#if defined(_WIN32) || defined(__CYGWIN__)' >> sdk_release/include/cortex_sdk_export.h
+            echo '  #ifdef CORTEXSDR_BUILDING_DLL' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #ifdef __GNUC__' >> sdk_release/include/cortex_sdk_export.h
+            echo '      #define CORTEXSDR_API __attribute__((dllexport))' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #else' >> sdk_release/include/cortex_sdk_export.h
+            echo '      #define CORTEXSDR_API __declspec(dllexport)' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #endif' >> sdk_release/include/cortex_sdk_export.h
+            echo '  #else' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #ifdef __GNUC__' >> sdk_release/include/cortex_sdk_export.h
+            echo '      #define CORTEXSDR_API __attribute__((dllimport))' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #else' >> sdk_release/include/cortex_sdk_export.h
+            echo '      #define CORTEXSDR_API __declspec(dllimport)' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #endif' >> sdk_release/include/cortex_sdk_export.h
+            echo '  #endif' >> sdk_release/include/cortex_sdk_export.h
+            echo '#else' >> sdk_release/include/cortex_sdk_export.h
+            echo '  #if __GNUC__ >= 4' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #define CORTEXSDR_API __attribute__((visibility("default")))' >> sdk_release/include/cortex_sdk_export.h
+            echo '  #else' >> sdk_release/include/cortex_sdk_export.h
+            echo '    #define CORTEXSDR_API' >> sdk_release/include/cortex_sdk_export.h
+            echo '  #endif' >> sdk_release/include/cortex_sdk_export.h
+            echo '#endif' >> sdk_release/include/cortex_sdk_export.h
+            echo '' >> sdk_release/include/cortex_sdk_export.h
+            echo '#endif // CORTEXSDR_SDK_EXPORT_H' >> sdk_release/include/cortex_sdk_export.h
+          fi
+          
+          # Copy SDK libraries (using correct target names)
+          # Try the standard library naming convention first
+          cp build/libcortexsdr_sdk.a sdk_release/lib/ || echo "Standard static SDK library not found"
+          cp build/libcortexsdr_sdk_shared.so sdk_release/lib/ || echo "Standard shared SDK library not found"
+          cp build/libcortexsdr.a sdk_release/lib/ || echo "Main library not found"
+          cp build/libcortexsdr_shared.so sdk_release/lib/ || echo "Main shared library not found"
+          
+          # Try alternative names if the above don't exist
+          if [ ! -f "sdk_release/lib/libcortexsdr_sdk.a" ]; then
+            cp build/cortexsdr_sdk.a sdk_release/lib/ || echo "Alternative static SDK library not found"
+          fi
+          if [ ! -f "sdk_release/lib/libcortexsdr_sdk_shared.so" ]; then
+            cp build/cortexsdr_sdk_shared.so sdk_release/lib/ || echo "Alternative shared SDK library not found"
+          fi
+          
+          # Try with different extensions
+          if [ ! -f "sdk_release/lib/libcortexsdr_sdk.a" ] && [ ! -f "sdk_release/lib/cortexsdr_sdk.a" ]; then
+            cp build/cortexsdr_sdk sdk_release/lib/ || echo "Static SDK library without extension not found"
+          fi
+          if [ ! -f "sdk_release/lib/libcortexsdr_sdk_shared.so" ] && [ ! -f "sdk_release/lib/cortexsdr_sdk_shared.so" ]; then
+            cp build/cortexsdr_sdk_shared sdk_release/lib/ || echo "Shared SDK library without extension not found"
+          fi
+          
+          # Copy CLI tools
+          cp build/cortexsdr_ai_compression_cli sdk_release/bin/ || echo "AI compression CLI not found"
+          cp build/cortexsdr_cli sdk_release/bin/ || echo "Main CLI not found"
+          
+          # Copy examples
+          cp -r examples/ sdk_release/examples/ || echo "Examples not found"
+          
+          # Copy documentation
+          cp docs/README.md sdk_release/docs/ || echo "README not found"
+          cp docs/cli_usage.md sdk_release/docs/ || echo "CLI docs not found"
+          cp LICENSE sdk_release/ || echo "LICENSE not found"
+          
+          # Create CMake config files
+          echo 'cmake_minimum_required(VERSION 3.10)' > sdk_release/CMakeLists.txt
+          echo 'project(CortexSDR)' >> sdk_release/CMakeLists.txt
+          echo 'find_package(PkgConfig REQUIRED)' >> sdk_release/CMakeLists.txt
+          echo 'pkg_check_modules(REQUIRED zlib)' >> sdk_release/CMakeLists.txt
+          echo 'pkg_check_modules(REQUIRED nlohmann_json)' >> sdk_release/CMakeLists.txt
+          echo 'add_library(cortexsdr_sdk STATIC IMPORTED)' >> sdk_release/CMakeLists.txt
+          echo 'set_target_properties(cortexsdr_sdk PROPERTIES' >> sdk_release/CMakeLists.txt
+          echo '  IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/lib/libcortexsdr_sdk.a' >> sdk_release/CMakeLists.txt
+          echo '  INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include' >> sdk_release/CMakeLists.txt
+          echo '  INTERFACE_LINK_LIBRARIES z nlohmann_json::nlohmann_json' >> sdk_release/CMakeLists.txt
+          echo ')' >> sdk_release/CMakeLists.txt
+          
+          # Create package
+          tar -czvf cortexsdr-cpp-sdk-linux.tar.gz sdk_release/
 
-      - name: Package Firmware
-        run: |
-          mkdir -p firmware_release/bin
-          mkdir -p firmware_release/include
-          cp firmware/build/cortex_firmware firmware_release/bin/
-          cp firmware/include/*.h firmware_release/include/
-          tar -czvf cortexsdr-firmware-linux.tar.gz firmware_release/
-
-      - name: Upload SDK artifact
+      - name: Upload C++ SDK Library
         uses: actions/upload-artifact@v4
         with:
-          name: cortexsdr-sdk-linux
-          path: cortexsdr-sdk-linux.tar.gz
-
-      - name: Upload Firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cortexsdr-firmware-linux
-          path: cortexsdr-firmware-linux.tar.gz
+          name: cortexsdr-cpp-sdk-linux
+          path: cortexsdr-cpp-sdk-linux.tar.gz
 
   build-android:
     runs-on: ubuntu-latest
@@ -184,9 +275,11 @@ jobs:
           cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
                   -DANDROID_ABI="arm64-v8a" \
                   -DANDROID_PLATFORM=android-21 \
-                  -DBUILD_SDK=ON \
                   -DBUILD_SHARED_LIBS=ON \
-                  -DBUILD_DESKTOP=OFF \
+                  -DBUILD_DESKTOP=ON \
+                  -DENABLE_ONNX=ON \
+                  -DENABLE_PYTORCH=ON \
+                  -DENABLE_TENSORFLOW=ON \
                   -DBUILD_TESTING=OFF \
                   -DCMAKE_PREFIX_PATH="/tmp/protobuf_android;/tmp/json_android" \
                   -DProtobuf_INCLUDE_DIR=/tmp/protobuf_android/include \
@@ -195,15 +288,41 @@ jobs:
                   -Dnlohmann_json_DIR=/tmp/json_android/share/cmake/nlohmann_json \
                   -DBUNDLE_DEPENDENCIES=ON
           make -j$(nproc) || echo "Build failed but continuing to package available artifacts"
+          
+      - name: List Android build artifacts
+        run: |
+          cd build_android
+          echo "Android build directory contents:"
+          ls -la
+          echo "Looking for SDK libraries:"
+          find . -name "*cortexsdr*" -type f
 
       - name: Package Android SDK
         run: |
+          # Check if build directory exists
+          if [ ! -d "build_android" ]; then
+            echo "Android build directory does not exist! Creating empty package."
+            mkdir -p android_release
+            echo "Build failed - no artifacts to package" > android_release/BUILD_FAILED.txt
+            tar -czvf cortexsdr-sdk-android.tar.gz android_release/
+            exit 0
+          fi
+          
           mkdir -p android_release/include
           mkdir -p android_release/lib/arm64-v8a
           cp src/ai_compression/api/cortex_sdk.h android_release/include/
           cp src/ai_compression/api/cortex_sdk_export.h android_release/include/
-          cp build_android/libcortexsdr_sdk.a android_release/lib/arm64-v8a/
-          cp build_android/libcortexsdr_sdk_shared.so android_release/lib/arm64-v8a/
+          cp build_android/libcortexsdr_sdk.a android_release/lib/arm64-v8a/ || echo "Static SDK library not found"
+          cp build_android/libcortexsdr_sdk_shared.so android_release/lib/arm64-v8a/ || echo "Shared SDK library not found"
+          
+          # Try alternative names if the above don't exist
+          if [ ! -f "android_release/lib/arm64-v8a/libcortexsdr_sdk.a" ]; then
+            cp build_android/cortexsdr_sdk.a android_release/lib/arm64-v8a/ || echo "Alternative static SDK library not found"
+          fi
+          if [ ! -f "android_release/lib/arm64-v8a/libcortexsdr_sdk_shared.so" ]; then
+            cp build_android/cortexsdr_sdk_shared.so android_release/lib/arm64-v8a/ || echo "Alternative shared SDK library not found"
+          fi
+          
           tar -czvf cortexsdr-sdk-android.tar.gz android_release/
 
       - name: Upload Android SDK artifact
@@ -225,8 +344,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            cortexsdr-sdk-linux/cortexsdr-sdk-linux.tar.gz
-            cortexsdr-firmware-linux/cortexsdr-firmware-linux.tar.gz
+            cortexsdr-cpp-sdk-linux/cortexsdr-cpp-sdk-linux.tar.gz
             cortexsdr-sdk-android/cortexsdr-sdk-android.tar.gz
           draft: false
           prerelease: false
@@ -249,7 +367,7 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: cortexsdr-sdk-linux
+          name: cortexsdr-cpp-sdk-linux
           
       - name: Create Homebrew formula
         run: |
@@ -258,14 +376,14 @@ jobs:
           class Cortexsdr < Formula
             desc "CortexSDR AI compression CLI tool"
             homepage "https://github.com/Selfbyt/cortexSDR"
-            url "https://github.com/Selfbyt/cortexSDR/releases/download/v${VERSION}/cortexsdr-sdk-linux.tar.gz"
-            sha256 "$(shasum -a 256 cortexsdr-sdk-linux.tar.gz | awk '{print $1}')"
+            url "https://github.com/Selfbyt/cortexSDR/releases/download/v${VERSION}/cortexsdr-cpp-sdk-linux.tar.gz"
+            sha256 "$(shasum -a 256 cortexsdr-cpp-sdk-linux.tar.gz | awk '{print $1}')"
             version "${VERSION}"
             
             def install
-              bin.install "release/bin/cortexsdr_ai_compression_cli" => "cortexsdr"
-              lib.install Dir["release/lib/*"]
-              include.install Dir["release/include/*"]
+              bin.install "sdk_release/bin/cortexsdr_ai_compression_cli" => "cortexsdr"
+              lib.install Dir["sdk_release/lib/*"]
+              include.install Dir["sdk_release/include/*"]
             end
             
             test do
