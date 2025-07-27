@@ -94,6 +94,20 @@ if(BUILD_DESKTOP)
     set(UI_SOURCES
         src/SDRWindow.cpp
     )
+    
+    # Add desktop application sources
+    set(DESKTOP_SOURCES
+        src/desktop_app/main.cpp
+        src/desktop_app/MainWindow.cpp
+        src/desktop_app/ModelManager.cpp
+        src/desktop_app/CompressionWidget.cpp
+        src/desktop_app/InferenceWidget.cpp
+        src/desktop_app/BenchmarkWidget.cpp
+        src/desktop_app/ResultsWidget.cpp
+        src/desktop_app/TextGenerationWidget.cpp
+        src/desktop_app/AudioInferenceWidget.cpp
+        src/desktop_app/PerformanceMonitor.cpp
+    )
 endif()
 
 # Find required packages
@@ -329,8 +343,74 @@ target_link_libraries(test_c_api PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 add_executable(cortexsdr_ai_compression_cli src/ai_compression_cli.cpp)
 target_link_libraries(cortexsdr_ai_compression_cli PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 
-# Add tests unless building for firmware (which might have different constraints)
-if(NOT BUILD_FIRMWARE)
+# Desktop Application
+if(BUILD_DESKTOP)
+    # Find Qt6 components for desktop build
+    find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Concurrent)
+    
+    # Try to find Qt6 Charts
+    find_package(Qt6 COMPONENTS Charts QUIET)
+    if(Qt6Charts_FOUND)
+        message(STATUS "Qt6 Charts found - charts will be enabled")
+        add_definitions(-DENABLE_QT_CHARTS)
+        set(QT_CHARTS_AVAILABLE TRUE)
+    else()
+        message(STATUS "Qt6 Charts not found - charts will be disabled")
+        set(QT_CHARTS_AVAILABLE FALSE)
+        # Temporarily disable Qt Charts to get basic build working
+        set(QT_CHARTS_AVAILABLE FALSE)
+    endif()
+    
+    # Create desktop application
+    add_executable(cortexsdr_desktop ${DESKTOP_SOURCES})
+    
+    # Set Qt properties
+    set_target_properties(cortexsdr_desktop PROPERTIES
+        AUTOMOC ON
+        AUTOUIC ON
+        AUTORCC ON
+    )
+    
+    # Link libraries for desktop application
+    target_link_libraries(cortexsdr_desktop
+        PRIVATE
+            ${PROJECT_NAME}
+            ${PROJECT_NAME}_sdk
+            Qt6::Core
+            Qt6::Widgets
+            Qt6::Network
+            Qt6::Concurrent
+            ${EXTRA_LIBS}
+    )
+    
+    # Add Qt Charts if available
+    if(QT_CHARTS_AVAILABLE)
+        target_link_libraries(cortexsdr_desktop PRIVATE Qt6::Charts)
+    endif()
+    
+    # Add include directories for desktop application
+    target_include_directories(cortexsdr_desktop
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/api
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/core
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/strategies
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/parsers
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/utils
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/streaming
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/onnx_proto
+            ${EXTRA_INCLUDES}
+    )
+    
+    # Install desktop application
+    install(TARGETS cortexsdr_desktop
+        RUNTIME DESTINATION bin
+    )
+endif()
+
+# Add tests unless building for firmware or testing is disabled
+if(NOT BUILD_FIRMWARE AND BUILD_TESTING)
     add_subdirectory(test)
 endif()
 
