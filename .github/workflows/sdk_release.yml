@@ -62,11 +62,7 @@ jobs:
         run: |
           if [ -f "./build_firmware.sh" ]; then
             chmod +x ./build_firmware.sh
-            cd build
-            cmake .. -DBUILD_FIRMWARE=ON -DBUILD_SDK=OFF -DBUILD_DESKTOP=OFF -DBUILD_TESTING=OFF
-            make -j$(nproc) cortexsdr_firmware_SERVER_X86_64 || echo "Firmware build failed!"
-            cd ..
-            ./build_firmware.sh || echo "Firmware build skipped or failed, continuing with SDK only"
+            ./build_firmware.sh -t SERVER_X86_64 || echo "Firmware build failed, continuing with SDK only"
           else
             echo "Firmware build script not found, continuing with SDK only"
           fi
@@ -191,12 +187,12 @@ jobs:
                   -DBUILD_SDK=ON \
                   -DBUILD_SHARED_LIBS=ON \
                   -DBUILD_DESKTOP=OFF \
+                  -DBUILD_TESTING=OFF \
                   -DCMAKE_PREFIX_PATH="/tmp/protobuf_android;/tmp/json_android" \
                   -DProtobuf_INCLUDE_DIR=/tmp/protobuf_android/include \
                   -DProtobuf_LIBRARIES=/tmp/protobuf_android/lib/libprotobuf.a \
                   -DProtobuf_PROTOC_EXECUTABLE=/tmp/protobuf_android/bin/protoc \
                   -Dnlohmann_json_DIR=/tmp/json_android/share/cmake/nlohmann_json \
-                  -DBUILD_TESTING=OFF \
                   -DBUNDLE_DEPENDENCIES=ON
           make -j$(nproc) || echo "Build failed but continuing to package available artifacts"
 
