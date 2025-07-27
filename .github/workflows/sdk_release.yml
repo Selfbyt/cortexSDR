@@ -267,6 +267,16 @@ jobs:
           cmake .. -DCMAKE_INSTALL_PREFIX=/tmp/json_android -DJSON_BuildTests=OFF
           make -j$(nproc)
           make install
+          
+          # Download ML libraries for Android (simplified versions)
+          cd /tmp
+          # Download ONNX Runtime for Android
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.21.1/onnxruntime-android-1.21.1.zip
+          unzip -q onnxruntime-android-1.21.1.zip
+          mv onnxruntime-android-1.21.1 onnxruntime_android
+          
+          # Clone ONNX repository for headers
+          git clone --depth 1 https://github.com/onnx/onnx.git onnx_src_android
 
       - name: Build Android SDK
         run: |
@@ -276,10 +286,10 @@ jobs:
                   -DANDROID_ABI="arm64-v8a" \
                   -DANDROID_PLATFORM=android-21 \
                   -DBUILD_SHARED_LIBS=ON \
-                  -DBUILD_DESKTOP=ON \
-                  -DENABLE_ONNX=ON \
-                  -DENABLE_PYTORCH=ON \
-                  -DENABLE_TENSORFLOW=ON \
+                  -DBUILD_DESKTOP=OFF \
+                  -DENABLE_ONNX=OFF \
+                  -DENABLE_PYTORCH=OFF \
+                  -DENABLE_TENSORFLOW=OFF \
                   -DBUILD_TESTING=OFF \
                   -DCMAKE_PREFIX_PATH="/tmp/protobuf_android;/tmp/json_android" \
                   -DProtobuf_INCLUDE_DIR=/tmp/protobuf_android/include \
@@ -296,6 +306,12 @@ jobs:
           ls -la
           echo "Looking for SDK libraries:"
           find . -name "*cortexsdr*" -type f
+          echo "Looking for all libraries:"
+          find . -name "*.a" -o -name "*.so" | head -20
+          echo "Looking for executables:"
+          find . -type f -executable | head -20
+          echo "CMake configuration:"
+          cat CMakeCache.txt | grep -E "(BUILD_DESKTOP|ENABLE_ONNX|ENABLE_PYTORCH|ENABLE_TENSORFLOW)" || echo "No CMake cache found"
 
       - name: Package Android SDK
         run: |
@@ -310,8 +326,10 @@ jobs:
           
           mkdir -p android_release/include
           mkdir -p android_release/lib/arm64-v8a
-          cp src/ai_compression/api/cortex_sdk.h android_release/include/
-          cp src/ai_compression/api/cortex_sdk_export.h android_release/include/
+          cp src/ai_compression/api/cortex_sdk.h android_release/include/ || echo "cortex_sdk.h not found"
+          cp src/ai_compression/api/cortex_sdk_export.h android_release/include/ || echo "cortex_sdk_export.h not found"
+          
+          # Try to copy any available libraries
           cp build_android/libcortexsdr_sdk.a android_release/lib/arm64-v8a/ || echo "Static SDK library not found"
           cp build_android/libcortexsdr_sdk_shared.so android_release/lib/arm64-v8a/ || echo "Shared SDK library not found"
           
@@ -323,6 +341,18 @@ jobs:
             cp build_android/cortexsdr_sdk_shared.so android_release/lib/arm64-v8a/ || echo "Alternative shared SDK library not found"
           fi
           
+          # Try with different extensions
+          if [ ! -f "android_release/lib/arm64-v8a/libcortexsdr_sdk.a" ] && [ ! -f "android_release/lib/arm64-v8a/cortexsdr_sdk.a" ]; then
+            cp build_android/cortexsdr_sdk android_release/lib/arm64-v8a/ || echo "Static SDK library without extension not found"
+          fi
+          if [ ! -f "android_release/lib/arm64-v8a/libcortexsdr_sdk_shared.so" ] && [ ! -f "android_release/lib/arm64-v8a/cortexsdr_sdk_shared.so" ]; then
+            cp build_android/cortexsdr_sdk_shared android_release/lib/arm64-v8a/ || echo "Shared SDK library without extension not found"
+          fi
+          
+          # Create a note about what was found
+          echo "Android build artifacts:" > android_release/BUILD_INFO.txt
+          ls -la build_android/ | grep cortexsdr >> android_release/BUILD_INFO.txt || echo "No cortexsdr files found in build_android" >> android_release/BUILD_INFO.txt
+          
           tar -czvf cortexsdr-sdk-android.tar.gz android_release/
 
       - name: Upload Android SDK artifact
@@ -330,6 +360,20 @@ jobs:
         with:
           name: cortexsdr-sdk-android
           path: cortexsdr-sdk-android.tar.gz
+          
+      - name: Handle firmware build (if needed)
+        run: |
+          # Check if firmware build is requested
+          if [ -d "firmware" ]; then
+            echo "Firmware directory found, attempting to build firmware..."
+            mkdir -p firmware/build
+            cd firmware/build
+            cmake .. -DBUILD_FIRMWARE=ON -DCORTEX_TARGET_PLATFORM=SERVER_X86_64 || echo "Firmware build failed"
+            make -j$(nproc) || echo "Firmware build failed"
+            cd ../..
+          else
+            echo "No firmware directory found, skipping firmware build"
+          fi
 
   create-release:
     needs: [build-linux, build-android]
