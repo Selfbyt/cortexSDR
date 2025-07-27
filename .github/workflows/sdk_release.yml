@@ -364,9 +364,29 @@ jobs:
     needs: [build-linux, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      packages: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+
+      - name: Check artifacts before release
+        run: |
+          echo "Checking available artifacts..."
+          ls -la
+          if [ -d "cortexsdr-cpp-sdk-linux" ]; then
+            echo "Linux SDK artifacts found:"
+            ls -la cortexsdr-cpp-sdk-linux/
+          else
+            echo "Linux SDK artifacts not found"
+          fi
+          if [ -d "cortexsdr-sdk-android" ]; then
+            echo "Android SDK artifacts found:"
+            ls -la cortexsdr-sdk-android/
+          else
+            echo "Android SDK artifacts not found"
+          fi
 
       - name: Create Release
         id: create_release
@@ -378,13 +398,15 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: false
           
   create-homebrew-formula:
     needs: [create-release]
     runs-on: macos-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
