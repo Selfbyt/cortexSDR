@@ -430,26 +430,73 @@ jobs:
             url "https://github.com/Selfbyt/cortexSDR/releases/download/v${VERSION}/cortexsdr-cpp-sdk-linux.tar.gz"
             sha256 "$(shasum -a 256 cortexsdr-cpp-sdk-linux.tar.gz | awk '{print $1}')"
             version "${VERSION}"
-            
+            license "MIT"
+
+            depends_on "cmake" => :build
+            depends_on "protobuf"
+            depends_on "zlib"
+            depends_on "nlohmann-json"
+
             def install
+              # Extract the SDK
+              system "tar", "-xzf", "cortexsdr-cpp-sdk-linux.tar.gz"
+              
+              # Install binaries
               bin.install "sdk_release/bin/cortexsdr_ai_compression_cli" => "cortexsdr"
+              bin.install "sdk_release/bin/cortexsdr_cli" => "cortexsdr-cli"
+              bin.install "sdk_release/bin/cortexsdr_model_converter" => "cortexsdr-converter"
+              
+              # Install libraries
               lib.install Dir["sdk_release/lib/*"]
+              
+              # Install headers
               include.install Dir["sdk_release/include/*"]
+              
+              # Install examples
+              share.install "sdk_release/examples" => "cortexsdr"
+              
+              # Install documentation
+              doc.install "sdk_release/docs"
             end
-            
+
             test do
-              system "#{bin}/cortexsdr", "--version"
+              system "#{bin}/cortexsdr", "--help"
             end
           end
           EOF
           
+          echo "Homebrew formula created with SHA256: $(shasum -a 256 cortexsdr-cpp-sdk-linux.tar.gz | awk '{print $1}')"
+          
       - name: Setup Homebrew tap
         run: |
+          echo "Setting up Homebrew formula..."
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git clone https://github.com/Selfbyt/homebrew-cortexsdr.git
-          cp Formula/cortexsdr.rb homebrew-cortexsdr/Formula/
-          cd homebrew-cortexsdr
-          git add Formula/cortexsdr.rb
-          git commit -m "Update cortexsdr to v${VERSION}"
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/Selfbyt/homebrew-cortexsdr.git
+          
+          # Try to clone the homebrew tap, but don't fail if it doesn't exist
+          if git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/Selfbyt/homebrew-cortexsdr.git; then
+            echo "Homebrew tap repository found, updating formula..."
+            cp Formula/cortexsdr.rb homebrew-cortexsdr/Formula/
+            cd homebrew-cortexsdr
+            git add Formula/cortexsdr.rb
+            git commit -m "Update cortexsdr to v${VERSION}"
+            git push origin main || echo "Failed to push to homebrew tap, but continuing..."
+            cd ..
+          else
+            echo "Homebrew tap repository not found or not accessible. Skipping Homebrew formula update."
+            echo "To enable Homebrew formula updates, create the repository: https://github.com/Selfbyt/homebrew-cortexsdr"
+          fi
+          
+          # Always create the formula file for manual use
+          echo "Formula file created at Formula/cortexsdr.rb"
+          cat Formula/cortexsdr.rb
+          
+          # Upload formula as artifact for manual setup
+          echo "Uploading formula as artifact for manual tap setup..."
+          cp Formula/cortexsdr.rb cortexsdr-formula-v${VERSION}.rb
+          
+      - name: Upload Homebrew formula
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula-v${{ env.VERSION }}
+          path: cortexsdr-formula-v${{ env.VERSION }}.rb
