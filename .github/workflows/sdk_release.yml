@@ -30,17 +30,11 @@ jobs:
           sudo make
           sudo cp lib/*.a /usr/lib/
           cd -
-          # Install Qt6 for desktop build - try multiple approaches
-          # First try the standard Ubuntu packages
+          # Install Qt6 for desktop build - try standard Ubuntu packages
+          # Ubuntu 24.04 should have Qt6 packages available
           sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-network-dev || \
-          # Try alternative package names
+          # Try alternative package names if the above fail
           sudo apt-get install -y qtbase6-dev qtdeclarative6-dev qt6-base-dev || \
-          # Try installing from Qt's official repository
-          (echo "Installing Qt6 from official repository..." && \
-           sudo apt-get install -y software-properties-common && \
-           sudo add-apt-repository ppa:okirby/qt6-backports -y && \
-           sudo apt-get update && \
-           sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-network-dev) || \
           echo "Qt6 packages not available, will build without desktop support"
           # Install additional dependencies for ML libraries
           sudo apt-get install -y libgomp1 libblas3 liblapack3
@@ -100,21 +94,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # Try multiple approaches to install Qt6
+          # Try to install Qt6 from standard Ubuntu packages
           echo "Attempting to install Qt6..."
           
           # Method 1: Try standard Ubuntu packages
           sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-network-dev && echo "Qt6 installed via standard packages" || \
           # Method 2: Try alternative package names
           sudo apt-get install -y qtbase6-dev qtdeclarative6-dev qt6-base-dev && echo "Qt6 installed via alternative packages" || \
-          # Method 3: Try Qt's official PPA
-          (echo "Trying Qt's official PPA..." && \
-           sudo apt-get install -y software-properties-common && \
-           sudo add-apt-repository ppa:okirby/qt6-backports -y && \
-           sudo apt-get update && \
-           sudo apt-get install -y qt6-base-dev qt6-declarative-dev qt6-network-dev && \
-           echo "Qt6 installed via PPA") || \
-          # Method 4: Try building without Qt
+          # Method 3: Build without Qt
           echo "Qt6 packages not available, will build without desktop support"
 
       - name: Install Qt6 (macOS)
