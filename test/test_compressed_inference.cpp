@@ -224,6 +224,16 @@ found_pair:
     ASSERT_FALSE(current.empty());
 }
 
+TEST(CortexSDR, InvalidModelPath) {
+    CortexCompressorHandle handle = nullptr;
+    CortexCompressionOptions options;
+    cortex_compression_options_init(&options);
+    CortexError err = cortex_compressor_create("nonexistent.onnx", "onnx", &options, &handle);
+    EXPECT_NE(err.code, 0);
+    EXPECT_STREQ(cortex_error_string(err.code), "File not found");
+    cortex_error_free(&err);
+}
+
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

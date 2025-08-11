@@ -882,6 +882,17 @@ CortexError cortex_decompressor_free(CortexDecompressorHandle handle) {
     }
 }
 
+const char* cortex_error_string(int code) {
+    switch (code) {
+        case 0: return "Success";
+        case 1: return "Invalid argument";
+        case 2: return "File not found";
+        case 3: return "Unsupported format";
+        case 100: return "Internal error";
+        default: return "Unknown error";
+    }
+}
+
 void cortex_error_free(CortexError* error) {
     if (error && error->message) {
         delete[] error->message;

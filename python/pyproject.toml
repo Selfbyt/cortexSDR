@@ -1,0 +1,46 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.9",
+  "pybind11>=2.10",
+  "numpy",
+  "cmake>=3.20",
+  "ninja; platform_system != 'Windows'",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "cortexsdr-sdk"
+version = "1.0.0"
+description = "CortexSDR SDK Python bindings (compression, decompression, sparse inference)"
+authors = [{ name = "CortexSDR", email = "support@cortexsdr.ai" }]
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+  "numpy>=1.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/Selfbyt/cortexSDR"
+
+[tool.scikit-build]
+wheel.expand-macos-universal-tags = true
+
+[tool.scikit-build.cmake]
+minimum-version = "3.20"
+
+[tool.cibuildwheel]
+skip = "pp* cp36-* cp37-*"
+archs = ["x86_64", "aarch64"]
+

@@ -39,14 +39,14 @@ typedef struct CortexInferenceEngine* CortexInferenceEngineHandle;
 /**
  * Initialize compression options with defaults
  */
-CortexError cortex_compression_options_init(CortexCompressionOptions* options);
+CORTEXSDR_API CortexError cortex_compression_options_init(CortexCompressionOptions* options);
 
 /* ===== Compression Functions ===== */
 
 /**
  * Create a compressor instance
  */
-CortexError cortex_compressor_create(
+CORTEXSDR_API CortexError cortex_compressor_create(
     const char* model_path,
     const char* format,
     const CortexCompressionOptions* options,
@@ -56,7 +56,7 @@ CortexError cortex_compressor_create(
 /**
  * Compress a model
  */
-CortexError cortex_compressor_compress(
+CORTEXSDR_API CortexError cortex_compressor_compress(
     CortexCompressorHandle handle,
     const char* output_path
 );
@@ -64,7 +64,7 @@ CortexError cortex_compressor_compress(
 /**
  * Get compression statistics
  */
-CortexError cortex_compressor_get_stats(
+CORTEXSDR_API CortexError cortex_compressor_get_stats(
     CortexCompressorHandle handle,
     size_t* original_size,
     size_t* compressed_size,
@@ -75,14 +75,14 @@ CortexError cortex_compressor_get_stats(
 /**
  * Free a compressor instance
  */
-CortexError cortex_compressor_free(CortexCompressorHandle handle);
+CORTEXSDR_API CortexError cortex_compressor_free(CortexCompressorHandle handle);
 
 /* ===== Decompression Functions ===== */
 
 /**
  * Create a decompressor instance
  */
-CortexError cortex_decompressor_create(
+CORTEXSDR_API CortexError cortex_decompressor_create(
     const char* compressed_path,
     CortexDecompressorHandle* handle,
     float sparsity
@@ -91,7 +91,7 @@ CortexError cortex_decompressor_create(
 /**
  * Decompress a model
  */
-CortexError cortex_decompressor_decompress(
+CORTEXSDR_API CortexError cortex_decompressor_decompress(
     CortexDecompressorHandle handle,
     const char* compressed_path,
     const char* output_path
@@ -100,14 +100,14 @@ CortexError cortex_decompressor_decompress(
 /**
  * Free a decompressor instance
  */
-CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
+CORTEXSDR_API CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
 
 /* ===== Inference Engine Functions ===== */
 
 /**
  * Create an inference engine from a compressed model
  */
-CortexError cortex_inference_engine_create(
+CORTEXSDR_API CortexError cortex_inference_engine_create(
     const char* compressed_model_path,
     CortexInferenceEngineHandle* handle
 );
@@ -115,7 +115,7 @@ CortexError cortex_inference_engine_create(
 /**
  * Set batch size for inference
  */
-CortexError cortex_inference_engine_set_batch_size(
+CORTEXSDR_API CortexError cortex_inference_engine_set_batch_size(
     CortexInferenceEngineHandle handle,
     size_t batch_size
 );
@@ -123,7 +123,7 @@ CortexError cortex_inference_engine_set_batch_size(
 /**
  * Enable/disable dropout for inference
  */
-CortexError cortex_inference_engine_enable_dropout(
+CORTEXSDR_API CortexError cortex_inference_engine_enable_dropout(
     CortexInferenceEngineHandle handle,
     int enable
 );
@@ -131,7 +131,7 @@ CortexError cortex_inference_engine_enable_dropout(
 /**
  * Set inference mode (training=1, inference=0)
  */
-CortexError cortex_inference_engine_set_mode(
+CORTEXSDR_API CortexError cortex_inference_engine_set_mode(
     CortexInferenceEngineHandle handle,
     int training_mode
 );
@@ -146,7 +146,7 @@ CortexError cortex_inference_engine_set_mode(
  * @param output_size Size of output buffer
  * @param actual_output_size Actual size of output data written
  */
-CortexError cortex_inference_engine_run(
+CORTEXSDR_API CortexError cortex_inference_engine_run(
     CortexInferenceEngineHandle handle,
     const float* input_data,
     size_t input_size,
@@ -158,7 +158,7 @@ CortexError cortex_inference_engine_run(
 /**
  * Run inference on a specific layer
  */
-CortexError cortex_inference_engine_run_layer(
+CORTEXSDR_API CortexError cortex_inference_engine_run_layer(
     CortexInferenceEngineHandle handle,
     const char* layer_name,
     const float* input_data,
@@ -171,14 +171,14 @@ CortexError cortex_inference_engine_run_layer(
 /**
  * Free an inference engine instance
  */
-CortexError cortex_inference_engine_free(
+CORTEXSDR_API CortexError cortex_inference_engine_free(
     CortexInferenceEngineHandle handle
 );
 
 /**
  * Get version information
  */
-const char* cortex_sdk_version();
+CORTEXSDR_API const char* cortex_sdk_version();
 
 #ifdef __cplusplus
 }

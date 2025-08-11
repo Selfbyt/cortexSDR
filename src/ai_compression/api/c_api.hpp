@@ -15,6 +15,14 @@ typedef struct CortexCompressor* CortexCompressorHandle;
 typedef void* CortexDecompressorHandle;
 
 // Error handling
+typedef enum {
+    CORTEX_OK = 0,
+    CORTEX_ERR_INVALID_ARG = 1,
+    CORTEX_ERR_FILE_NOT_FOUND = 2,
+    CORTEX_ERR_UNSUPPORTED_FORMAT = 3,
+    CORTEX_ERR_INTERNAL = 100
+} CortexErrorCode;
+
 typedef struct {
     const char* message;
     int code;
@@ -81,6 +89,9 @@ CORTEXSDR_API CortexError cortex_decompressor_free(CortexDecompressorHandle hand
 
 // Free error message
 CORTEXSDR_API void cortex_error_free(CortexError* error);
+
+// Get a human-readable error string for a given error code
+CORTEXSDR_API const char* cortex_error_string(int code);
 
 #ifdef __cplusplus
 }

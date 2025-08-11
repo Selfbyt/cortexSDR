@@ -420,3 +420,13 @@ int main() {
     return 0;
 }
 ```
+
+## Releases
+
+See [CHANGELOG.md](./CHANGELOG.md) for release notes.
+
+Download the latest binaries and libraries from the [GitHub Releases page](https://github.com/your-org/cortexSDR/releases).
+
+## Error Handling
+
+The SDK and CLI now provide standardized error codes and human-readable error messages. Use the `cortex_error_string` function to interpret error codes returned by the API.

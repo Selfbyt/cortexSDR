@@ -107,6 +107,7 @@ if(BUILD_DESKTOP)
         src/desktop_app/TextGenerationWidget.cpp
         src/desktop_app/AudioInferenceWidget.cpp
         src/desktop_app/PerformanceMonitor.cpp
+        src/desktop_app/ChatWidget.cpp
     )
 endif()
 
@@ -239,6 +240,7 @@ set(SDK_SOURCES
     src/ai_compression/utils/ModelConverter.cpp
     src/ai_compression/strategies/NumericalRLE.cpp
     src/ai_compression/strategies/GzipStrategy.cpp
+    src/ai_compression/utils/sha256.cpp
     src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
     src/ai_compression/strategies/MetadataSDRStrategy.cpp
     src/ai_compression/strategies/QuantizedTensorStrategy.cpp

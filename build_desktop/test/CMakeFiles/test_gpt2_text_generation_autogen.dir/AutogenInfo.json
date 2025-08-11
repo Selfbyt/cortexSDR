@@ -1,0 +1,115 @@
+{
+	"BUILD_DIR" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_gpt2_text_generation_autogen",
+	"CMAKE_BINARY_DIR" : "/home/mbishu/Desktop/cortexSDR/build_desktop",
+	"CMAKE_CURRENT_BINARY_DIR" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test",
+	"CMAKE_CURRENT_SOURCE_DIR" : "/home/mbishu/Desktop/cortexSDR/test",
+	"CMAKE_EXECUTABLE" : "/usr/bin/cmake",
+	"CMAKE_LIST_FILES" : 
+	[
+		"/home/mbishu/Desktop/cortexSDR/test/CMakeLists.txt",
+		"/usr/share/cmake/Modules/FindGTest.cmake",
+		"/usr/share/cmake/Modules/GoogleTest.cmake",
+		"/usr/share/cmake/Modules/FindPackageHandleStandardArgs.cmake",
+		"/usr/share/cmake/Modules/FindPackageMessage.cmake",
+		"/usr/lib64/cmake/GTest/GTestConfigVersion.cmake",
+		"/usr/lib64/cmake/GTest/GTestConfig.cmake",
+		"/usr/share/cmake/Modules/CMakeFindDependencyMacro.cmake",
+		"/usr/share/cmake/Modules/FindThreads.cmake",
+		"/usr/share/cmake/Modules/CheckLibraryExists.cmake",
+		"/usr/share/cmake/Modules/CheckIncludeFileCXX.cmake",
+		"/usr/share/cmake/Modules/CheckCXXSourceCompiles.cmake",
+		"/usr/share/cmake/Modules/FindPackageHandleStandardArgs.cmake",
+		"/usr/share/cmake/Modules/FindPackageMessage.cmake",
+		"/usr/lib64/cmake/GTest/GTestTargets.cmake",
+		"/usr/lib64/cmake/GTest/GTestTargets-noconfig.cmake",
+		"/home/mbishu/Desktop/cortexSDR/cmake/Findnlohmann_json.cmake",
+		"/usr/share/cmake/Modules/FindPackageHandleStandardArgs.cmake",
+		"/usr/share/cmake/Modules/FindPackageMessage.cmake"
+	],
+	"CMAKE_SOURCE_DIR" : "/home/mbishu/Desktop/cortexSDR",
+	"CROSS_CONFIG" : false,
+	"DEP_FILE" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_gpt2_text_generation_autogen/deps",
+	"DEP_FILE_RULE_NAME" : "test_gpt2_text_generation_autogen/timestamp",
+	"HEADERS" : [],
+	"HEADER_EXTENSIONS" : [ "h", "hh", "h++", "hm", "hpp", "hxx", "in", "txx" ],
+	"INCLUDE_DIR" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_gpt2_text_generation_autogen/include",
+	"MOC_COMPILATION_FILE" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_gpt2_text_generation_autogen/mocs_compilation.cpp",
+	"MOC_DEFINITIONS" : 
+	[
+		"ENABLE_ONNX",
+		"ENABLE_ONNX_PROTOBUF",
+		"ENABLE_PYTORCH",
+		"ENABLE_QT_CHARTS",
+		"ENABLE_TENSORFLOW"
+	],
+	"MOC_DEPEND_FILTERS" : 
+	[
+		[
+			"Q_PLUGIN_METADATA",
+			"[\n][ \t]*Q_PLUGIN_METADATA[ \t]*\\([^\\)]*FILE[ \t]*\"([^\"]+)\""
+		]
+	],
+	"MOC_INCLUDES" : 
+	[
+		"/home/mbishu/Desktop/cortexSDR/libtensorflow/include",
+		"/home/mbishu/Desktop/cortexSDR/src",
+		"/home/mbishu/Desktop/cortexSDR/include",
+		"/usr/include",
+		"/usr/include/c++/14",
+		"/usr/include/c++/14/x86_64-redhat-linux",
+		"/usr/include/c++/14/backward",
+		"/usr/lib/gcc/x86_64-redhat-linux/14/include",
+		"/usr/local/include"
+	],
+	"MOC_MACRO_NAMES" : 
+	[
+		"Q_OBJECT",
+		"Q_GADGET",
+		"Q_NAMESPACE",
+		"Q_NAMESPACE_EXPORT",
+		"Q_GADGET_EXPORT",
+		"Q_ENUM_NS"
+	],
+	"MOC_OPTIONS" : [],
+	"MOC_PATH_PREFIX" : false,
+	"MOC_PREDEFS_CMD" : 
+	[
+		"/usr/bin/c++",
+		"-std=gnu++17",
+		"-dM",
+		"-E",
+		"-c",
+		"/usr/share/cmake/Modules/CMakeCXXCompilerABI.cpp"
+	],
+	"MOC_PREDEFS_FILE" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_gpt2_text_generation_autogen/moc_predefs.h",
+	"MOC_RELAXED_MODE" : false,
+	"MOC_SKIP" : 
+	[
+		"/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_compressed_inference_autogen/mocs_compilation.cpp"
+	],
+	"MULTI_CONFIG" : false,
+	"PARALLEL" : 8,
+	"PARSE_CACHE_FILE" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/CMakeFiles/test_gpt2_text_generation_autogen.dir/ParseCache.txt",
+	"QT_MOC_EXECUTABLE" : "/usr/lib64/qt6/libexec/moc",
+	"QT_UIC_EXECUTABLE" : "/usr/lib64/qt6/libexec/uic",
+	"QT_VERSION_MAJOR" : 6,
+	"QT_VERSION_MINOR" : 8,
+	"SETTINGS_FILE" : "/home/mbishu/Desktop/cortexSDR/build_desktop/test/CMakeFiles/test_gpt2_text_generation_autogen.dir/AutogenUsed.txt",
+	"SOURCES" : 
+	[
+		[
+			"/home/mbishu/Desktop/cortexSDR/test/test_gpt2_text_generation.cpp",
+			"MU",
+			null
+		]
+	],
+	"UIC_OPTIONS" : [],
+	"UIC_SEARCH_PATHS" : [],
+	"UIC_SKIP" : 
+	[
+		"/home/mbishu/Desktop/cortexSDR/build_desktop/test/test_compressed_inference_autogen/mocs_compilation.cpp"
+	],
+	"UIC_UI_FILES" : [],
+	"USE_BETTER_GRAPH" : true,
+	"VERBOSITY" : 0
+}
