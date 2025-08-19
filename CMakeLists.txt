@@ -345,6 +345,10 @@ target_link_libraries(test_c_api PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 add_executable(cortexsdr_ai_compression_cli src/ai_compression_cli.cpp)
 target_link_libraries(cortexsdr_ai_compression_cli PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 
+# Text Generation CLI Tool (Ollama-like)
+add_executable(cortexsdr_text_cli src/cortexsdr_cli.cpp)
+target_link_libraries(cortexsdr_text_cli PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
+
 # Desktop Application
 if(BUILD_DESKTOP)
     # Find Qt6 components for desktop build

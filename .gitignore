@@ -1,5 +1,6 @@
 # Build directories
 build/
+build_desktop/
 build_firmware/
 firmware/build/
 firmware/build_test/
@@ -22,6 +23,22 @@ test/build/
 moc_*
 *.pro.user
 *.user
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!*.cmake.in
+
+# Qt generated files
+*_autogen/
+*.moc
+*.moc.cpp
+qrc_*.cpp
+ui_*.h
 
 # System files
 .DS_Store
