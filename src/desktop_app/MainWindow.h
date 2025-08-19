@@ -21,6 +21,7 @@
 #include "BenchmarkWidget.h"
 #include "ResultsWidget.h"
 #include "ChatWidget.h"
+#include "TextGenerationWidget.h"
 #include "PerformanceMonitor.h"
 
 class MainWindow : public QMainWindow
@@ -60,6 +61,7 @@ private:
     BenchmarkWidget *m_benchmarkWidget;
     ResultsWidget *m_resultsWidget;
     ChatWidget *m_chatWidget;
+    TextGenerationWidget *m_textGenerationWidget;
     
     // Core components
     ModelManager *m_modelManager;

@@ -17,6 +17,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_benchmarkWidget(nullptr)
     , m_resultsWidget(nullptr)
     , m_chatWidget(nullptr)
+    , m_textGenerationWidget(nullptr)
     , m_modelManager(nullptr)
     , m_performanceMonitor(nullptr)
     , m_progressBar(nullptr)
@@ -80,15 +81,17 @@ void MainWindow::setupUI()
     m_benchmarkWidget = new BenchmarkWidget(m_modelManager, this);
     m_resultsWidget = new ResultsWidget(this);
     m_chatWidget = new ChatWidget(m_modelManager, this);
+    m_textGenerationWidget = new TextGenerationWidget(m_modelManager, this);
     
     // Add tabs
+    m_tabWidget->addTab(m_textGenerationWidget, "🤖 Text Generation");
     m_tabWidget->addTab(m_chatWidget, "💬 Chat");
     m_tabWidget->addTab(m_compressionWidget, "🗜️ Compression");
     m_tabWidget->addTab(m_inferenceWidget, "⚡ Inference");
     m_tabWidget->addTab(m_benchmarkWidget, "📊 Benchmark");
     m_tabWidget->addTab(m_resultsWidget, "📋 Results");
     
-    // Set chat as default tab
+    // Set text generation as default tab
     m_tabWidget->setCurrentIndex(0);
 }
 

@@ -10,7 +10,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "cortexsdr-sdk"
-version = "1.0.0"
+version = "1.0.1"
 description = "CortexSDR SDK Python bindings (compression, decompression, sparse inference)"
 authors = [{ name = "CortexSDR", email = "support@cortexsdr.ai" }]
 readme = "README.md"

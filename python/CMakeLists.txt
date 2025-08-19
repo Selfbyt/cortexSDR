@@ -55,7 +55,7 @@ endif()
 message(STATUS "Using CortexSDR include: ${CORTEXSDR_INCLUDE_DIR_RES}")
 
 # Build the Python extension module
-pybind11_add_module(_bindings MODULE
+pybind11_add_library(_bindings MODULE
   cortexsdr_sdk/_bindings.cpp
   ${CORTEXSDR_INCLUDE_DIR_RES}/ai_compression/utils/sha256.cpp
 )
@@ -67,13 +67,19 @@ target_link_libraries(_bindings PRIVATE ${CORTEXSDR_LIB})
 # Use C++17 and instruct scikit-build-core where to place the module in the wheel
 set_target_properties(_bindings PROPERTIES
   CXX_STANDARD 17
-  CXX_STANDARD_REQUIRED YES
+  OUTPUT_NAME "_bindings"
+  PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY "${SKBUILD_PLATLIB_DIR}/cortexsdr_sdk"
+  BUILD_RPATH "$ORIGIN"
+  INSTALL_RPATH "$ORIGIN"
 )
 
 # Install the extension module into the Python package directory inside the wheel
 install(TARGETS _bindings
   LIBRARY DESTINATION cortexsdr_sdk
-  RUNTIME DESTINATION cortexsdr_sdk
   ARCHIVE DESTINATION cortexsdr_sdk
+  RUNTIME DESTINATION cortexsdr_sdk
 )
 
+# Bundle the SDK shared library into the wheel next to the extension so RPATH $ORIGIN resolves it
+install(FILES ${CORTEXSDR_LIB} DESTINATION cortexsdr_sdk)
