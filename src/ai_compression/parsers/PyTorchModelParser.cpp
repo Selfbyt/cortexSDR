@@ -144,19 +144,25 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
                 if (!in) {
                     throw std::runtime_error("Unable to open file for reading: " + modelPath);
                 }
-                in.seekg(0, std::ios::end);
-                std::streamsize size = in.tellg();
-                if (size < 0) {
-                    throw std::runtime_error("Failed to determine file size: " + modelPath);
-                }
-                in.seekg(0, std::ios::beg);
-                std::vector<char> buffer(static_cast<size_t>(size));
-                if (!in.read(buffer.data(), size)) {
-                    throw std::runtime_error("Failed to read file: " + modelPath);
+                // Detect zip-archive style checkpoints (new PyTorch serialization)
+                {
+                    std::ifstream sig(modelPath, std::ios::binary);
+                    unsigned char magic[4] = {0};
+                    sig.read(reinterpret_cast<char*>(magic), 4);
+                    // ZIP local file header signature: 'P' 'K' 0x03 0x04
+                    if (sig.gcount() == 4 && magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04) {
+                        throw ParsingError(
+                            "This .pth uses the new zip archive format. Please resave with _use_new_zipfile_serialization=False or provide ONNX/TorchScript.");
+                    }
                 }
 
-                // Load pickled IValue from buffer
-                torch::IValue iv = torch::pickle_load(buffer);
+                // Stream-unpickle directly from file to avoid large in-memory buffers
+                auto reader = [&in](char* buf, size_t n) -> size_t {
+                    if (!in.good()) return 0;
+                    in.read(buf, static_cast<std::streamsize>(n));
+                    return static_cast<size_t>(in.gcount());
+                };
+                torch::IValue iv = torch::jit::unpickle(reader, /*type_resolver*/nullptr, /*tensor_table*/{});
 
                 // Helper to recursively collect tensors with hierarchical names
                 auto collect = [&](const torch::IValue& value,
