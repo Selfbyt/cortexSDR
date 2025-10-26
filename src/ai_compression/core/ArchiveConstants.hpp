@@ -1,3 +1,7 @@
+/**
+ * @file ArchiveConstants.hpp
+ * @brief Constants defining the archive format magic and version.
+ */
 #ifndef ARCHIVE_CONSTANTS_HPP
 #define ARCHIVE_CONSTANTS_HPP
 
@@ -5,8 +9,9 @@
 
 namespace CortexAICompression {
 
-// Define simple magic number and version for the archive format
+/** Magic number for identifying Cortex AI archives. */
 extern const char ARCHIVE_MAGIC[8];
+/** Version of the archive format for compatibility checks. */
 extern const uint32_t ARCHIVE_VERSION;
 
 } // namespace CortexAICompression

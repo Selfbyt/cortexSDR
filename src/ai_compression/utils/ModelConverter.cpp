@@ -1,3 +1,20 @@
+/**
+ * @file ModelConverter.cpp
+ * @brief Implementation of neural network model format conversion utilities
+ * 
+ * This file implements the ModelConverter class which provides comprehensive
+ * model format conversion capabilities for neural networks. Supports conversion
+ * between popular formats including PyTorch, TensorFlow, and ONNX.
+ * 
+ * Key Features:
+ * - Multi-format model conversion (PyTorch, TensorFlow, ONNX)
+ * - Automatic format detection and validation
+ * - External tool integration for complex conversions
+ * - Metadata preservation during conversion
+ * - Error handling and validation
+ * - Batch conversion support
+ */
+
 #include "ModelConverter.hpp"
 #include <iostream>
 #include <fstream>
@@ -10,18 +27,30 @@
 
 namespace CortexAICompression {
 
+/**
+ * @brief Convert neural network model to ONNX format
+ * @param modelPath Path to the input model file
+ * @param format Source model format (pytorch, tensorflow, etc.)
+ * @param outputPath Optional output path (generated if empty)
+ * @return Path to the converted ONNX model file
+ * @throws ModelConversionError if conversion fails
+ * 
+ * Converts various neural network model formats to ONNX format using
+ * appropriate conversion tools and libraries. Handles format detection,
+ * validation, and external tool integration.
+ */
 std::string ModelConverter::convertToONNX(const std::string& modelPath, const std::string& format, const std::string& outputPath) {
-    // Check if the input file exists
+    // Validate input file existence
     if (!std::filesystem::exists(modelPath)) {
         throw ModelConversionError("Input model file does not exist: " + modelPath);
     }
     
-    // If already in ONNX format, just return the path
+    // Skip conversion if already in target format
     if (format == "onnx") {
         return modelPath;
     }
     
-    // Generate output path if not provided
+    // Determine output path for converted model
     std::string actualOutputPath = outputPath.empty() ? generateOutputPath(modelPath) : outputPath;
     
     // Provide information about model conversion

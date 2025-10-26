@@ -1,6 +1,6 @@
 /**
  * @file PyTorchModelParser.cpp
- * @brief Implementation of PyTorch model parsing into archive segments.
+ * @brief Implementation of PyTorch model parsing with ZIP/Pickle support for LLaMA models
  */
 #include "PyTorchModelParser.hpp"
 #include <stdexcept>
@@ -9,6 +9,14 @@
 #include <cstring>
 #include <iostream>
 #include <fstream>
+#include <sstream>
+
+// Add libzip for handling ZIP archives
+#include <zip.h>
+
+// c10 optional utilities for unpickle API
+#include <c10/util/Optional.h>
+// (no additional includes required for pointer+size unpickle overload)
 
 #ifdef ENABLE_PYTORCH
 #include <torch/torch.h>
@@ -109,11 +117,155 @@ std::vector<std::byte> PyTorchModelParser::tensorToBytes(const torch::Tensor& te
     return data;
 }
 
+// Helper function to check if file is a ZIP archive
+bool PyTorchModelParser::isZipFile(const std::string& modelPath) const {
+    std::ifstream file(modelPath, std::ios::binary);
+    if (!file) return false;
+    
+    unsigned char magic[4] = {0};
+    file.read(reinterpret_cast<char*>(magic), 4);
+    
+    // ZIP local file header signature: 'P' 'K' 0x03 0x04
+    return (magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04);
+}
+
+// Extract tensors from LLaMA-style ZIP archive containing pickle + data files
+std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractFromZipArchive(const std::string& modelPath) const {
+    std::vector<PyTorchTensorInfo> tensors;
+    
+    std::cout << "Detected ZIP archive format (LLaMA-style consolidated.pth)" << std::endl;
+    
+    int err = 0;
+    zip_t* archive = zip_open(modelPath.c_str(), ZIP_RDONLY, &err);
+    if (!archive) {
+        zip_error_t error;
+        zip_error_init_with_code(&error, err);
+        std::string error_msg = zip_error_strerror(&error);
+        zip_error_fini(&error);
+        throw std::runtime_error("Failed to open ZIP archive: " + error_msg);
+    }
+    
+    try {
+        // Find the .pkl file in the archive
+        std::string pklFile;
+        zip_int64_t num_entries = zip_get_num_entries(archive, 0);
+        
+        for (zip_int64_t i = 0; i < num_entries; ++i) {
+            const char* name = zip_get_name(archive, i, 0);
+            if (name) {
+                std::string filename(name);
+                if (filename.find(".pkl") != std::string::npos) {
+                    pklFile = filename;
+                    std::cout << "Found pickle file: " << pklFile << std::endl;
+                    break;
+                }
+            }
+        }
+        
+        if (pklFile.empty()) {
+            throw std::runtime_error("No .pkl file found in ZIP archive");
+        }
+        
+        // Read pickle file into memory (pkl is small) and unpickle via pointer+size
+        zip_stat_t stat;
+        zip_stat_init(&stat);
+        if (zip_stat(archive, pklFile.c_str(), 0, &stat) != 0) {
+            throw std::runtime_error("Failed to stat pickle file");
+        }
+        zip_file_t* pkl_file = zip_fopen(archive, pklFile.c_str(), 0);
+        if (!pkl_file) {
+            throw std::runtime_error("Failed to open pickle file in archive");
+        }
+        std::vector<char> pkl_data(static_cast<size_t>(stat.size));
+        zip_int64_t bytes_read = zip_fread(pkl_file, pkl_data.data(), static_cast<zip_uint64_t>(pkl_data.size()));
+        zip_fclose(pkl_file);
+        if (bytes_read != static_cast<zip_int64_t>(pkl_data.size())) {
+            throw std::runtime_error("Failed to read complete pickle file");
+        }
+        std::cout << "Unpickling model structure..." << std::endl;
+        // Use vector-based pickle loader (compatible across libtorch versions)
+        torch::IValue iv = torch::pickle_load(pkl_data);
+        
+        // Collect tensors from the unpickled structure
+        std::function<void(const torch::IValue&, const std::string&)> collect_tensors;
+        collect_tensors = [&](const torch::IValue& value, const std::string& prefix) {
+            if (value.isTensor()) {
+                const torch::Tensor tensor = value.toTensor();
+                PyTorchTensorInfo info;
+                info.name = prefix.empty() ? "tensor" : prefix;
+                
+                // For LLaMA models, tensors are stored as references to data files
+                // We need to read them from the ZIP archive
+                const auto contig = tensor.contiguous();
+                info.shape = contig.sizes().vec();
+                info.scalar_type = contig.scalar_type();
+                info.data = tensorToBytes(contig);
+                info.size_bytes = info.data.size();
+                
+                tensors.push_back(std::move(info));
+                return;
+            }
+            
+            if (value.isGenericDict()) {
+                auto dict = value.toGenericDict();
+                for (const auto& item : dict) {
+                    std::string key_str;
+                    if (item.key().isString()) {
+                        key_str = item.key().toStringRef();
+                    } else if (item.key().isInt()) {
+                        key_str = std::to_string(item.key().toInt());
+                    } else {
+                        continue;
+                    }
+                    const std::string next = prefix.empty() ? key_str : (prefix + "." + key_str);
+                    collect_tensors(item.value(), next);
+                }
+                return;
+            }
+            
+            if (value.isList()) {
+                auto list = value.toList();
+                for (size_t i = 0; i < list.size(); ++i) {
+                    const std::string next = prefix.empty() ? std::to_string(i) : (prefix + "." + std::to_string(i));
+                    collect_tensors(list.get(i), next);
+                }
+                return;
+            }
+            
+            if (value.isTuple()) {
+                auto elements = value.toTuple()->elements();
+                for (size_t i = 0; i < elements.size(); ++i) {
+                    const std::string next = prefix.empty() ? std::to_string(i) : (prefix + "." + std::to_string(i));
+                    collect_tensors(elements[i], next);
+                }
+                return;
+            }
+        };
+        
+        collect_tensors(iv, "");
+        
+        zip_close(archive);
+        
+        std::cout << "Successfully loaded ZIP archive with " << tensors.size() << " tensors" << std::endl;
+        
+    } catch (const std::exception& e) {
+        zip_close(archive);
+        throw;
+    }
+    
+    return tensors;
+}
+
 std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTensorInfo(const std::string& modelPath) const {
     std::vector<PyTorchTensorInfo> tensors;
     
     try {
         std::cout << "Loading PyTorch model from: " << modelPath << std::endl;
+        
+        // Check if this is a ZIP archive (LLaMA consolidated.pth format)
+        if (isZipFile(modelPath)) {
+            return extractFromZipArchive(modelPath);
+        }
         
         // Try to load as a TorchScript model first
         try {
@@ -138,40 +290,77 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
         } catch (const std::exception& e) {
             std::cout << "Failed to load as TorchScript model, trying as state dict: " << e.what() << std::endl;
             
-            // Fallback: try to load as a pickled state dict (.pth/.pt saved via torch.save)
+            // Fallback: try to load as a pickled state dict
             try {
                 std::ifstream in(modelPath, std::ios::binary);
                 if (!in) {
                     throw std::runtime_error("Unable to open file for reading: " + modelPath);
                 }
-                // Detect zip-archive style checkpoints (new PyTorch serialization)
-                {
-                    std::ifstream sig(modelPath, std::ios::binary);
-                    unsigned char magic[4] = {0};
-                    sig.read(reinterpret_cast<char*>(magic), 4);
-                    // ZIP local file header signature: 'P' 'K' 0x03 0x04
-                    if (sig.gcount() == 4 && magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04) {
-                        throw ParsingError(
-                            "This .pth uses the new zip archive format. Please resave with _use_new_zipfile_serialization=False or provide ONNX/TorchScript.");
+                
+                // Try native C++ torch::load on a tensor dictionary
+                try {
+                    torch::serialize::InputArchive archive;
+                    archive.load_from(in);
+
+                    std::function<void(const std::string&, torch::serialize::InputArchive&)> walk;
+                    walk = [&](const std::string& prefix, torch::serialize::InputArchive& ar) {
+                        for (const auto& key : ar.keys()) {
+                            torch::Tensor t;
+                            if (ar.try_read(key, t)) {
+                                PyTorchTensorInfo info;
+                                info.name = prefix.empty() ? key : (prefix + "." + key);
+                                auto contig = t.contiguous();
+                                info.shape = contig.sizes().vec();
+                                info.scalar_type = contig.scalar_type();
+                                info.data = tensorToBytes(contig);
+                                info.size_bytes = info.data.size();
+                                tensors.push_back(std::move(info));
+                                continue;
+                            }
+
+                            torch::serialize::InputArchive child;
+                            if (ar.try_read(key, child)) {
+                                const std::string next = prefix.empty() ? key : (prefix + "." + key);
+                                walk(next, child);
+                            }
+                        }
+                    };
+
+                    walk(std::string(), archive);
+                    if (!tensors.empty()) {
+                        std::cout << "Successfully loaded zip-archive state dict with " << tensors.size() << " tensors" << std::endl;
+                        return tensors;
                     }
+                } catch (const std::exception& zipe) {
+                    std::cerr << "Zip-archive state dict load via InputArchive failed: " << zipe.what() << std::endl;
+                    in.clear();
+                    in.seekg(0);
                 }
 
-                // Stream-unpickle directly from file to avoid large in-memory buffers
-                auto reader = [&in](char* buf, size_t n) -> size_t {
-                    if (!in.good()) return 0;
-                    in.read(buf, static_cast<std::streamsize>(n));
-                    return static_cast<size_t>(in.gcount());
-                };
-                torch::IValue iv = torch::jit::unpickle(reader, /*type_resolver*/nullptr, /*tensor_table*/{});
+                // Stream-unpickle directly from file without buffering whole contents
+                // As a last resort, read file into memory and unpickle via pointer+size
+                in.seekg(0, std::ios::end);
+                const std::streamoff fsize = in.tellg();
+                if (fsize <= 0) {
+                    throw std::runtime_error("Empty or unreadable state dict file");
+                }
+                in.seekg(0, std::ios::beg);
+                std::vector<char> buf(static_cast<size_t>(fsize));
+                in.read(buf.data(), fsize);
+                if (in.gcount() != fsize) {
+                    throw std::runtime_error("Failed to read full state dict");
+                }
+                // Use vector-based pickle loader
+                torch::IValue iv = torch::pickle_load(buf);
 
-                // Helper to recursively collect tensors with hierarchical names
+                // Recursively collect tensors
                 auto collect = [&](const torch::IValue& value,
                                    const std::string& prefix,
                                    auto&& collect_ref) -> void {
                     if (value.isTensor()) {
                         const torch::Tensor tensor = value.toTensor();
                         PyTorchTensorInfo info;
-                        info.name = prefix.empty() ? std::string("tensor") : prefix;
+                        info.name = prefix.empty() ? "tensor" : prefix;
                         const auto contig = tensor.contiguous();
                         info.shape = contig.sizes().vec();
                         info.scalar_type = contig.scalar_type();
@@ -190,7 +379,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
                             } else if (item.key().isInt()) {
                                 key_str = std::to_string(item.key().toInt());
                             } else {
-                                // Unsupported key type; skip
                                 continue;
                             }
                             const std::string next = prefix.empty() ? key_str : (prefix + "." + key_str);
@@ -198,8 +386,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
                         }
                         return;
                     }
-
-                    // No value.isDict() in this LibTorch version; GenericDict covers dicts
 
                     if (value.isList()) {
                         auto list = value.toList();
@@ -218,8 +404,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
                         }
                         return;
                     }
-
-                    // Ignore other IValue types (e.g., objects, scalars) as they are not parameters
                 };
 
                 collect(iv, std::string(), collect);

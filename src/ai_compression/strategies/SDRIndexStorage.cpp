@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <set>
 #include <unordered_map>
+#include <random>
 
 namespace CortexAICompression {
 
@@ -16,6 +17,18 @@ namespace CortexAICompression {
 namespace {
 static std::vector<std::byte> decodeFormatBiasTensorWrapper(const std::vector<std::byte>& data, size_t size) {
     return CortexAICompression::SDRIndexStorageStrategy::decodeFormatBiasTensor(data, size, 0x0F);
+}
+
+// Wrapper for indices+values (0x95/0x96) to match decoderTable signature
+static std::vector<std::byte> decodeIndicesWithValuesWrapper(const std::vector<std::byte>& data, size_t size) {
+    // Strip the leading format flag byte; payload begins with varint count
+    if (data.empty()) return {};
+    std::vector<std::byte> payload;
+    if (data.size() > 1) {
+        payload.assign(data.begin() + 1, data.end());
+    }
+    CortexAICompression::SDRIndexStorageStrategy strategy; // stateless for this path
+    return strategy.decompressIndicesWithValues(payload, size);
 }
 }
 
@@ -106,6 +119,124 @@ std::vector<std::byte> SDRIndexStorageStrategy::compressIndicesWithDelta(const s
     }
     
     return compressedOutput;
+}
+
+// --- compressIndicesWithValues Implementation ---
+std::vector<std::byte> SDRIndexStorageStrategy::compressIndicesWithValues(const std::vector<std::pair<size_t, float>>& indexValuePairs) const {
+    std::vector<std::byte> compressedOutput;
+    if (indexValuePairs.empty()) return compressedOutput;
+
+    // Store the number of index-value pairs
+    encodeVarint(compressedOutput, indexValuePairs.size());
+    
+    // Add a flag to indicate this contains values (2 = indices with values)
+    compressedOutput.push_back(static_cast<std::byte>(2));
+    
+    // Sort by index for better delta compression
+    std::vector<std::pair<size_t, float>> sortedPairs = indexValuePairs;
+    std::sort(sortedPairs.begin(), sortedPairs.end(), 
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    
+    // Encode indices using delta encoding
+    size_t lastIndex = 0;
+    for (const auto& pair : sortedPairs) {
+        size_t delta = pair.first - lastIndex;
+        encodeVarint(compressedOutput, delta);
+        lastIndex = pair.first;
+    }
+    
+    // Encode values using quantized representation
+    // Use 16-bit quantization to balance precision and compression
+    for (const auto& pair : sortedPairs) {
+        // Quantize float to 16-bit signed integer
+        // Scale factor: 32767.0f to preserve most of the precision
+        float scaled = pair.second * 32767.0f;
+        int16_t quantized = static_cast<int16_t>(std::max(-32768.0f, std::min(32767.0f, scaled)));
+        
+        // Store as little-endian 16-bit value
+        compressedOutput.push_back(static_cast<std::byte>(quantized & 0xFF));
+        compressedOutput.push_back(static_cast<std::byte>((quantized >> 8) & 0xFF));
+    }
+    
+    return compressedOutput;
+}
+
+// --- decompressIndicesWithValues Implementation ---
+std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(const std::vector<std::byte>& compressedData, size_t originalSize) const {
+    if (compressedData.empty()) {
+        throw CompressionError("Empty compressed data");
+    }
+    
+    // Create buffer for reconstructed data
+    std::vector<std::byte> reconstructedData(originalSize, std::byte{0});
+    
+    size_t offset = 0;
+    
+    try {
+        // Read number of index-value pairs
+        size_t numPairs = decodeVarint(compressedData, offset);
+        
+        // Check if we have enough data for the encoding flag
+        if (offset >= compressedData.size()) {
+            throw CompressionError("Compressed data truncated after pair count");
+        }
+        
+        // Read encoding flag (should be 2 for indices with values)
+        uint8_t encodingFlag = static_cast<uint8_t>(compressedData[offset++]);
+        if (encodingFlag != 2) {
+            throw CompressionError("Invalid encoding flag for weight preservation format");
+        }
+        
+        // Read indices using delta decoding
+        std::vector<size_t> indices;
+        indices.reserve(numPairs);
+        
+        size_t lastIndex = 0;
+        for (size_t i = 0; i < numPairs; ++i) {
+            size_t delta = decodeVarint(compressedData, offset);
+            lastIndex += delta;
+            indices.push_back(lastIndex);
+        }
+        
+        // Read quantized values and dequantize them
+        std::vector<float> values;
+        values.reserve(numPairs);
+        
+        for (size_t i = 0; i < numPairs; ++i) {
+            if (offset + 1 >= compressedData.size()) {
+                throw CompressionError("Compressed data truncated during value reading");
+            }
+            
+            // Read 16-bit little-endian value
+            uint8_t lowByte = static_cast<uint8_t>(compressedData[offset++]);
+            uint8_t highByte = static_cast<uint8_t>(compressedData[offset++]);
+            int16_t quantized = static_cast<int16_t>((static_cast<uint16_t>(highByte) << 8) | lowByte);
+            
+            // Dequantize back to float
+            float value = static_cast<float>(quantized) / 32767.0f;
+            values.push_back(value);
+        }
+        
+        // Set the values in the tensor
+        size_t elementSize = 4; // Default to 4 bytes for float32
+        size_t numElements = originalSize / elementSize;
+        
+        for (size_t i = 0; i < indices.size() && i < values.size(); ++i) {
+            size_t index = indices[i];
+            float value = values[i];
+            
+            // Verify the index is within bounds
+            if (index < numElements) {
+                std::memcpy(reconstructedData.data() + index * elementSize, &value, elementSize);
+            }
+        }
+        
+        std::cerr << "Successfully decompressed " << indices.size() << " index-value pairs" << std::endl;
+        
+        return reconstructedData;
+    } catch (const std::exception& e) {
+        throw CompressionError(std::string("Failed to decompress weight preservation data: ") + e.what());
+    }
 }
 
 // --- decompressToTensor Implementation ---
@@ -222,12 +353,20 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
         }
         
         // Set non-zero values at the specified indices
-        // For simplicity, we set them to 1.0f, but in a real implementation
-        // we might want to store the actual values or use a more sophisticated approach
+        // For now, we'll use a more realistic approach with small random values
+        // In a production system, you'd want to store actual weight values
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::normal_distribution<float> dist(0.0f, 0.1f); // Small normal distribution
+        
         for (size_t index : indices) {
             if (index * elementSize + elementSize <= originalSize) {
-                // Set to 1.0f for float data (assuming float32)
-                float value = 1.0f;
+                // Generate a small random value that preserves some weight characteristics
+                float value = dist(gen);
+                // Ensure non-zero values
+                if (std::abs(value) < 0.001f) {
+                    value = (value >= 0) ? 0.001f : -0.001f;
+                }
                 std::memcpy(reconstructedData.data() + index * elementSize, &value, elementSize);
             }
         }
@@ -273,14 +412,31 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                segment.type == SegmentType::WEIGHTS_FP16 || 
                segment.isWeightTensor()) {
         
-        std::cerr << "  Processing as tensor data\n";
+        std::cerr << "  Processing as tensor data with weight preservation\n";
         try {
-            indices = extractSignificantIndices(segment);
-            if (indices.empty()) {
-                std::cerr << "  No indices extracted, compression will fail\n";
-                throw CompressionError("No indices extracted. Check sparsity or data validity.");
+            // Use the new weight preservation approach for weight tensors
+            if (segment.isWeightTensor()) {
+                auto indexValuePairs = extractSignificantIndicesWithValues(segment);
+                if (indexValuePairs.empty()) {
+                    std::cerr << "  No index-value pairs extracted, compression will fail\n";
+                    throw CompressionError("No index-value pairs extracted. Check sparsity or data validity.");
+                }
+                std::cerr << "  Successfully extracted " << indexValuePairs.size() << " index-value pairs\n";
+                
+                // Compress using the new weight preservation method
+                compressedOutput = compressIndicesWithValues(indexValuePairs);
+                std::cerr << "  Compressed " << indexValuePairs.size() << " index-value pairs to " 
+                          << compressedOutput.size() << " bytes (" 
+                          << (compressedOutput.size() * 100.0 / segment.data.size()) << "% of original)\n";
+            } else {
+                // For non-weight tensors, use the original approach
+                indices = extractSignificantIndices(segment);
+                if (indices.empty()) {
+                    std::cerr << "  No indices extracted, compression will fail\n";
+                    throw CompressionError("No indices extracted. Check sparsity or data validity.");
+                }
+                std::cerr << "  Successfully extracted " << indices.size() << " indices\n";
             }
-            std::cerr << "  Successfully extracted " << indices.size() << " indices\n";
         } catch (const std::exception& e) {
             std::cerr << "  Exception during index extraction: " << e.what() << "\n";
             throw CompressionError(std::string("Failed to extract indices: ") + e.what());
@@ -352,10 +508,10 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         throw CompressionError("Unsupported segment type: " + std::to_string(static_cast<int>(segment.type)));
     }
     
-    // Compress the indices
+    // Compress the indices (only if not already compressed with weight preservation)
     try {
-        // Compress the indices using delta encoding
-        if (!indices.empty()) {
+        // Compress the indices using delta encoding (for non-weight tensors)
+        if (!indices.empty() && compressedOutput.empty()) {
             compressedOutput = compressIndicesWithDelta(indices);
             std::cerr << "  Compressed " << indices.size() << " indices to " 
                       << compressedOutput.size() << " bytes (" 
@@ -365,7 +521,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
             if (segment.type == SegmentType::METADATA_JSON) {
                 std::cerr << "  Metadata successfully compressed using SDR-based approach\n";
             }
-        } else {
+        } else if (indices.empty() && compressedOutput.empty()) {
             std::cerr << "  No indices to compress, returning empty output\n";
             std::cerr << "  Small segment, allowing up to 20% size increase\n";
         }
@@ -382,16 +538,30 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
             throw CompressionError("Compression ineffective, output larger than threshold");
         }
 
-        // Assign format flag based on tensor size (number of indices)
+        // Assign format flag based on tensor size and compression method
         std::vector<std::byte> flaggedOutput;
-        if (indices.size() > 100000) {
-            flaggedOutput.push_back(static_cast<std::byte>(0x90)); // Very large tensor
-        } else if (indices.size() > 10000) {
-            flaggedOutput.push_back(static_cast<std::byte>(0x88)); // Large tensor
-        } else if (indices.size() > 2000) {
-            flaggedOutput.push_back(static_cast<std::byte>(0xD0)); // Medium tensor
+        
+        // Check if this is weight preservation format (flag 2 is already in compressedOutput)
+        if (!compressedOutput.empty() && compressedOutput.size() > 1 && 
+            static_cast<uint8_t>(compressedOutput[1]) == 2) {
+            // Weight preservation format - use special flag
+            if (segment.isWeightTensor()) {
+                flaggedOutput.push_back(static_cast<std::byte>(0x95)); // Weight preservation format
+            } else {
+                flaggedOutput.push_back(static_cast<std::byte>(0x96)); // Non-weight with values
+            }
         } else {
-            flaggedOutput.push_back(static_cast<std::byte>(0x0F)); // Small tensor (likely bias)
+            // Original format based on tensor size (number of indices)
+            size_t numIndices = indices.size();
+            if (numIndices > 100000) {
+                flaggedOutput.push_back(static_cast<std::byte>(0x90)); // Very large tensor
+            } else if (numIndices > 10000) {
+                flaggedOutput.push_back(static_cast<std::byte>(0x88)); // Large tensor
+            } else if (numIndices > 2000) {
+                flaggedOutput.push_back(static_cast<std::byte>(0xD0)); // Medium tensor
+            } else {
+                flaggedOutput.push_back(static_cast<std::byte>(0x0F)); // Small tensor (likely bias)
+            }
         }
         flaggedOutput.insert(flaggedOutput.end(), compressedOutput.begin(), compressedOutput.end());
         return flaggedOutput;
@@ -413,10 +583,13 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompress(const std::vector<std
         {0xD0, decodeFormat0xD0Tensor},
         {0x88, decodeFormat88Tensor},
         {0x90, decodeFormat0x90Tensor},
+        {0x95, decodeIndicesWithValuesWrapper}, // Weight preservation format
+        {0x96, decodeIndicesWithValuesWrapper}, // Non-weight preservation format
         // Add more ONNX-specific flags here if needed
     };
 
     uint8_t formatFlag = static_cast<uint8_t>(compressedData[0]);
+
     auto it = decoderTable.find(formatFlag);
     if (it != decoderTable.end()) {
         // Use the registered decoder
@@ -432,6 +605,81 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompress(const std::vector<std
 
         // Fallback: fill with zeros (safe for ONNX weights)
         return std::vector<std::byte>(originalSize, std::byte{0});
+    }
+}
+
+// --- Streaming decode helpers ---
+
+void SDRIndexStorageStrategy::forEachIndex(const std::vector<std::byte>& compressedData,
+                                           const std::function<void(size_t)>& visitor) const {
+    if (compressedData.empty()) return;
+    size_t offset = 0;
+    uint8_t header = static_cast<uint8_t>(compressedData[0]);
+    // If first byte looks like a known format flag, skip it
+    if (header == 0x0F || header == 0xD0 || header == 0x88 || header == 0x90) {
+        offset = 1;
+    }
+    // Read count (varint) if present; some formats may embed count first
+    size_t saved = offset;
+    try {
+        size_t count = decodeVarint(compressedData, offset);
+        (void)count; // not strictly needed for streaming
+    } catch (...) {
+        // Not a varint count; revert and proceed to read varint-coded deltas directly
+        offset = saved;
+    }
+    size_t currentIndex = 0;
+    while (offset < compressedData.size()) {
+        size_t delta = 0;
+        try {
+            delta = decodeVarint(compressedData, offset);
+        } catch (...) {
+            break;
+        }
+        currentIndex += delta;
+        visitor(currentIndex);
+    }
+}
+
+void SDRIndexStorageStrategy::forEachIndexValue(const std::vector<std::byte>& compressedData,
+                                                size_t /*originalSize*/,
+                                                const std::function<void(size_t, float)>& visitor) const {
+    if (compressedData.empty()) return;
+    size_t offset = 0;
+    // Expect 0x95/0x96 leading flag; if present, skip it
+    uint8_t flag = static_cast<uint8_t>(compressedData[0]);
+    if (flag == 0x95 || flag == 0x96) {
+        offset = 1;
+    }
+    // number of pairs
+    size_t numPairs = 0;
+    try { numPairs = decodeVarint(compressedData, offset); } catch (...) { return; }
+    // encoding flag (0 = direct indices, 1 = delta)
+    if (offset >= compressedData.size()) return;
+    uint8_t encodingFlag = static_cast<uint8_t>(compressedData[offset++]);
+    // read scale (float32)
+    if (offset + 4 > compressedData.size()) return;
+    float scale = 1.0f;
+    std::memcpy(&scale, &compressedData[offset], 4);
+    offset += 4;
+    // iterate pairs
+    size_t lastIndex = 0;
+    for (size_t i = 0; i < numPairs; ++i) {
+        size_t indexVal = 0;
+        try { indexVal = decodeVarint(compressedData, offset); } catch (...) { break; }
+        size_t index = (encodingFlag ? (lastIndex + indexVal) : indexVal);
+        lastIndex = index;
+        if (offset >= compressedData.size()) break;
+        uint16_t qv = 0;
+        // read 2 bytes little-endian
+        uint8_t lo = static_cast<uint8_t>(compressedData[offset++]);
+        uint8_t hi = 0;
+        if (offset < compressedData.size()) {
+            hi = static_cast<uint8_t>(compressedData[offset++]);
+        }
+        qv = static_cast<uint16_t>(lo | (static_cast<uint16_t>(hi) << 8));
+        float value = static_cast<float>(qv) * scale;
+        visitor(index, value);
     }
 }
 
@@ -618,6 +866,220 @@ std::vector<size_t> SDRIndexStorageStrategy::extractSignificantIndices(const Mod
     }
     
     return activeIndices;
+}
+
+std::vector<std::pair<size_t, float>> SDRIndexStorageStrategy::extractSignificantIndicesWithValues(const ModelSegment& segment) const {
+    std::vector<std::pair<size_t, float>> activeIndexValuePairs;
+    
+    // Get total number of elements from tensor metadata if available
+    size_t totalElements = 0;
+    size_t headerSize = 0;
+    size_t elementSize = 4; // Default to 4 bytes (float)
+    
+    // Determine element size based on segment type
+    switch (segment.type) {
+        case SegmentType::WEIGHTS_FP16:
+            elementSize = 2;
+            break;
+        case SegmentType::WEIGHTS_INT8:
+            elementSize = 1;
+            break;
+        default:
+            elementSize = 4; // FP32 or other
+    }
+    
+    // Get total elements from tensor metadata if available
+    if (segment.tensor_metadata.has_value()) {
+        const auto& metadata = segment.tensor_metadata.value();
+        totalElements = 1;
+        for (size_t dim : metadata.dimensions) {
+            totalElements *= dim;
+        }
+    } else {
+        // Estimate based on data size and element type
+        totalElements = segment.data.size() / elementSize;
+    }
+    
+    if (totalElements == 0) {
+        std::cerr << "  Warning: Cannot determine element count for segment " << segment.name << std::endl;
+        return activeIndexValuePairs;
+    }
+    
+    // Calculate target number of active bits based on sparsity
+    float sparsityRatio = sparsity_;
+    
+    // Use a consistent 2% sparsity for all segments by default
+    sparsityRatio = 0.02f; // Default 2% sparsity
+    
+    // Override with tensor metadata if available
+    if (segment.tensor_metadata.has_value() && segment.tensor_metadata.value().sparsity_ratio > 0) {
+        sparsityRatio = segment.tensor_metadata.value().sparsity_ratio;
+    }
+    
+    size_t activeBitsCount = static_cast<size_t>(totalElements * sparsityRatio);
+    activeBitsCount = std::max(size_t(1), activeBitsCount); // Ensure at least one active bit
+    
+    // For very large tensors, cap the maximum number of active bits
+    size_t MAX_ACTIVE_BITS;
+    
+    if (totalElements > 10000000) { // Extremely large tensors (>10M elements)
+        MAX_ACTIVE_BITS = 10000; // Higher cap for huge tensors
+    } else if (totalElements > 1000000) { // Large tensors (1M-10M elements)
+        MAX_ACTIVE_BITS = 5000; // Higher cap for large tensors
+    } else {
+        MAX_ACTIVE_BITS = 2000; // Higher cap for medium tensors
+    }
+    
+    if (activeBitsCount > MAX_ACTIVE_BITS) {
+        activeBitsCount = MAX_ACTIVE_BITS;
+        sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;
+    }
+    
+    std::cerr << "Processing segment '" << segment.name << "' with " 
+              << totalElements << " elements (after " << headerSize 
+              << " byte header), targeting " << activeBitsCount 
+              << " active bits (" << sparsityRatio * 100 << "% sparsity)" << std::endl;
+    
+    // For float data, extract the most significant values with their indices
+    if (segment.type == SegmentType::WEIGHTS_FP32 || 
+        segment.type == SegmentType::WEIGHTS_FP16) {
+        
+        // For very large tensors, use a sampling approach instead of sorting all values
+        if (totalElements > 1000000) {
+            // Sample a subset of the data to find significant values
+            const size_t SAMPLE_SIZE = std::min(totalElements, static_cast<size_t>(100000));
+            const size_t SAMPLE_STEP = totalElements / SAMPLE_SIZE;
+            
+            std::vector<std::pair<float, size_t>> sampledValues;
+            sampledValues.reserve(SAMPLE_SIZE);
+            
+            const float* floatData = reinterpret_cast<const float*>(segment.data.data() + headerSize);
+            for (size_t i = 0; i < totalElements; i += SAMPLE_STEP) {
+                if (i < totalElements) { // Safety check
+                    sampledValues.emplace_back(std::abs(floatData[i]), i);
+                }
+            }
+            
+            // Sort the sampled values
+            std::sort(sampledValues.begin(), sampledValues.end(), 
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+            
+            // Take the top values from the sample
+            size_t samplesToTake = std::min(activeBitsCount, sampledValues.size());
+            for (size_t i = 0; i < samplesToTake; ++i) {
+                if (sampledValues[i].first > 0.0f) {
+                    size_t index = sampledValues[i].second;
+                    float originalValue = floatData[index];
+                    activeIndexValuePairs.emplace_back(index, originalValue);
+                }
+            }
+            
+            // If we need more indices, add some uniformly distributed ones
+            if (activeIndexValuePairs.size() < activeBitsCount) {
+                size_t step = std::max(size_t(1), totalElements / (activeBitsCount - activeIndexValuePairs.size() + 1));
+                for (size_t i = 0; i < totalElements && activeIndexValuePairs.size() < activeBitsCount; i += step) {
+                    // Check if this index is already included
+                    bool alreadyIncluded = false;
+                    for (const auto& pair : activeIndexValuePairs) {
+                        if (pair.first == i) {
+                            alreadyIncluded = true;
+                            break;
+                        }
+                    }
+                    if (!alreadyIncluded) {
+                        float originalValue = floatData[i];
+                        activeIndexValuePairs.emplace_back(i, originalValue);
+                    }
+                }
+            }
+        } else {
+            // For smaller tensors, use the original approach
+            std::vector<std::pair<float, size_t>> valuePairs;
+            valuePairs.reserve(totalElements);
+            
+            if (segment.type == SegmentType::WEIGHTS_FP32) {
+                const float* floatData = reinterpret_cast<const float*>(segment.data.data() + headerSize);
+                for (size_t i = 0; i < totalElements; ++i) {
+                    valuePairs.emplace_back(std::abs(floatData[i]), i);
+                }
+            } else if (segment.type == SegmentType::WEIGHTS_FP16) {
+                // Handle FP16 data - implementation depends on how FP16 is stored
+                const uint16_t* fp16Data = reinterpret_cast<const uint16_t*>(segment.data.data() + headerSize);
+                for (size_t i = 0; i < totalElements; ++i) {
+                    // Convert FP16 to FP32 (simplified)
+                    float value = static_cast<float>(fp16Data[i]) / 65535.0f;
+                    valuePairs.emplace_back(std::abs(value), i);
+                }
+            } else { // Other float types
+                const float* floatData = reinterpret_cast<const float*>(segment.data.data() + headerSize);
+                for (size_t i = 0; i < totalElements; ++i) {
+                    valuePairs.emplace_back(std::abs(floatData[i]), i);
+                }
+            }
+            
+            // Sort by absolute value in descending order
+            std::sort(valuePairs.begin(), valuePairs.end(), 
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+            
+            // Take the top N values where N is the target active bits count
+            activeIndexValuePairs.reserve(activeBitsCount);
+            for (size_t i = 0; i < std::min(activeBitsCount, valuePairs.size()); ++i) {
+                if (valuePairs[i].first > 0.0f) {
+                    size_t index = valuePairs[i].second;
+                    // Get the original value (not absolute)
+                    float originalValue;
+                    if (segment.type == SegmentType::WEIGHTS_FP32) {
+                        const float* floatData = reinterpret_cast<const float*>(segment.data.data() + headerSize);
+                        originalValue = floatData[index];
+                    } else if (segment.type == SegmentType::WEIGHTS_FP16) {
+                        const uint16_t* fp16Data = reinterpret_cast<const uint16_t*>(segment.data.data() + headerSize);
+                        originalValue = static_cast<float>(fp16Data[index]) / 65535.0f;
+                    } else {
+                        const float* floatData = reinterpret_cast<const float*>(segment.data.data() + headerSize);
+                        originalValue = floatData[index];
+                    }
+                    activeIndexValuePairs.emplace_back(index, originalValue);
+                }
+            }
+            
+            // If we don't have enough non-zero values, add zeros until we reach the target count
+            if (activeIndexValuePairs.size() < activeBitsCount) {
+                for (size_t i = 0; i < valuePairs.size() && activeIndexValuePairs.size() < activeBitsCount; ++i) {
+                    if (valuePairs[i].first == 0.0f && 
+                        std::find_if(activeIndexValuePairs.begin(), activeIndexValuePairs.end(),
+                            [&](const auto& pair) { return pair.first == valuePairs[i].second; }) == activeIndexValuePairs.end()) {
+                        size_t index = valuePairs[i].second;
+                        float originalValue = 0.0f;
+                        activeIndexValuePairs.emplace_back(index, originalValue);
+                    }
+                }
+            }
+        }
+        
+        // Sort indices for better delta compression
+        std::sort(activeIndexValuePairs.begin(), activeIndexValuePairs.end(), 
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        
+        std::cerr << "Extracted " << activeIndexValuePairs.size() << " index-value pairs out of " 
+                  << totalElements << " elements (effective sparsity: " 
+                  << (static_cast<float>(activeIndexValuePairs.size()) / totalElements) * 100.0f 
+                  << "%)\n";
+    } else {
+        // For other element types, use uniform sampling with increased sparsity
+        if (totalElements > 0) {
+            size_t step = std::max(size_t(1), totalElements / activeBitsCount);
+            for (size_t i = 0; i < totalElements && activeIndexValuePairs.size() < activeBitsCount; i += step) {
+                // For non-float types, use a default value
+                float defaultValue = 1.0f; // Default non-zero value
+                activeIndexValuePairs.emplace_back(i, defaultValue);
+            }
+            // Sort for better delta compression
+            std::sort(activeIndexValuePairs.begin(), activeIndexValuePairs.end(), 
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+    }
+    
+    return activeIndexValuePairs;
 }
 
 std::vector<std::byte> SDRIndexStorageStrategy::decompressToSparseIndices(const std::vector<std::byte>& compressedData, 

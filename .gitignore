@@ -33,6 +33,29 @@ Makefile
 !CMakeLists.txt
 !*.cmake.in
 
+# Ninja build files
+*.ninja
+.ninja_deps
+.ninja_log
+install_manifest.txt
+compile_commands.json
+
+# Additional CMake/IDE build dirs
+cmake-build-*/
+
+# Bazel outputs (if building TensorFlow locally)
+bazel-*
+**/bazel-bin/
+**/bazel-out/
+**/bazel-testlogs/
+
+# Generated protobuf sources (keep tracked ones; ignore new ones by default)
+*.pb.cc
+*.pb.h
+
+# Logs
+*.log
+
 # Qt generated files
 *_autogen/
 *.moc

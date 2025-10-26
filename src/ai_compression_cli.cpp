@@ -22,10 +22,13 @@ void printUsage(const char* programName) {
     std::cout << "  " << programName << " -d <compressed_path> <output_path> [sparsity]       (Decompress)\n";
     std::cout << "  " << programName << " -i <archive_path> <input_indices_file>              (Inference)\n";
     std::cout << "\nSupported formats:\n";
-    std::cout << "  - onnx: ONNX models\n";
-    std::cout << "  - tensorflow: TensorFlow models (will be converted to ONNX)\n";
-    std::cout << "  - pytorch: PyTorch models (will be converted to ONNX)\n";
-    std::cout << "  - gguf: GGUF models\n";
+    std::cout << "  - onnx: ONNX models (direct support)\n";
+    std::cout << "  - gguf: GGUF models (direct support)\n";
+    std::cout << "  - tensorflow: TensorFlow SavedModel (.pb files)\n";
+    std::cout << "  - pytorch: PyTorch models (.pt/.pth files)\n";
+    std::cout << "  - coreml: CoreML models (.mlmodel files)\n";
+    std::cout << "  - hdf5: HDF5/Keras models (.h5 files)\n";
+    std::cout << "\nNote: All formats are compressed using the same SDR-based compression strategies.\n";
     std::cout << "\nOptions:\n";
     std::cout << "  sparsity: Fraction of active bits in SDR encoding (default: 0.02 = 2%)\n";
     std::cout << "\nExamples:\n";

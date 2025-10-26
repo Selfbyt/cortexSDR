@@ -1,3 +1,21 @@
+/**
+ * @file StreamingCompressor.hpp
+ * @brief Streaming compression handler for large neural network models
+ * 
+ * This header defines the StreamingCompressor class which provides efficient
+ * streaming compression for large neural network models that cannot fit
+ * entirely in memory. Implements thread-safe streaming with proper
+ * synchronization and archive format management.
+ * 
+ * Key Features:
+ * - Memory-efficient streaming compression for large models
+ * - Thread-safe concurrent segment processing
+ * - Archive format management with proper headers and indexing
+ * - Real-time compression statistics and progress tracking
+ * - Automatic resource management and cleanup
+ * - Support for multi-gigabyte model compression
+ */
+
 #ifndef STREAMING_COMPRESSOR_HPP
 #define STREAMING_COMPRESSOR_HPP
 
@@ -8,35 +26,75 @@
 #include <string>
 #include <vector>
 #include <cstdint>
-#include <utility> // For std::pair
+#include <utility>
 
 namespace CortexAICompression {
 
-// Handles streaming compression to a file with proper synchronization
+/**
+ * @brief Streaming compression handler for memory-efficient model compression
+ * 
+ * Implements streaming compression that processes model segments as they become
+ * available without loading the entire model into memory. Provides thread-safe
+ * operations and maintains compression statistics for progress monitoring.
+ */
 class StreamingCompressor : public ICompressionHandler {
 public:
+    /**
+     * @brief Constructor initializing streaming compression to output file
+     * @param outputPath Path to output compressed archive file
+     * @throws std::runtime_error if output file cannot be created
+     */
     explicit StreamingCompressor(const std::string& outputPath);
+    
+    /**
+     * @brief Destructor ensuring proper resource cleanup and file finalization
+     */
     ~StreamingCompressor() override;
 
-    // Implements ICompressionHandler
+    /**
+     * @brief Handle compressed segment data in streaming fashion
+     * @param header Compressed segment metadata and information
+     * @param compressedData Compressed segment data bytes
+     * 
+     * Thread-safe method for processing compressed segments as they become
+     * available. Writes data to output stream and updates statistics.
+     */
     void handleCompressedSegment(const CompressedSegmentHeader& header, const std::vector<std::byte>& compressedData) override;
 
-    // Get compression statistics
+    /**
+     * @brief Get total compressed data size processed so far
+     * @return Total size in bytes of all compressed segments
+     */
     size_t getTotalCompressedSize() const { return totalCompressedSize_; }
+    
+    /**
+     * @brief Get total original data size before compression
+     * @return Total size in bytes of all original segments
+     */
     size_t getTotalOriginalSize() const { return totalOriginalSize_; }
-    // Note: getCompressionRatio removed, calculated after finalization if needed
 
-    // Finalize the archive writing process
+    /**
+     * @brief Finalize archive writing and close output file
+     * 
+     * Completes the archive format by writing segment index, updating
+     * headers, and ensuring all data is properly flushed to disk.
+     * Must be called after all segments have been processed.
+     */
     void finalizeArchive();
 
 private:
-    std::ofstream outputFile_;
-    std::mutex writeMutex_; // Mutex might still be needed if handleCompressedSegment is called concurrently
-    size_t totalCompressedSize_ = 0;
-    size_t totalOriginalSize_ = 0;
-    uint64_t currentDataOffset_ = 0;
+    std::ofstream outputFile_;                  ///< Output file stream for compressed archive
+    std::mutex writeMutex_;                     ///< Thread synchronization for concurrent access
+    size_t totalCompressedSize_ = 0;            ///< Running total of compressed data size
+    size_t totalOriginalSize_ = 0;              ///< Running total of original data size
+    uint64_t currentDataOffset_ = 0;            ///< Current write position in output file
 
-    // Storage for segment headers and their file offsets
+    /**
+     * @brief Storage for segment headers and their file positions
+     * 
+     * Maintains mapping of segment headers to their byte offsets in the
+     * output file for efficient random access during decompression.
+     */
     std::vector<std::pair<CompressedSegmentHeader, uint64_t>> segment_headers_;
 };
 

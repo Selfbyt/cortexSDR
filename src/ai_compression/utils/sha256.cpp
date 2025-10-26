@@ -1,3 +1,7 @@
+/**
+ * @file sha256.cpp
+ * @brief Minimal SHA-256 implementation used for archive integrity.
+ */
 #include "sha256.h"
 #include <cstring>
 #include <sstream>

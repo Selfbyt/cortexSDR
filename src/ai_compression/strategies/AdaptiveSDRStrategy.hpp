@@ -1,3 +1,7 @@
+/**
+ * @file AdaptiveSDRStrategy.hpp
+ * @brief Size-adaptive compression switching between direct and SDR encoding.
+ */
 #ifndef ADAPTIVE_SDR_STRATEGY_HPP
 #define ADAPTIVE_SDR_STRATEGY_HPP
 
@@ -12,12 +16,9 @@
 namespace CortexAICompression {
 
 /**
- * AdaptiveSDRStrategy implements a size-adaptive compression strategy
- * that automatically switches between direct storage and SDR-based encoding
- * based on data size.
- * 
- * This approach maintains the SDR philosophy but prevents size expansion
- * for small models.
+ * @brief Size-adaptive compression that selects between direct storage and SDR.
+ * @details Avoids size expansion for small tensors while keeping SDR benefits
+ * for larger tensors with significant sparsity.
  */
 class AdaptiveSDRStrategy : public ICompressionStrategy {
 public:

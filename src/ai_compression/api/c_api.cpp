@@ -9,6 +9,7 @@
 #include "../strategies/AdaptiveSDRStrategy.hpp"
 #include "../parsers/ONNXModelParser.hpp"
 #include "../parsers/GGUFModelParser.hpp"
+#include "../parsers/ModelParserFactory.hpp"
 #include "../utils/ModelConverter.hpp"
 #include "../streaming/StreamingCompressor.hpp"
 #include <chrono>
@@ -86,36 +87,33 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         }
         std::string actualModelPath = model_path;
         std::string actualFormat = format;
-        if (strcmp(format, "gguf") != 0 && strcmp(format, "onnx") != 0) {
+        
+        // Check if the format is supported by our parsers
+        if (!ModelParserFactory::isFormatSupported(format)) {
+            // Fallback to ONNX conversion for unsupported formats
             try {
-                std::cout << "Converting " << format << " model to ONNX format..." << std::endl;
+                std::cout << "Format " << format << " not directly supported, converting to ONNX format..." << std::endl;
                 actualModelPath = ModelConverter::convertToONNX(model_path, format);
                 actualFormat = "onnx";
                 std::cout << "Model successfully converted to ONNX: " << actualModelPath << std::endl;
             } catch (const ModelConversionError& e) {
                 std::cerr << "Warning: " << e.what() << std::endl;
-                std::cerr << "Please convert your model to ONNX format manually..." << std::endl;
-                return {str_to_c("Failed to convert model to ONNX: " + std::string(e.what())), 1};
+                std::cerr << "Please convert your model to a supported format manually..." << std::endl;
+                return {str_to_c("Failed to convert model: " + std::string(e.what())), 1};
             } catch (const std::exception& e) {
                  return {str_to_c("Error during model conversion: " + std::string(e.what())), 1};
             }
         }
+        // Use the factory to create the appropriate parser
         std::unique_ptr<IAIModelParser> parser;
-        if (actualFormat == "gguf") {
-#ifdef ENABLE_GGUF
-            parser = std::make_unique<GGUFModelParser>();
-#else
-            return {str_to_c("GGUF support is not enabled in this build."), 1};
-#endif
+        try {
+            parser = ModelParserFactory::createParser(actualModelPath);
+        } catch (const ParsingError& e) {
+            return {str_to_c("Failed to create parser: " + std::string(e.what())), 1};
+        } catch (const std::exception& e) {
+            return {str_to_c("Unexpected error creating parser: " + std::string(e.what())), 1};
         }
-#if defined(ENABLE_ONNX) || defined(ENABLE_ONNX_PROTOBUF)
-        else if (actualFormat == "onnx") {
-            parser = std::make_unique<ONNXModelParser>();
-        }
-#endif
-        else {
-            return {str_to_c("Unsupported model format. Please convert to ONNX or GGUF."), 1};
-        }
+        
         if (!parser) {
              return {str_to_c("Failed to create model parser for format: " + actualFormat), 1};
         }

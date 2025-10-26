@@ -1,3 +1,7 @@
+/**
+ * @file ONNXModelParser.hpp
+ * @brief Parser that converts ONNX models into archive segments.
+ */
 #ifndef ONNX_MODEL_PARSER_HPP
 #define ONNX_MODEL_PARSER_HPP
 
@@ -22,6 +26,9 @@
 
 namespace CortexAICompression {
 
+/**
+ * @brief Parse ONNX models into compression-ready segments.
+ */
 class ONNXModelParser : public IAIModelParser {
 public:
     ONNXModelParser();

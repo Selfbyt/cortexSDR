@@ -1,3 +1,7 @@
+/**
+ * @file StreamingCompressor.cpp
+ * @brief Implementation of streaming archive writer for large models.
+ */
 #include "StreamingCompressor.hpp"
 #include "../core/ArchiveConstants.hpp" // Include for ARCHIVE_MAGIC, ARCHIVE_VERSION
 #include <stdexcept>

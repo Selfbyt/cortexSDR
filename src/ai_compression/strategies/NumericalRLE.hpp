@@ -1,3 +1,7 @@
+/**
+ * @file NumericalRLE.hpp
+ * @brief Run-Length Encoding strategy for numerical tensors.
+ */
 #ifndef NUMERICAL_RLE_HPP
 #define NUMERICAL_RLE_HPP
 
@@ -9,28 +13,27 @@
 
 namespace CortexAICompression {
 
-// Implementation of RLE for sequences of arithmetic types (int, float, etc.)
+/**
+ * @brief RLE for sequences of arithmetic types (int, float, etc.).
+ */
 class NumericalRLEStrategy : public ICompressionStrategy {
 public:
-    // Compresses numerical data from a ModelSegment using RLE.
-    // Assumes segment.data contains a sequence of a specific arithmetic type.
-    // The type needs to be known or inferred (e.g., from segment.type).
+    /** Compress numerical data using RLE. */
     std::vector<std::byte> compress(const ModelSegment& segment) const override;
 
-    // Decompresses RLE data back into a sequence of raw bytes.
-    // Requires the original segment type to correctly interpret the data.
+    /** Decompress RLE data back into raw bytes. */
     std::vector<std::byte> decompress(const std::vector<std::byte>& compressedData, SegmentType originalType, size_t originalSize) const override;
 
 private:
-    // Templated helper for compressing sequences of a specific type T
+    /** Templated helper for compressing sequences of a specific type T. */
     template <typename T>
     std::vector<std::byte> compressTyped(const std::vector<std::byte>& rawData) const;
 
-    // Templated helper for decompressing sequences of a specific type T
+    /** Templated helper for decompressing sequences of a specific type T. */
     template <typename T>
     std::vector<std::byte> decompressTyped(const std::vector<std::byte>& rleData) const;
 
-    // Helper to determine element size based on segment type
+    /** Determine element size based on segment type. */
     size_t getElementSize(SegmentType type) const;
 };
 

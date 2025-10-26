@@ -1,3 +1,7 @@
+/**
+ * @file NumericalRLE.cpp
+ * @brief Implementation of run-length encoding for numerical tensors.
+ */
 #include "NumericalRLE.hpp"
 #include "../core/ModelSegment.hpp"
 #include <stdexcept>       // For std::runtime_error

@@ -1,3 +1,7 @@
+/**
+ * @file ModelConverter.hpp
+ * @brief Utilities to convert external model formats into ONNX.
+ */
 #ifndef MODEL_CONVERTER_HPP
 #define MODEL_CONVERTER_HPP
 
@@ -23,31 +27,22 @@
 
 namespace CortexAICompression {
 
+/** Error indicating a model conversion failure. */
 class ModelConversionError : public std::runtime_error {
 public:
     explicit ModelConversionError(const std::string& message) : std::runtime_error(message) {}
 };
 
+/**
+ * @brief Convert models from frameworks (PyTorch, TF) to ONNX.
+ */
 class ModelConverter {
 public:
-    /**
-     * Convert a model from its original format to ONNX format
-     * 
-     * @param modelPath Path to the original model file
-     * @param format Original format of the model (e.g., "pytorch", "tensorflow")
-     * @param outputPath Optional path for the output ONNX model. If empty, a default path will be generated.
-     * @return Path to the converted ONNX model
-     * @throws ModelConversionError if conversion fails
-     */
+    /** Convert a model from its original format to ONNX format. */
     static std::string convertToONNX(const std::string& modelPath, const std::string& format, const std::string& outputPath = "");
 
 private:
-    /**
-     * Generate a default output path for the ONNX model
-     * 
-     * @param inputPath Path to the input model
-     * @return Generated output path
-     */
+    /** Generate a default output path for the ONNX model. */
     static std::string generateOutputPath(const std::string& inputPath);
 };
 
