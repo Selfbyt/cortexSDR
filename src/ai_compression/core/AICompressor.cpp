@@ -1,26 +1,55 @@
+/**
+ * @file AICompressor.cpp
+ * @brief Implementation of AI model compression with multiple strategies
+ * 
+ * This file implements the AICompressor class which provides comprehensive
+ * neural network model compression using various strategies including:
+ * - Sparse Distributed Representation (SDR) compression
+ * - Run-Length Encoding (RLE) for sequential data
+ * - Gzip compression for general purpose reduction
+ * - Quantization strategies for precision reduction
+ * 
+ * Key Features:
+ * - Multi-strategy compression pipeline
+ * - Streaming compression for large models
+ * - Parallel processing for performance optimization
+ * - Comprehensive error handling and validation
+ * - SHA-256 integrity verification
+ */
+
 #include "AICompressor.hpp"
 #include "../strategies/CompressionStrategy.hpp"
 #include "ArchiveConstants.hpp"
-#include <fstream> // For file stream operations if needed, though using ostream directly
+#include <fstream>
 #include <stdexcept>
-#include <iostream> // For potential debug/error messages
+#include <iostream>
 #include <vector>
-#include <cstring> // For std::memcpy
+#include <cstring>
 #include <thread>
 #include <future>
-#include <list>    // Include list for strategy storage
-#include <algorithm> // For std::find_if
+#include <list>
+#include <algorithm>
 #include "../utils/sha256.h"
 
 namespace CortexAICompression {
 
-// Helper function to write basic types to the stream
+/**
+ * @brief Write binary data of basic types to output stream
+ * @tparam T Type of data to write (must be trivially copyable)
+ * @param stream Output stream to write to
+ * @param value Value to write in binary format
+ */
 template<typename T>
 void writeBasicType(std::ostream& stream, const T& value) {
     stream.write(reinterpret_cast<const char*>(&value), sizeof(T));
 }
 
-// Helper function to write string (length prefixed)
+/**
+ * @brief Write length-prefixed string to output stream
+ * @param stream Output stream to write to
+ * @param str String to write with 32-bit length prefix
+ * @throws std::runtime_error if string length exceeds UINT32_MAX
+ */
 void writeString(std::ostream& stream, const std::string& str) {
     uint32_t len = static_cast<uint32_t>(str.length());
     if (str.length() > UINT32_MAX) {

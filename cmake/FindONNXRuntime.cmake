@@ -12,16 +12,18 @@ if(PKG_CONFIG_FOUND)
   pkg_check_modules(PC_ONNXRuntime QUIET onnxruntime)
 endif()
 
-# Find the include directory
+# Find the include directory - check local installation first
 find_path(ONNXRuntime_INCLUDE_DIR
   NAMES onnxruntime_cxx_api.h
   PATHS
+    ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/onnxruntime-linux-x64-gpu-1.21.1/include
     ${PC_ONNXRuntime_INCLUDE_DIRS}
     /usr/include
     /usr/local/include
     /usr/include/onnxruntime
     /usr/local/include/onnxruntime
   PATH_SUFFIXES onnxruntime/core/session
+  NO_DEFAULT_PATH
 )
 
 # Find the library

@@ -1,3 +1,7 @@
+/**
+ * @file GGUFModelParser.cpp
+ * @brief Implementation of GGUF model parsing into archive segments.
+ */
 #include "GGUFModelParser.hpp"
 #include <stdexcept>
 #include <regex>

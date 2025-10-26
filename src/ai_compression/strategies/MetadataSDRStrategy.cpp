@@ -1,3 +1,7 @@
+/**
+ * @file MetadataSDRStrategy.cpp
+ * @brief Implementation of SDR-based reversible metadata encoding.
+ */
 #include "MetadataSDRStrategy.hpp"
 #include <algorithm>
 #include <cmath>

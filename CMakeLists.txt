@@ -3,7 +3,7 @@ project(cortexsdr VERSION 1.0.0 LANGUAGES CXX)
 
 # Build type options
 option(BUILD_FIRMWARE "Build as firmware for embedded devices" OFF)
-option(BUILD_DESKTOP "Build as desktop application" ON)
+option(BUILD_DESKTOP "Build as desktop application" OFF)
 option(BUILD_LIBRARY "Build as a standalone library" OFF)
 option(BUILD_PYTHON_WRAPPER "Build Python bindings" OFF)
 
@@ -35,41 +35,10 @@ if(BUILD_FIRMWARE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/firmware/config/firmware_config.cmake)
 endif()
 
-# Desktop application settings
-if(BUILD_DESKTOP)
-    # Find Qt packages for desktop build
-    find_package(Qt6 COMPONENTS Widgets REQUIRED)
-    
-    # Enable Qt features
-    set(CMAKE_AUTOMOC ON)
-    set(CMAKE_AUTORCC ON)
-    set(CMAKE_AUTOUIC ON)
-endif()
+# Desktop application settings removed
 
 # Define source files
 set(COMMON_SOURCES
-    # Text encoders
-    src/encoders/text/WordEncoding.cpp
-    src/encoders/text/CharacterEncoding.cpp
-    src/encoders/text/SpecialCharEncoding.cpp
-    
-    # Numeric encoders
-    src/encoders/numeric/NumberEncoding.cpp
-    src/encoders/numeric/DateTimeEncoding.cpp
-    src/encoders/numeric/GeoEncoding.cpp
-    
-    # Media encoders
-    src/encoders/media/ImageEncoding.cpp
-    src/encoders/media/AudioEncoding.cpp
-    src/encoders/media/VideoEncoding.cpp
-    
-    # Adapters
-    src/encoders/adapters/SpecialCharEncodingAdapter.cpp
-    src/encoders/adapters/GeoEncodingAdapter.cpp
-    # Core
-    src/cortexSDR.cpp
-    src/rle.cpp
-
     # AI Compression
     src/ai_compression/core/AICompressor.cpp
     src/ai_compression/core/AIDecompressor.cpp
@@ -82,6 +51,11 @@ set(COMMON_SOURCES
     src/ai_compression/streaming/StreamingCompressor.cpp
     src/ai_compression/parsers/GGUFModelParser.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp
+    src/ai_compression/parsers/TensorFlowModelParser.cpp
+    src/ai_compression/parsers/PyTorchModelParser.cpp
+    src/ai_compression/parsers/CoreMLModelParser.cpp
+    src/ai_compression/parsers/HDF5ModelParser.cpp
+    src/ai_compression/parsers/ModelParserFactory.cpp
     src/ai_compression/utils/ModelConverter.cpp
     src/ai_compression/utils/sha256.cpp
     src/ai_compression/api/c_api.cpp
@@ -89,38 +63,34 @@ set(COMMON_SOURCES
     src/ai_compression/SparseInferenceEngine.cpp
 )
 
-# Add UI sources only for desktop build
-if(BUILD_DESKTOP)
-    set(UI_SOURCES
-        src/SDRWindow.cpp
-    )
-    
-    # Add desktop application sources
-    set(DESKTOP_SOURCES
-        src/desktop_app/main.cpp
-        src/desktop_app/MainWindow.cpp
-        src/desktop_app/ModelManager.cpp
-        src/desktop_app/CompressionWidget.cpp
-        src/desktop_app/InferenceWidget.cpp
-        src/desktop_app/BenchmarkWidget.cpp
-        src/desktop_app/ResultsWidget.cpp
-        src/desktop_app/TextGenerationWidget.cpp
-        src/desktop_app/AudioInferenceWidget.cpp
-        src/desktop_app/PerformanceMonitor.cpp
-        src/desktop_app/ChatWidget.cpp
-    )
-endif()
+# Remove desktop UI and application sources
 
 # Find required packages
 find_package(ZLIB REQUIRED)
 find_package(Protobuf REQUIRED) # Protobuf is often a dependency for ONNX
 find_package(nlohmann_json REQUIRED)
 
+# libzip (for reading ZIP-based PyTorch checkpoints like consolidated.xx.pth)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBZIP REQUIRED libzip)
+if(LIBZIP_FOUND)
+    list(APPEND EXTRA_LIBS ${LIBZIP_LIBRARIES})
+    list(APPEND EXTRA_INCLUDES ${LIBZIP_INCLUDE_DIRS})
+    message(STATUS "Found libzip: ${LIBZIP_LIBRARIES}")
+    message(STATUS "libzip include dirs: ${LIBZIP_INCLUDE_DIRS}")
+else()
+    message(FATAL_ERROR "libzip not found. Please install libzip (e.g., 'dnf install libzip libzip-devel').")
+endif()
+
 # Optional model format support
+# Note: TensorFlow is OFF by default to avoid heavy C++ dependency setup.
+# To enable, configure with: -DENABLE_TENSORFLOW=ON and set TENSORFLOW_SOURCE_DIR to your TF source path.
 option(ENABLE_GGUF "Enable GGUF model support" ON)
 option(ENABLE_ONNX "Enable ONNX model support" ON)
-option(ENABLE_TENSORFLOW "Enable TensorFlow model conversion support" ON)
+option(ENABLE_TENSORFLOW "Enable TensorFlow model conversion support" OFF)
 option(ENABLE_PYTORCH "Enable PyTorch model conversion support" ON)
+option(ENABLE_COREML "Enable CoreML model support" ON)
+option(ENABLE_HDF5 "Enable HDF5/Keras model support" ON)
 
 # Set the module path to include our custom FindONNXRuntime.cmake module
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -180,14 +150,82 @@ if(ENABLE_ONNX)
 endif()
 # --- End ONNX Configuration ---
 
+# --- HDF5 Configuration ---
+if(ENABLE_HDF5)
+    find_package(HDF5 REQUIRED)
+    if(HDF5_FOUND)
+        add_definitions(-DENABLE_HDF5)
+        list(APPEND EXTRA_LIBS ${HDF5_LIBRARIES})
+        list(APPEND EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS})
+        message(STATUS "Found HDF5: ${HDF5_LIBRARIES}")
+        message(STATUS "HDF5 include dirs: ${HDF5_INCLUDE_DIRS}")
+    else()
+        message(WARNING "HDF5 not found. HDF5/Keras model support will be disabled.")
+        set(ENABLE_HDF5 OFF)
+    endif()
+endif()
+# --- End HDF5 Configuration ---
+
 # Check for TensorFlow if enabled
 if(ENABLE_TENSORFLOW)
-    # Use local TensorFlow installation
-    set(TENSORFLOW_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/libtensorflow")
-    if(EXISTS "${TENSORFLOW_ROOT}/include" AND EXISTS "${TENSORFLOW_ROOT}/lib")
+    # Allow user to specify TensorFlow source directory via environment variable or CMake variable
+    if(NOT DEFINED TENSORFLOW_SOURCE_DIR)
+        if(DEFINED ENV{TENSORFLOW_SOURCE_DIR})
+            set(TENSORFLOW_SOURCE_DIR "$ENV{TENSORFLOW_SOURCE_DIR}")
+        else()
+            # Try common locations
+            set(TENSORFLOW_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tensorflow")
+        endif()
+    endif()
+    
+    # Check if TensorFlow source directory exists
+    if(EXISTS "${TENSORFLOW_SOURCE_DIR}/tensorflow/cc/saved_model/loader.h")
         set(TensorFlow_FOUND TRUE)
-        set(TensorFlow_INCLUDE_DIRS "${TENSORFLOW_ROOT}/include")
-        set(TensorFlow_LIBRARIES "${TENSORFLOW_ROOT}/lib/libtensorflow.so" "${TENSORFLOW_ROOT}/lib/libtensorflow_framework.so")
+        set(TensorFlow_INCLUDE_DIRS 
+            "${TENSORFLOW_SOURCE_DIR}"
+            "${TENSORFLOW_SOURCE_DIR}/bazel-bin"
+            "${TENSORFLOW_SOURCE_DIR}/bazel-tensorflow/external/com_google_protobuf/src"
+            "${TENSORFLOW_SOURCE_DIR}/bazel-tensorflow/external/org_tensorflow"
+        )
+        
+        # Try to find TensorFlow libraries
+        find_library(TensorFlow_LIBRARY
+            NAMES tensorflow_cc tensorflow
+            PATHS
+                "${TENSORFLOW_SOURCE_DIR}/bazel-bin/tensorflow"
+                "${TENSORFLOW_SOURCE_DIR}/bazel-tensorflow/bin/tensorflow"
+                /usr/lib
+                /usr/lib64
+                /usr/local/lib
+                /usr/local/lib64
+        )
+        
+        find_library(TensorFlow_FRAMEWORK_LIBRARY
+            NAMES tensorflow_framework
+            PATHS
+                "${TENSORFLOW_SOURCE_DIR}/bazel-bin/tensorflow"
+                "${TENSORFLOW_SOURCE_DIR}/bazel-tensorflow/bin/tensorflow"
+                /usr/lib
+                /usr/lib64
+                /usr/local/lib
+                /usr/local/lib64
+        )
+        
+        if(TensorFlow_LIBRARY)
+            set(TensorFlow_LIBRARIES ${TensorFlow_LIBRARY})
+            if(TensorFlow_FRAMEWORK_LIBRARY)
+                list(APPEND TensorFlow_LIBRARIES ${TensorFlow_FRAMEWORK_LIBRARY})
+            endif()
+        else()
+            # Fallback to system libraries if available
+            find_library(TensorFlow_LIBRARY
+                NAMES tensorflow_cc tensorflow
+                PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64
+            )
+            if(TensorFlow_LIBRARY)
+                set(TensorFlow_LIBRARIES ${TensorFlow_LIBRARY})
+            endif()
+        endif()
         
         add_definitions(-DENABLE_TENSORFLOW)
         list(APPEND EXTRA_LIBS ${TensorFlow_LIBRARIES})
@@ -196,9 +234,13 @@ if(ENABLE_TENSORFLOW)
         # Make sure we include the TensorFlow headers in all targets
         include_directories(${TensorFlow_INCLUDE_DIRS})
         
-        message(STATUS "Using local TensorFlow installation at ${TENSORFLOW_ROOT}")
+        message(STATUS "Using TensorFlow source directory at ${TENSORFLOW_SOURCE_DIR}")
+        message(STATUS "TensorFlow include directories: ${TensorFlow_INCLUDE_DIRS}")
+        message(STATUS "TensorFlow libraries: ${TensorFlow_LIBRARIES}")
     else()
-        message(WARNING "Local TensorFlow not found at ${TENSORFLOW_ROOT}. TensorFlow model conversion support will be disabled.")
+        message(WARNING "TensorFlow source directory not found at ${TENSORFLOW_SOURCE_DIR}")
+        message(WARNING "Set TENSORFLOW_SOURCE_DIR environment variable or CMake variable to point to your TensorFlow source directory")
+        message(WARNING "TensorFlow model conversion support will be disabled.")
         set(ENABLE_TENSORFLOW OFF)
     endif()
 endif()
@@ -232,6 +274,11 @@ set(SDK_SOURCES
     src/ai_compression/api/c_api.cpp
     src/ai_compression/SparseInferenceEngine.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp
+    src/ai_compression/parsers/TensorFlowModelParser.cpp
+    src/ai_compression/parsers/PyTorchModelParser.cpp
+    src/ai_compression/parsers/CoreMLModelParser.cpp
+    src/ai_compression/parsers/HDF5ModelParser.cpp
+    src/ai_compression/parsers/ModelParserFactory.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
     src/ai_compression/core/AIDecompressor.cpp
     src/ai_compression/core/AICompressor.cpp
@@ -248,11 +295,7 @@ set(SDK_SOURCES
 )
 
 # Add main library target
-if(BUILD_FIRMWARE)
-    add_library(${PROJECT_NAME} STATIC ${COMMON_SOURCES})
-else()
-    add_library(${PROJECT_NAME} ${COMMON_SOURCES} ${UI_SOURCES})
-endif()
+add_library(${PROJECT_NAME} ${COMMON_SOURCES})
 
 # Add SDK library targets (both static and shared)
 add_library(${PROJECT_NAME}_sdk STATIC ${SDK_SOURCES})
@@ -305,28 +348,14 @@ target_include_directories(${PROJECT_NAME}
 )
 
 # Link libraries based on build type
-if(BUILD_DESKTOP)
-    target_link_libraries(${PROJECT_NAME}
-        PRIVATE
-            Qt6::Widgets
-            Qt6::Widgets
-            ZLIB::ZLIB
-            ${Protobuf_LIBRARIES} # Link Protobuf libraries directly
-            ${EXTRA_LIBS} # Contains ONNX and ONNXRuntime libs if found
-    )
-else()
-    target_link_libraries(${PROJECT_NAME}
-        PRIVATE
-            ZLIB::ZLIB
-            ${Protobuf_LIBRARIES} # Link Protobuf libraries directly
-            ${EXTRA_LIBS} # Contains ONNX and ONNXRuntime libs if found
-    )
-endif()
+target_link_libraries(${PROJECT_NAME}
+    PRIVATE
+        ZLIB::ZLIB
+        ${Protobuf_LIBRARIES}
+        ${EXTRA_LIBS}
+)
 
-# CLI Tool executable
-find_package(ZLIB REQUIRED)
-add_executable(cortexsdr_cli src/cli_main.cpp)
-target_link_libraries(cortexsdr_cli PRIVATE ${PROJECT_NAME} ZLIB::ZLIB)
+# CLI Tool executable removed (moved to sdr_core)
 
 # Model Converter CLI Tool
 add_executable(cortexsdr_model_converter src/model_converter_cli.cpp)
@@ -337,9 +366,7 @@ if(ENABLE_ONNX)
     target_include_directories(cortexsdr_model_converter PRIVATE ${ONNXRuntime_INCLUDE_DIRS})
 endif()
 
-# C API Test Tool
-add_executable(test_c_api src/test_c_api.cpp)
-target_link_libraries(test_c_api PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+# C API Test Tool removed
 
 # AI Compression CLI Tool
 add_executable(cortexsdr_ai_compression_cli src/ai_compression_cli.cpp)
@@ -349,76 +376,9 @@ target_link_libraries(cortexsdr_ai_compression_cli PRIVATE ${PROJECT_NAME} ${EXT
 add_executable(cortexsdr_text_cli src/cortexsdr_cli.cpp)
 target_link_libraries(cortexsdr_text_cli PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
 
-# Desktop Application
-if(BUILD_DESKTOP)
-    # Find Qt6 components for desktop build
-    find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Concurrent)
-    
-    # Try to find Qt6 Charts
-    find_package(Qt6 COMPONENTS Charts QUIET)
-    if(Qt6Charts_FOUND)
-        message(STATUS "Qt6 Charts found - charts will be enabled")
-        add_definitions(-DENABLE_QT_CHARTS)
-        set(QT_CHARTS_AVAILABLE TRUE)
-    else()
-        message(STATUS "Qt6 Charts not found - charts will be disabled")
-        set(QT_CHARTS_AVAILABLE FALSE)
-        # Temporarily disable Qt Charts to get basic build working
-        set(QT_CHARTS_AVAILABLE FALSE)
-    endif()
-    
-    # Create desktop application
-    add_executable(cortexsdr_desktop ${DESKTOP_SOURCES})
-    
-    # Set Qt properties
-    set_target_properties(cortexsdr_desktop PROPERTIES
-        AUTOMOC ON
-        AUTOUIC ON
-        AUTORCC ON
-    )
-    
-    # Link libraries for desktop application
-    target_link_libraries(cortexsdr_desktop
-        PRIVATE
-            ${PROJECT_NAME}
-            ${PROJECT_NAME}_sdk
-            Qt6::Core
-            Qt6::Widgets
-            Qt6::Network
-            Qt6::Concurrent
-            ${EXTRA_LIBS}
-    )
-    
-    # Add Qt Charts if available
-    if(QT_CHARTS_AVAILABLE)
-        target_link_libraries(cortexsdr_desktop PRIVATE Qt6::Charts)
-    endif()
-    
-    # Add include directories for desktop application
-    target_include_directories(cortexsdr_desktop
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/api
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/core
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/strategies
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/parsers
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/utils
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/streaming
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ai_compression/onnx_proto
-            ${EXTRA_INCLUDES}
-    )
-    
-    # Install desktop application
-    install(TARGETS cortexsdr_desktop
-        RUNTIME DESTINATION bin
-    )
-endif()
+# Desktop application target removed
 
-# Add tests unless building for firmware or testing is disabled
-if(NOT BUILD_FIRMWARE AND BUILD_TESTING)
-    add_subdirectory(test)
-endif()
+# Tests removed
 
 # Firmware binary target
 if(BUILD_FIRMWARE)

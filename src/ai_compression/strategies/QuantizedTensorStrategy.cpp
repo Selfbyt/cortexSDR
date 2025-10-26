@@ -1,3 +1,7 @@
+/**
+ * @file QuantizedTensorStrategy.cpp
+ * @brief Implementation of quantization-based tensor compression.
+ */
 #include "QuantizedTensorStrategy.hpp"
 #include <iostream>
 #include <cstring> // For memcpy

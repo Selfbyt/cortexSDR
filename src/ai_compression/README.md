@@ -48,6 +48,8 @@ ai_compression/
 - `GzipStrategy`: Gzip-based compression
 - `NumericalRLE`: Run-length encoding for numerical data
 - `SDRIndexStorage`: Sparse distributed representation storage
+- `AdaptiveSDRStrategy`: Switches between direct storage and SDR based on tensor size and sparsity
+- `QuantizedTensorStrategy`: Quantizes float tensors to INT8/INT4 with (a)symmetric modes
 
 ### Streaming
 - `StreamingCompressor`: Streaming compression support
@@ -60,12 +62,16 @@ ai_compression/
 
 - Support for multiple model formats (GGUF, ONNX, PyTorch, TensorFlow)
 - Multiple compression strategies (Gzip, RLE, SDR)
-- Streaming compression support
+- Streaming compression support (see `streaming/`)
 - Parallel processing capabilities
 - C API for integration with other languages
 - Model-aware chunking for optimal compression
 - Metadata preservation
 - Error handling and validation
+
+## Inference (On-Demand)
+
+`SparseInferenceEngine` and `SDRModelLoader` enable Ollama-style on-demand layer loading from `.sdr` archives to reduce peak memory usage.
 
 ## Dependencies
 

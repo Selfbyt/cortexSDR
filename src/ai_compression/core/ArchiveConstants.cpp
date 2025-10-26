@@ -1,3 +1,7 @@
+/**
+ * @file ArchiveConstants.cpp
+ * @brief Defines archive magic and version used across compression/decompression.
+ */
 #include "ArchiveConstants.hpp"
 
 namespace CortexAICompression {

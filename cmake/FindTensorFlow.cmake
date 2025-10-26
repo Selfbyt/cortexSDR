@@ -36,19 +36,21 @@ if(TENSORFLOW_ROOT)
     endif()
   endif()
 else()
-  # Find the include directory
+  # Find the include directory - look for C++ API headers first, then C API
   find_path(TensorFlow_INCLUDE_DIR
-    NAMES tensorflow/c/c_api.h
+    NAMES tensorflow/cc/saved_model/loader.h tensorflow/c/c_api.h
     PATHS
       ${PC_TensorFlow_INCLUDE_DIRS}
       /usr/include
       /usr/local/include
       /opt/tensorflow/include
+      ~/tensorflow/bazel-bin/tensorflow/include
+      ~/tensorflow/bazel-tensorflow/external/org_tensorflow/tensorflow/include
   )
 
-  # Find the libraries
+  # Find the libraries - look for C++ API libraries first
   find_library(TensorFlow_LIBRARY
-    NAMES tensorflow
+    NAMES tensorflow_cc tensorflow
     PATHS
       ${PC_TensorFlow_LIBRARY_DIRS}
       /usr/lib
@@ -56,6 +58,8 @@ else()
       /usr/local/lib
       /usr/local/lib64
       /opt/tensorflow/lib
+      ~/tensorflow/bazel-bin/tensorflow
+      ~/tensorflow/bazel-tensorflow/bin/tensorflow
   )
   
   find_library(TensorFlow_FRAMEWORK_LIBRARY
@@ -67,6 +71,8 @@ else()
       /usr/local/lib
       /usr/local/lib64
       /opt/tensorflow/lib
+      ~/tensorflow/bazel-bin/tensorflow
+      ~/tensorflow/bazel-tensorflow/bin/tensorflow
   )
   
   if(TensorFlow_LIBRARY)

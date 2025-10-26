@@ -1,3 +1,7 @@
+/**
+ * @file sha256.h
+ * @brief Minimal SHA-256 implementation wrapper.
+ */
 #ifndef AI_COMPRESSION_UTILS_SHA256_H
 #define AI_COMPRESSION_UTILS_SHA256_H
 
@@ -8,6 +12,9 @@
 
 namespace CortexAICompression {
 
+/**
+ * @brief Incremental SHA-256 hasher producing 32-byte digests.
+ */
 class SHA256 {
 public:
     SHA256();

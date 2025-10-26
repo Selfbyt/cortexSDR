@@ -1,18 +1,35 @@
+/**
+ * @file ONNXModelParser.cpp
+ * @brief Implementation of ONNX neural network model parsing for compression
+ * 
+ * This file implements the ONNXModelParser class which provides comprehensive
+ * parsing of ONNX (Open Neural Network Exchange) format models for compression
+ * preprocessing. Supports various ONNX operators and model architectures.
+ * 
+ * Key Features:
+ * - Complete ONNX protobuf model parsing
+ * - Layer-by-layer weight and bias extraction
+ * - Metadata preservation for reconstruction
+ * - Multi-threading for large model processing
+ * - Memory-efficient streaming parsing
+ * - Support for quantized and specialized layer types
+ */
+
 #include "ONNXModelParser.hpp"
 #include <stdexcept>
 #include <regex>
 #include <algorithm>
 #include <cstring>
-#include <iostream> // For potential debug output
-#include <iomanip> // For std::setw, std::setfill
-#include <sstream> // For string stream serialization
-#include <fstream> // For file reading
-#include <unordered_set> // For initializer check
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <fstream>
+#include <unordered_set>
 #include <future>
 #include <thread>
 
 #ifdef ENABLE_ONNX_PROTOBUF
-#include <../onnx_proto/onnx.pb.h> // Include ONNX Protobuf headers
+#include <../onnx_proto/onnx.pb.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #endif
@@ -20,9 +37,15 @@
 
 namespace CortexAICompression {
 
+/**
+ * @brief Constructor for ONNXModelParser with protobuf initialization
+ * 
+ * Initializes the ONNX model parser with protobuf support and sets up
+ * the parsing environment for efficient model processing.
+ */
 ONNXModelParser::ONNXModelParser() {
 #ifdef ENABLE_ONNX
-    // Keep ORT environment for potential future use or fallback, but parsing now uses Protobuf primarily
+    // Initialize ORT environment for potential fallback parsing
     env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "CortexONNXParser");
     sessionOptions = std::make_unique<Ort::SessionOptions>();
     sessionOptions->SetIntraOpNumThreads(1);

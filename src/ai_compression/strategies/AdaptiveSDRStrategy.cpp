@@ -1,27 +1,57 @@
+/**
+ * @file AdaptiveSDRStrategy.cpp
+ * @brief Implementation of adaptive sparse distributed representation compression
+ * 
+ * This file implements the AdaptiveSDRStrategy class which provides intelligent
+ * compression using sparse distributed representations with adaptive parameters.
+ * The strategy automatically selects optimal compression parameters based on
+ * data characteristics to maximize compression efficiency.
+ * 
+ * Key Features:
+ * - Adaptive sparsity level selection based on data analysis
+ * - Dynamic SDR width adjustment for optimal representation
+ * - Small data handling with specialized compression
+ * - Memory-efficient sparse encoding with bit-packing
+ * - Performance monitoring and parameter tuning
+ */
+
 #include "AdaptiveSDRStrategy.hpp"
 #include <algorithm>
 #include <iostream>
 #include <cstring>
 #include <cassert>
-#include <iomanip> // Required for std::setw and std::setfill
+#include <iomanip>
 
 namespace CortexAICompression {
 
+/**
+ * @brief Constructor for AdaptiveSDRStrategy with configurable parameters
+ * @param sparsity Target sparsity level (0.0-1.0) for sparse representation
+ * @param sdrWidth Width of the SDR representation vector
+ * @param smallDataThreshold Threshold below which to use specialized small data handling
+ * @throws std::invalid_argument if parameters are invalid
+ */
 AdaptiveSDRStrategy::AdaptiveSDRStrategy(float sparsity, size_t sdrWidth, size_t smallDataThreshold)
     : sparsity_(sparsity), sdrWidth_(sdrWidth), smallDataThreshold_(smallDataThreshold) {
     
-    // Validate parameters
+    // Validate sparsity parameter
     if (sparsity <= 0.0f || sparsity >= 1.0f) {
         throw std::invalid_argument("Sparsity must be between 0 and 1");
     }
     
+    // Validate SDR width parameter
     if (sdrWidth_ == 0) {
         throw std::invalid_argument("SDR width must be greater than 0");
     }
     
-    // No delegate strategies created yet - they'll be lazy-loaded when needed
+    // Delegate strategies created on-demand for memory efficiency
 }
 
+/**
+ * @brief Update the target sparsity level for compression
+ * @param sparsity New sparsity level (0.0-1.0)
+ * @throws std::invalid_argument if sparsity is out of valid range
+ */
 void AdaptiveSDRStrategy::setSparsity(float sparsity) {
     if (sparsity <= 0.0f || sparsity >= 1.0f) {
         throw std::invalid_argument("Sparsity must be between 0 and 1");

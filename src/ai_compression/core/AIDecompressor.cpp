@@ -1,22 +1,50 @@
+/**
+ * @file AIDecompressor.cpp
+ * @brief Implementation of AI model decompression with on-demand loading
+ * 
+ * This file implements the AIDecompressor class which provides efficient
+ * neural network model decompression supporting various compression strategies.
+ * Designed for on-demand loading to minimize memory usage during inference.
+ * 
+ * Key Features:
+ * - Multi-strategy decompression (SDR, RLE, Gzip, Quantization)
+ * - On-demand segment loading for memory efficiency
+ * - Stream-based decompression for large models  
+ * - SHA-256 integrity verification
+ * - Header-only reading for metadata access
+ * - Parallel decompression support for performance
+ */
+
 #include "AIDecompressor.hpp"
 #include "ArchiveConstants.hpp"
 #include <vector>
 #include <stdexcept>
-#include <iostream> // For potential debug/error messages
-#include <cstring> // For std::memcpy, std::memcmp
+#include <iostream>
+#include <cstring>
 #include <fstream>
 #include "../utils/sha256.h"
 
 namespace CortexAICompression {
 
-// Helper function to read basic types from the stream
+/**
+ * @brief Read binary data of basic types from input stream
+ * @tparam T Type of data to read (must be trivially copyable)
+ * @param stream Input stream to read from
+ * @param value Reference to store the read value
+ * @return True if read successful, false otherwise
+ */
 template<typename T>
 bool readBasicType(std::istream& stream, T& value) {
     stream.read(reinterpret_cast<char*>(&value), sizeof(T));
     return stream.good();
 }
 
-// Helper function to read string (length prefixed)
+/**
+ * @brief Read length-prefixed string from input stream
+ * @param stream Input stream to read from
+ * @param str Reference to string to populate
+ * @return True if read successful, false otherwise
+ */
 bool readString(std::istream& stream, std::string& str) {
     uint32_t len;
     if (!readBasicType(stream, len)) {
@@ -431,6 +459,25 @@ ModelSegment AIDecompressor::decompressSegment(const std::string& archivePath, c
     segment.output_shape = segmentInfo.output_shape;
 
     return segment;
+}
+
+std::vector<std::byte> AIDecompressor::readCompressedBytes(const std::string& archivePath, const CompressedSegmentHeader& segmentInfo, uint64_t offset) {
+    std::ifstream stream(archivePath, std::ios::binary);
+    if (!stream) {
+        throw CompressionError("Failed to open archive for raw segment read: " + archivePath);
+    }
+
+    stream.seekg(offset);
+    if (!stream) {
+        throw CompressionError("Failed to seek to offset for segment: " + segmentInfo.name);
+    }
+
+    std::vector<std::byte> compressedData(segmentInfo.compressed_size);
+    stream.read(reinterpret_cast<char*>(compressedData.data()), segmentInfo.compressed_size);
+    if (!stream) {
+        throw CompressionError("Failed to read compressed data for segment: " + segmentInfo.name);
+    }
+    return compressedData;
 }
 
 std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveHeaders(std::istream& inputArchiveStream) {

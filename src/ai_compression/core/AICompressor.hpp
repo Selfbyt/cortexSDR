@@ -1,6 +1,14 @@
 #ifndef AI_COMPRESSOR_HPP
 #define AI_COMPRESSOR_HPP
 
+/**
+ * @file AICompressor.hpp
+ * @brief Public API for the AI model compressor and streaming interfaces.
+ *
+ * @details Declares the compressor that converts model artifacts (e.g., ONNX)
+ * into a compressed archive made of typed segments. Exposes streaming hooks,
+ * statistics, and a strategy registry to customize compression behavior.
+ */
 #include "AIModelParser.hpp"
 #include "../strategies/CompressionStrategy.hpp"
 #include "ModelSegment.hpp"
@@ -21,7 +29,9 @@
 
 namespace CortexAICompression {
 
-// Structure to hold compression statistics
+/**
+ * @brief Statistics about a compression run.
+ */
 struct CompressionStats {
     size_t originalSize = 0;
     size_t compressedSize = 0;
@@ -31,7 +41,12 @@ struct CompressionStats {
     size_t numCompressedSegments = 0;
 };
 
-// Represents the compressed archive format structure
+/**
+ * @brief Header describing a single compressed segment in the archive.
+ *
+ * @details Includes original type and size information, chosen strategy ID,
+ * human-readable name, layer linkage, ONNX op type, and true tensor shapes.
+ */
 struct CompressedSegmentHeader {
     SegmentType original_type;
     uint8_t compression_strategy_id;
@@ -46,14 +61,23 @@ struct CompressedSegmentHeader {
     std::vector<size_t> output_shape; // True output tensor shape for the layer (from ONNX graph)
 };
 
-// Interface for handling compressed segments during streaming
+/**
+ * @brief Interface to receive compressed segments during streaming compression.
+ */
 class ICompressionHandler {
 public:
     virtual ~ICompressionHandler() = default;
+    /**
+     * @brief Receive a compressed segment chunk-by-chunk or as a whole.
+     * @param header Segment metadata.
+     * @param compressedData Owned vector containing the compressed bytes.
+     */
     virtual void handleCompressedSegment(const CompressedSegmentHeader& header, const std::vector<std::byte>& compressedData) = 0;
 };
 
-// Thread pool for parallel processing
+/**
+ * @brief Minimal thread pool for parallel compression tasks.
+ */
 class ThreadPool {
 public:
     explicit ThreadPool(size_t numThreads) : stop(false) {
@@ -109,7 +133,9 @@ private:
     bool stop;
 };
 
-// Buffer pool for efficient memory management
+/**
+ * @brief Buffer pool to reduce heap churn during compression.
+ */
 class BufferPool {
 public:
     explicit BufferPool(size_t maxBuffers = 100) : maxBuffers(maxBuffers) {}
@@ -142,26 +168,40 @@ private:
 
 class AICompressor {
 public:
-    // Constructor takes the parser to use.
-    // Strategies can be added or configured.
+    /**
+     * @brief Construct a compressor with a model parser implementation.
+     */
     explicit AICompressor(std::unique_ptr<IAIModelParser> parser);
 
-    // Registers a compression strategy for a specific segment type with a given priority.
-    // Lower priority values are tried first.
-    // Uses shared_ptr to allow multiple segments to potentially use the same strategy instance.
+    /**
+     * @brief Register a compression strategy for a segment type.
+     * @param type Segment type the strategy can handle.
+     * @param priority Lower is tried first.
+     * @param strategy_id Byte identifier persisted in the archive.
+     * @param strategy Shared strategy instance.
+     */
     void registerStrategy(SegmentType type, int priority, uint8_t strategy_id, std::shared_ptr<ICompressionStrategy> strategy);
 
-    // Compresses the model file and writes the bundled archive to the output stream.
-    // Throws ParsingError or CompressionError on failure.
+    /**
+     * @brief Compress a model and write the full archive to a stream.
+     * @throws ParsingError On model parse failure.
+     * @throws CompressionError On strategy failures or I/O errors.
+     */
     void compressModel(const std::string& modelPath, std::ostream& outputArchiveStream);
 
-    // New: Compress model with chunking and streaming
+    /**
+     * @brief Compress model with streaming callbacks per segment.
+     */
     void compressModelStreaming(const std::string& modelPath, ICompressionHandler& handler);
 
-    // New: Set the number of compression threads for parallel processing
+    /**
+     * @brief Configure the number of threads for parallel compression.
+     */
     void setCompressionThreads(size_t numThreads) { numThreads_ = numThreads; }
 
-    // Get compression statistics
+    /**
+     * @brief Access statistics accumulated during compression.
+     */
     const CompressionStats& getCompressionStats() const { return stats_; }
 
 private:
@@ -189,21 +229,21 @@ private:
     // Helper to select the list of appropriate strategies for a segment, ordered by priority
     const std::list<StrategyInfo>* selectStrategies(SegmentType type) const;
 
-    // Helper to write the archive header/index (implementation needed)
+    /** Write archive header/index to the stream. */
     void writeArchiveHeader(std::ostream& stream, const std::vector<CompressedSegmentHeader>& headers);
 
-    // Helper to write a single compressed segment (header + data)
+    /** Write one compressed segment (header + data) to the stream. */
     void writeSegment(std::ostream& stream, const CompressedSegmentHeader& header, const std::vector<std::byte>& compressedData);
 
-    // Helper for sequential compression of a single segment
+    /** Compress one segment sequentially. */
     std::pair<CompressedSegmentHeader, std::vector<std::byte>>
     compressSegment(const ModelSegment& segment) const;
     
-    // Helper for memory-efficient parallel compression of segments
+    /** Compress segments in parallel using the thread and buffer pools. */
     std::vector<std::pair<CompressedSegmentHeader, std::vector<std::byte>>> 
     compressSegmentsParallel(const std::vector<ModelSegment>& segments) const;
 
-    // New optimized methods
+    // Optimized helpers
     std::vector<std::byte> compressSegmentWithBuffer(const ModelSegment& segment, const std::list<StrategyInfo>& strategies);
     void writeCompressedDataOptimized(std::ostream& stream, const std::vector<std::byte>& data);
     uint8_t selectBestStrategy(const ModelSegment& segment, const std::list<StrategyInfo>& strategies);

@@ -1,3 +1,7 @@
+/**
+ * @file MetadataSDRStrategy.hpp
+ * @brief SDR-based reversible encoding for metadata and binary blobs.
+ */
 #ifndef METADATA_SDR_STRATEGY_HPP
 #define METADATA_SDR_STRATEGY_HPP
 
@@ -11,11 +15,9 @@
 namespace CortexAICompression {
 
 /**
- * MetadataSDRStrategy implements a specialized compression strategy for metadata
- * using Sparse Distributed Representations (SDRs) with reversible encoding.
- * 
- * This strategy handles metadata as strings and ensures that the original information
- * can be fully recovered during decompression using a direct SDR encoding approach.
+ * @brief SDR-based reversible encoding for metadata and binary blobs.
+ * @details Encodes textual and binary metadata as sparse index sets enabling
+ * exact reconstruction during decompression.
  */
 class MetadataSDRStrategy : public ICompressionStrategy {
 public:

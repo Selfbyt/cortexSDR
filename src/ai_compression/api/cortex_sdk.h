@@ -137,6 +137,41 @@ CORTEXSDR_API CortexError cortex_inference_engine_set_mode(
 );
 
 /**
+ * Initialize an internal memory pool for large-model inference
+ */
+CORTEXSDR_API CortexError cortex_inference_engine_init_memory_pool(
+    CortexInferenceEngineHandle handle,
+    size_t max_memory_mb
+);
+
+/**
+ * Enable or disable aggressive memory management (cache eviction between layers)
+ */
+CORTEXSDR_API CortexError cortex_inference_engine_enable_aggressive_memory(
+    CortexInferenceEngineHandle handle,
+    int enable
+);
+
+/**
+ * Get current memory usage in bytes (if memory pool is enabled)
+ */
+CORTEXSDR_API CortexError cortex_inference_engine_get_memory_usage(
+    CortexInferenceEngineHandle handle,
+    size_t* bytes
+);
+
+/**
+ * Get last run benchmark stats as JSON (caller must free with cortex_free_string)
+ */
+CORTEXSDR_API CortexError cortex_inference_engine_get_last_run_stats_json(
+    CortexInferenceEngineHandle handle,
+    char** out_json
+);
+
+/** Free strings returned by SDK functions */
+CORTEXSDR_API void cortex_free_string(char* s);
+
+/**
  * Run inference on input data
  * 
  * @param handle The inference engine handle
@@ -179,6 +214,40 @@ CORTEXSDR_API CortexError cortex_inference_engine_free(
  * Get version information
  */
 CORTEXSDR_API const char* cortex_sdk_version();
+
+/* ===== Convenience: Compress While Downloading ===== */
+
+/**
+ * Download a remote model and compress to .sdr in one call.
+ * The URL can be http(s) or a local file path. For http(s), this function
+ * attempts to use an available downloader (curl or wget). On success, the
+ * temporary file is removed.
+ *
+ * @param url_or_path Remote URL (http/https) or local file path to model
+ * @param format Model format hint (e.g., "onnx", "gguf", "tensorflow")
+ * @param output_path Destination .sdr path
+ * @param sparsity SDR sparsity (e.g., 0.02 for 2%)
+ */
+CORTEXSDR_API CortexError cortex_compress_from_url(
+    const char* url_or_path,
+    const char* format,
+    const char* output_path,
+    float sparsity
+);
+
+/* ===== Model Introspection ===== */
+
+/**
+ * Inspect a compressed .sdr archive for tokenizer assets.
+ * If present, sets out_has_tokenizer to 1 and returns a best-effort
+ * tokenizer type string via out_tokenizer_type (owned by caller via cortex_free_string),
+ * such as "sentencepiece", "gpt2-bpe", or "unknown".
+ */
+CORTEXSDR_API CortexError cortex_archive_get_tokenizer_info(
+    const char* archive_path,
+    int* out_has_tokenizer,
+    char** out_tokenizer_type
+);
 
 #ifdef __cplusplus
 }

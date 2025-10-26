@@ -1,9 +1,32 @@
+/**
+ * @file model_converter_cli.cpp
+ * @brief Command-line interface for neural network model format conversion
+ * 
+ * This utility provides command-line access to CortexSDR's model conversion
+ * capabilities, allowing users to convert between various neural network
+ * model formats including PyTorch, TensorFlow, and ONNX.
+ * 
+ * Key Features:
+ * - Multi-format model conversion support
+ * - Command-line interface for batch processing
+ * - Format validation and error reporting
+ * - Integration with external conversion tools
+ * - Comprehensive usage information and examples
+ */
+
 #include "ai_compression/utils/ModelConverter.hpp"
 #include <iostream>
 #include <string>
 
 using namespace CortexAICompression;
 
+/**
+ * @brief Print comprehensive usage information for the model converter
+ * @param programName Name of the executable for usage display
+ * 
+ * Displays detailed usage instructions including supported formats,
+ * command-line syntax, and examples based on compile-time configuration.
+ */
 void printUsage(const char* programName) {
     std::cout << "CortexSDR Model Converter - Convert ML models to ONNX format\n";
     std::cout << "Usage: " << programName << " <input_model> <output_model.onnx> <input_format>\n";

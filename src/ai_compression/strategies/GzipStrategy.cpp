@@ -1,3 +1,7 @@
+/**
+ * @file GzipStrategy.cpp
+ * @brief Implementation of zlib-deflate based compression strategy.
+ */
 #include "GzipStrategy.hpp"
 #include <zlib.h>
 #include <vector>

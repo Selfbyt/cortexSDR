@@ -1,3 +1,7 @@
+/**
+ * @file GGUFModelParser.hpp
+ * @brief Parser for GGUF-format models (e.g., llama.cpp artifacts).
+ */
 #ifndef GGUF_MODEL_PARSER_HPP
 #define GGUF_MODEL_PARSER_HPP
 
@@ -11,16 +15,18 @@
 
 namespace CortexAICompression {
 
-// Parser for GGUF format models (used by llama.cpp and others)
+/**
+ * @brief Parse GGUF models into compression-ready segments.
+ */
 class GGUFModelParser : public IAIModelParser {
 public:
     GGUFModelParser();
     ~GGUFModelParser() override = default;
 
-    // Parse the model into segments without special chunking
+    /** Parse the model into segments without special chunking. */
     std::vector<ModelSegment> parse(const std::string& modelPath) const override;
 
-    // Parse with model-aware chunking for better compression
+    /** Parse with model-aware chunking for better compression. */
     std::vector<ModelSegment> parseWithChunking(const std::string& modelPath) const override;
 
 private:
