@@ -104,57 +104,41 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
     // 3. Read Index Table Entries
     std::vector<CompressedSegmentHeader> headers;
     headers.reserve(numSegments);
-    std::cerr << "DEBUG: Expecting " << numSegments << " segment headers." << std::endl; // DEBUG
     for (uint64_t i = 0; i < numSegments; ++i) {
         CompressedSegmentHeader header;
         uint8_t type_val;
         uint64_t offset; // Read offset, store it temporarily
 
-        std::cerr << "DEBUG: Reading header for segment " << i << "..." << std::endl; // DEBUG
 
         if (!readString(stream, header.name)) {
-             std::cerr << "DEBUG: Failed reading name for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (name).");
         }
-        std::cerr << "  DEBUG Name: " << header.name << " (Length: " << header.name.length() << ")" << std::endl; // DEBUG
 
         if (!readString(stream, header.layer_type)) {
-            std::cerr << "DEBUG: Failed reading layer_type for segment " << i << std::endl; // DEBUG
             throw CompressionError("Failed to read segment header information from index (layer_type).");
         }
-        std::cerr << "  DEBUG Layer Type: " << header.layer_type << std::endl;
 
         if (!readBasicType(stream, type_val)) {
-             std::cerr << "DEBUG: Failed reading type for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (type).");
         }
         header.original_type = static_cast<SegmentType>(type_val);
-         std::cerr << "  DEBUG Type: " << static_cast<int>(header.original_type) << std::endl; // DEBUG
 
         if (!readBasicType(stream, header.compression_strategy_id)) {
-             std::cerr << "DEBUG: Failed reading strategy ID for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (strategy ID).");
         }
-          std::cerr << "  DEBUG Strategy ID: " << static_cast<int>(header.compression_strategy_id) << std::endl; // DEBUG
 
         if (!readBasicType(stream, header.original_size)) {
-             std::cerr << "DEBUG: Failed reading original size for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (original size).");
         }
-         std::cerr << "  DEBUG Original Size: " << header.original_size << std::endl; // DEBUG
 
         if (!readBasicType(stream, header.compressed_size)) {
-             std::cerr << "DEBUG: Failed reading compressed size for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (compressed size).");
         }
-         std::cerr << "  DEBUG Compressed Size: " << header.compressed_size << std::endl; // DEBUG
 
         if (!readBasicType(stream, offset)) // Read offset
         {
-             std::cerr << "DEBUG: Failed reading offset for segment " << i << std::endl; // DEBUG
              throw CompressionError("Failed to read segment header information from index (offset).");
         }
-        std::cerr << "  DEBUG Offset: " << offset << std::endl; // DEBUG
         // Note: The 'offset' read here is part of the header in the file,
         // but CompressedSegmentHeader struct itself doesn't store it as it's implicit in sequential read.
 
@@ -162,7 +146,6 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
         if (!readString(stream, header.layer_name)) {
             throw CompressionError("Failed to read segment header information from index (layer_name).");
         }
-        std::cerr << "  DEBUG Layer Name: " << header.layer_name << std::endl;
 
         // Read layer_index (as uint32_t)
         uint32_t layer_idx_u32;
@@ -170,14 +153,12 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
             throw CompressionError("Failed to read segment header information from index (layer_index).");
         }
         header.layer_index = static_cast<size_t>(layer_idx_u32);
-        std::cerr << "  DEBUG Layer Index: " << header.layer_index << std::endl;
 
         // Read tensor_metadata
         bool has_metadata;
         if (!readBasicType(stream, has_metadata)) {
             throw CompressionError("Failed to read segment header information from index (has_metadata flag).");
         }
-        std::cerr << "  DEBUG Has Metadata: " << (has_metadata ? "true" : "false") << std::endl;
 
         if (has_metadata) {
             header.tensor_metadata.emplace(); // Create the TensorMetadata object
@@ -187,7 +168,6 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
             if (!readBasicType(stream, num_dims)) {
                 throw CompressionError("Failed to read tensor metadata (num_dims).");
             }
-            std::cerr << "    DEBUG Num Dims: " << static_cast<int>(num_dims) << std::endl;
             meta.dimensions.resize(num_dims);
             for (uint8_t d = 0; d < num_dims; ++d) {
                 uint32_t dim_u32;
@@ -195,18 +175,15 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
                     throw CompressionError("Failed to read tensor metadata (dimension value).");
                 }
                 meta.dimensions[d] = static_cast<size_t>(dim_u32);
-                std::cerr << "      DEBUG Dim " << static_cast<int>(d) << ": " << meta.dimensions[d] << std::endl;
             }
 
             if (!readBasicType(stream, meta.sparsity_ratio)) {
                 throw CompressionError("Failed to read tensor metadata (sparsity_ratio).");
             }
-            std::cerr << "    DEBUG Sparsity Ratio: " << meta.sparsity_ratio << std::endl;
 
             if (!readBasicType(stream, meta.is_sorted)) {
                 throw CompressionError("Failed to read tensor metadata (is_sorted).");
             }
-            std::cerr << "    DEBUG Is Sorted: " << (meta.is_sorted ? "true" : "false") << std::endl;
 
             bool has_scale;
             if (!readBasicType(stream, has_scale)) {
@@ -218,7 +195,6 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
                     throw CompressionError("Failed to read tensor metadata (scale value).");
                 }
                 meta.scale = scale_val;
-                std::cerr << "    DEBUG Scale: " << scale_val << std::endl;
             }
 
             bool has_zero_point;
@@ -231,7 +207,6 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
                     throw CompressionError("Failed to read tensor metadata (zero_point value).");
                 }
                 meta.zero_point = zp_val;
-                std::cerr << "    DEBUG Zero Point: " << zp_val << std::endl;
             }
         }
         // Read input_shape
@@ -312,20 +287,9 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
         // 3. Decompress
         try {
             // Print first few bytes of compressed data for debugging
-            std::cerr << "  First 10 bytes of compressed data: ";
-            for (size_t i = 0; i < std::min(size_t(10), compressedData.size()); i++) {
-                std::cerr << std::hex << static_cast<int>(compressedData[i]) << " ";
-            }
-            std::cerr << std::dec << std::endl;
             
             decompressedData = strategy->decompress(compressedData, header.original_type, header.original_size);
             
-            // Print first few bytes of decompressed data for debugging
-            std::cerr << "  First 10 bytes of decompressed data: ";
-            for (size_t i = 0; i < std::min(size_t(10), decompressedData.size()); i++) {
-                std::cerr << std::hex << static_cast<int>(decompressedData[i]) << " ";
-            }
-            std::cerr << std::dec << std::endl;
         } catch (const CompressionError& e) {
             std::cerr << "  Decompression error: " << e.what() << std::endl;
             throw CompressionError("Decompression failed for segment '" + header.name + "': " + e.what());

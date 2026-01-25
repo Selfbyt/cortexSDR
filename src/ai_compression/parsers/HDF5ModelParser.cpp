@@ -210,7 +210,6 @@ std::vector<HDF5ModelParser::HDF5DatasetInfo> HDF5ModelParser::extractDatasetInf
     std::vector<HDF5DatasetInfo> datasets;
     
     try {
-        std::cout << "Opening HDF5 model: " << modelPath << std::endl;
         
         // Open the HDF5 file
         hid_t file_id = H5Fopen(modelPath.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -224,7 +223,6 @@ std::vector<HDF5ModelParser::HDF5DatasetInfo> HDF5ModelParser::extractDatasetInf
         // Close the file
         H5Fclose(file_id);
         
-        std::cout << "Successfully extracted " << datasets.size() << " datasets from HDF5 model" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error extracting HDF5 dataset info: " << e.what() << std::endl;
@@ -271,7 +269,6 @@ std::vector<ModelSegment> HDF5ModelParser::parse(const std::string& modelPath) c
     
 #ifdef ENABLE_HDF5
     try {
-        std::cout << "Parsing HDF5 model: " << modelPath << std::endl;
         
         auto datasetInfos = extractDatasetInfo(modelPath);
         segments.reserve(datasetInfos.size());
@@ -280,7 +277,6 @@ std::vector<ModelSegment> HDF5ModelParser::parse(const std::string& modelPath) c
             segments.push_back(createSegmentFromDataset(datasetInfo));
         }
         
-        std::cout << "Successfully parsed HDF5 model with " << segments.size() << " datasets" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error parsing HDF5 model: " << e.what() << std::endl;

@@ -96,8 +96,6 @@ std::vector<CoreMLModelParser::CoreMLLayerInfo> CoreMLModelParser::extractLayerI
     std::vector<CoreMLLayerInfo> layers;
     
     try {
-        std::cout << "Parsing CoreML model: " << modelPath << std::endl;
-        
         // CoreML models are typically ZIP archives containing protobuf files
         // For now, we'll create a basic parser that extracts the model structure
         
@@ -110,7 +108,6 @@ std::vector<CoreMLModelParser::CoreMLLayerInfo> CoreMLModelParser::extractLayerI
             if (model_data[0] == std::byte{0x50} && model_data[1] == std::byte{0x4B} &&
                 model_data[2] == std::byte{0x03} && model_data[3] == std::byte{0x04}) {
                 
-                std::cout << "Detected CoreML model as ZIP archive" << std::endl;
                 
                 // For now, create a placeholder layer structure
                 // In a full implementation, you would:
@@ -131,11 +128,9 @@ std::vector<CoreMLModelParser::CoreMLLayerInfo> CoreMLModelParser::extractLayerI
                 
                 layers.push_back(std::move(placeholder_layer));
                 
-                std::cout << "Created placeholder layer structure for CoreML model" << std::endl;
                 
             } else {
                 // Not a ZIP file, might be a raw protobuf
-                std::cout << "Model appears to be a raw protobuf file" << std::endl;
                 
                 // Create a basic layer structure
                 CoreMLLayerInfo basic_layer;
@@ -192,8 +187,6 @@ std::vector<ModelSegment> CoreMLModelParser::parse(const std::string& modelPath)
     std::vector<ModelSegment> segments;
     
     try {
-        std::cout << "Parsing CoreML model: " << modelPath << std::endl;
-        
         auto layerInfos = extractLayerInfo(modelPath);
         segments.reserve(layerInfos.size() * 2); // Assume weights and biases per layer
         
@@ -209,7 +202,6 @@ std::vector<ModelSegment> CoreMLModelParser::parse(const std::string& modelPath)
             }
         }
         
-        std::cout << "Successfully parsed CoreML model with " << segments.size() << " segments" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error parsing CoreML model: " << e.what() << std::endl;

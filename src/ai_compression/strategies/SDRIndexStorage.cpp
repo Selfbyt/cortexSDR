@@ -106,12 +106,8 @@ std::vector<std::byte> SDRIndexStorageStrategy::compressIndicesWithDelta(const s
         
         // Use whichever method produces smaller output
         if (deltaCompressed.size() < directCompressed.size()) {
-            std::cerr << "  Using delta encoding (saved " 
-                      << directCompressed.size() - deltaCompressed.size() 
-                      << " bytes)\n";
             return deltaCompressed;
         } else {
-            std::cerr << "  Using direct encoding\n";
             for (size_t index : indices) {
                 encodeVarint(compressedOutput, index);
             }
@@ -231,7 +227,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
             }
         }
         
-        std::cerr << "Successfully decompressed " << indices.size() << " index-value pairs" << std::endl;
         
         return reconstructedData;
     } catch (const std::exception& e) {
@@ -251,16 +246,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
     uint8_t firstByte = static_cast<uint8_t>(compressedData[0]);
     static const std::set<uint8_t> known_flags = {0x90, 0x88, 0xD0, 0x0F, 0x2E, 0x3D};
     if (firstByte >= 0x80 && compressedData.size() > 8) {
-        std::cerr << "Data uses custom format with flag: 0x" 
-                  << std::hex << static_cast<int>(firstByte) << std::dec << std::endl;
-        // Analyze the format header
-        std::cerr << "Format header (first 8 bytes):" << std::endl;
-        std::cerr << std::hex;
-        for (size_t i = 0; i < std::min(size_t(8), compressedData.size()); i++) {
-            std::cerr << std::setw(2) << std::setfill('0') 
-                      << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
-        }
-        std::cerr << std::dec << std::endl;
         // Specialized decoder for different formats we've identified
         if (firstByte == 0x88 && compressedData.size() >= 3 && 
             static_cast<uint8_t>(compressedData[1]) == 0x27 && 
@@ -281,14 +266,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
         } else {
             // Only warn if truly unknown flag
             if (known_flags.count(firstByte) == 0) {
-                std::cerr << "Unknown custom format - detailed analysis (first 32 bytes):" << std::endl;
-                std::cerr << std::hex;
-                for (size_t i = 0; i < std::min(size_t(32), compressedData.size()); i++) {
-                    std::cerr << std::setw(2) << std::setfill('0') 
-                              << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
-                    if ((i + 1) % 8 == 0) std::cerr << std::endl;
-                }
-                std::cerr << std::dec << std::endl;
             }
             // For now, return a reconstructable tensor for the unknown format
             // This is better than crashing but still needs proper implementation
@@ -384,27 +361,15 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
     std::vector<size_t> indices;
     
     // Log compression attempt
-    std::cerr << "Compressing segment '" << segment.name << "' of type " 
-              << static_cast<int>(segment.type) << " with size " 
-              << segment.data.size() << " bytes\n";
     
     // Extract tensor metadata if available
     if (segment.tensor_metadata) {
         const auto& metadata = segment.tensor_metadata.value();
-        std::cerr << "  Tensor dimensions: [";
-        for (size_t i = 0; i < metadata.dimensions.size(); ++i) {
-            std::cerr << metadata.dimensions[i];
-            if (i < metadata.dimensions.size() - 1) std::cerr << ", ";
-        }
-        std::cerr << "]\n";
-        
-        std::cerr << "  Sparsity ratio from metadata: " << metadata.sparsity_ratio << "\n";
     }
     
     // Handle different segment types
     if (segment.type == SegmentType::SPARSE_INDICES) {
         // For sparse indices, just pass through the data
-        std::cerr << "  Processing as sparse indices (pass-through)\n";
         return segment.data;
     } else if (segment.type == SegmentType::MODEL_INPUT || 
                segment.type == SegmentType::MODEL_OUTPUT || 
@@ -412,7 +377,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                segment.type == SegmentType::WEIGHTS_FP16 || 
                segment.isWeightTensor()) {
         
-        std::cerr << "  Processing as tensor data with weight preservation\n";
         try {
             // Use the new weight preservation approach for weight tensors
             if (segment.isWeightTensor()) {
@@ -421,13 +385,8 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                     std::cerr << "  No index-value pairs extracted, compression will fail\n";
                     throw CompressionError("No index-value pairs extracted. Check sparsity or data validity.");
                 }
-                std::cerr << "  Successfully extracted " << indexValuePairs.size() << " index-value pairs\n";
-                
                 // Compress using the new weight preservation method
                 compressedOutput = compressIndicesWithValues(indexValuePairs);
-                std::cerr << "  Compressed " << indexValuePairs.size() << " index-value pairs to " 
-                          << compressedOutput.size() << " bytes (" 
-                          << (compressedOutput.size() * 100.0 / segment.data.size()) << "% of original)\n";
             } else {
                 // For non-weight tensors, use the original approach
                 indices = extractSignificantIndices(segment);
@@ -435,7 +394,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                     std::cerr << "  No indices extracted, compression will fail\n";
                     throw CompressionError("No indices extracted. Check sparsity or data validity.");
                 }
-                std::cerr << "  Successfully extracted " << indices.size() << " indices\n";
             }
         } catch (const std::exception& e) {
             std::cerr << "  Exception during index extraction: " << e.what() << "\n";
@@ -443,8 +401,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         }
     } else if (segment.type == SegmentType::METADATA_JSON) {
         
-        std::cerr << "  Processing metadata with SDR-based compression\n";
-        std::cerr << "  Using sparsity level: " << sparsity_ << "\n";
         
         // Create a temporary ModelSegment with WEIGHTS_FP32 type to use extractSignificantIndices
         ModelSegment tempSegment = segment;
@@ -460,14 +416,12 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                 std::cerr << "  No indices extracted for metadata, compression will fail\n";
                 throw CompressionError("No indices extracted for metadata. Check sparsity or data validity.");
             }
-            std::cerr << "  Successfully extracted " << indices.size() << " indices from metadata\n";
         } catch (const std::exception& e) {
             std::cerr << "  Exception during metadata index extraction: " << e.what() << "\n";
             throw CompressionError(std::string("Failed to extract indices from metadata: ") + e.what());
         }
     } else if (segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
         
-        std::cerr << "  Processing graph structure with special handling\n";
         
         // For graph structure, we need to preserve more information
         // First, check if this is a valid ONNX model structure
@@ -489,7 +443,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         tempSegment.type = SegmentType::WEIGHTS_FP32;
         
         // No need to override sparsity - use what was set via setSparsity() from the CLI parameter
-        std::cerr << "  Using sparsity level: " << sparsity_ << "\n";
         
         try {
             indices = extractSignificantIndices(tempSegment);
@@ -498,7 +451,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                 std::cerr << "  No indices extracted for metadata/graph, compression will fail\n";
                 throw CompressionError("No indices extracted for metadata/graph. Check data validity.");
             }
-            std::cerr << "  Successfully extracted " << indices.size() << " indices from metadata/graph\n";
         } catch (const std::exception& e) {
             std::cerr << "  Exception during metadata/graph index extraction: " << e.what() << "\n";
             throw CompressionError(std::string("Failed to extract indices from metadata/graph: ") + e.what());
@@ -513,9 +465,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         // Compress the indices using delta encoding (for non-weight tensors)
         if (!indices.empty() && compressedOutput.empty()) {
             compressedOutput = compressIndicesWithDelta(indices);
-            std::cerr << "  Compressed " << indices.size() << " indices to " 
-                      << compressedOutput.size() << " bytes (" 
-                      << (compressedOutput.size() * 100.0 / segment.data.size()) << "% of original)\n";
             
             // For metadata, add additional logging
             if (segment.type == SegmentType::METADATA_JSON) {
@@ -752,11 +701,6 @@ std::vector<size_t> SDRIndexStorageStrategy::extractSignificantIndices(const Mod
         sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;
     }
     
-    std::cerr << "Processing segment '" << segment.name << "' with " 
-              << totalElements << " elements (after " << headerSize 
-              << " byte header), targeting " << activeBitsCount 
-              << " active bits (" << sparsityRatio * 100 << "% sparsity)" << std::endl;
-    
     // For float data, extract the most significant values
     if (segment.type == SegmentType::WEIGHTS_FP32 || 
         segment.type == SegmentType::WEIGHTS_FP16) {
@@ -934,11 +878,6 @@ std::vector<std::pair<size_t, float>> SDRIndexStorageStrategy::extractSignifican
         activeBitsCount = MAX_ACTIVE_BITS;
         sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;
     }
-    
-    std::cerr << "Processing segment '" << segment.name << "' with " 
-              << totalElements << " elements (after " << headerSize 
-              << " byte header), targeting " << activeBitsCount 
-              << " active bits (" << sparsityRatio * 100 << "% sparsity)" << std::endl;
     
     // For float data, extract the most significant values with their indices
     if (segment.type == SegmentType::WEIGHTS_FP32 || 

@@ -61,6 +61,13 @@ set(COMMON_SOURCES
     src/ai_compression/api/c_api.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
     src/ai_compression/SparseInferenceEngine.cpp
+    # Optimized Kernels
+    src/ai_compression/kernels/blas_kernels.cpp
+    src/ai_compression/kernels/simd_kernels.cpp
+    src/ai_compression/kernels/conv_kernels.cpp
+    src/ai_compression/kernels/fused_kernels.cpp
+    src/ai_compression/kernels/quantized_kernels.cpp
+    src/ai_compression/kernels/attention_kernels.cpp
 )
 
 # Remove desktop UI and application sources
@@ -91,6 +98,12 @@ option(ENABLE_TENSORFLOW "Enable TensorFlow model conversion support" OFF)
 option(ENABLE_PYTORCH "Enable PyTorch model conversion support" ON)
 option(ENABLE_COREML "Enable CoreML model support" ON)
 option(ENABLE_HDF5 "Enable HDF5/Keras model support" ON)
+
+# Performance optimization options
+option(ENABLE_BLAS "Enable BLAS acceleration for linear algebra" ON)
+option(USE_MKL "Use Intel MKL for BLAS (highest performance)" OFF)
+option(USE_OPENBLAS "Use OpenBLAS for BLAS" ON)
+option(ENABLE_SIMD "Enable SIMD optimizations (SSE/AVX)" ON)
 
 # Set the module path to include our custom FindONNXRuntime.cmake module
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -165,6 +178,61 @@ if(ENABLE_HDF5)
     endif()
 endif()
 # --- End HDF5 Configuration ---
+
+# --- BLAS Configuration for Performance ---
+if(ENABLE_BLAS)
+    if(USE_MKL)
+        # Intel MKL provides best performance
+        find_package(MKL)
+        if(MKL_FOUND)
+            add_definitions(-DUSE_MKL -DENABLE_BLAS)
+            list(APPEND EXTRA_LIBS ${MKL_LIBRARIES})
+            list(APPEND EXTRA_INCLUDES ${MKL_INCLUDE_DIRS})
+            message(STATUS "Using Intel MKL for BLAS: ${MKL_LIBRARIES}")
+            set(BLAS_FOUND TRUE)
+        else()
+            message(WARNING "Intel MKL not found, trying OpenBLAS...")
+            set(USE_MKL OFF)
+            set(USE_OPENBLAS ON)
+        endif()
+    endif()
+    
+    if(USE_OPENBLAS AND NOT BLAS_FOUND)
+        # OpenBLAS is a good open-source alternative
+        find_package(OpenBLAS)
+        if(NOT OpenBLAS_FOUND)
+            # Try pkg-config
+            pkg_check_modules(OpenBLAS openblas)
+        endif()
+        
+        if(OpenBLAS_FOUND)
+            add_definitions(-DUSE_OPENBLAS -DENABLE_BLAS)
+            list(APPEND EXTRA_LIBS ${OpenBLAS_LIBRARIES})
+            list(APPEND EXTRA_INCLUDES ${OpenBLAS_INCLUDE_DIRS})
+            link_directories(${OpenBLAS_LIBRARY_DIRS})
+            message(STATUS "Using OpenBLAS: ${OpenBLAS_LIBRARIES}")
+            set(BLAS_FOUND TRUE)
+        else()
+            message(WARNING "OpenBLAS not found, falling back to standard BLAS...")
+        endif()
+    endif()
+    
+    if(NOT BLAS_FOUND)
+        # Fall back to standard BLAS/LAPACK
+        find_package(BLAS)
+        if(BLAS_FOUND)
+            add_definitions(-DENABLE_BLAS)
+            list(APPEND EXTRA_LIBS ${BLAS_LIBRARIES})
+            message(STATUS "Using standard BLAS: ${BLAS_LIBRARIES}")
+            set(BLAS_FOUND TRUE)
+        else()
+            message(WARNING "No BLAS library found. Performance will be degraded.")
+            message(WARNING "Install OpenBLAS with: sudo dnf install openblas openblas-devel")
+            set(ENABLE_BLAS OFF)
+        endif()
+    endif()
+endif()
+# --- End BLAS Configuration ---
 
 # Check for TensorFlow if enabled
 if(ENABLE_TENSORFLOW)

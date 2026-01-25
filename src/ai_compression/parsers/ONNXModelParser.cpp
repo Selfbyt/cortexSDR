@@ -329,14 +329,7 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         throw std::runtime_error("Failed to parse model file using Protobuf");
     }
     
-    std::cout << "Successfully parsed ONNX model using Protobuf" << std::endl;
-    std::cout << "Model IR Version: " << model_proto.ir_version() << std::endl;
     if (!model_proto.producer_name().empty()) {
-        std::cout << "Producer: " << model_proto.producer_name();
-        if (!model_proto.producer_version().empty()) {
-            std::cout << " (" << model_proto.producer_version() << ")";
-        }
-        std::cout << std::endl;
     }
     
     // Process model metadata with ultra-aggressive compression
@@ -366,7 +359,6 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         );
         meta_segment.original_size = meta_segment.data.size();
         segments.push_back(std::move(meta_segment));
-        std::cout << "Added metadata segment (" << meta_segment.original_size << " bytes)." << std::endl;
     }
     
     // Process graph structure
@@ -410,36 +402,21 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         }
 
     // Debug output
-    std::cout << "Minimal ModelProto state before serialization:" << std::endl;
-    std::cout << "  IR Version: " << minimal_model.ir_version() << std::endl;
-    std::cout << "  Producer: " << minimal_model.producer_name() << " (" << minimal_model.producer_version() << ")" << std::endl;
-    std::cout << "  Domain: " << minimal_model.domain() << std::endl;
-    std::cout << "  Model Version: " << minimal_model.model_version() << std::endl;
-    std::cout << "  Opset Imports: " << minimal_model.opset_import_size() << std::endl;
-    std::cout << "  Has Graph: " << (minimal_model.has_graph() ? "yes" : "no") << std::endl;
     if (minimal_model.has_graph()) {
         const auto& graph = minimal_model.graph();
-        std::cout << "  Graph Name: " << graph.name() << std::endl;
-        std::cout << "  Nodes: " << graph.node_size() << std::endl;
-        std::cout << "  Inputs: " << graph.input_size() << std::endl;
-        std::cout << "  Outputs: " << graph.output_size() << std::endl;
-        std::cout << "  Initializers: " << graph.initializer_size() << std::endl;
     }
     
     // Try to serialize the minimal model using SerializeToString first
     std::string serialized_data;
     bool success = false;
     try {
-        std::cout << "Attempting SerializeToString on minimal ModelProto..." << std::endl;
         if (minimal_model.SerializeToString(&serialized_data)) {
-            std::cout << "SerializeToString on ModelProto succeeded. Size: " << serialized_data.size() << " bytes." << std::endl;
             success = true;
         } else {
             std::cerr << "SerializeToString on ModelProto failed. Trying GraphProto..." << std::endl;
             // Try serializing just the graph
             serialized_data.clear();
             if (minimal_model.has_graph() && minimal_model.graph().SerializeToString(&serialized_data)) {
-                std::cout << "SerializeToString on GraphProto succeeded. Size: " << serialized_data.size() << " bytes." << std::endl;
                 success = true;
             } else {
                 std::cerr << "SerializeToString on GraphProto also failed." << std::endl;
@@ -454,7 +431,6 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
     );
     graph_segment.original_size = graph_segment.data.size();
     segments.push_back(std::move(graph_segment));
-            std::cout << "Added model structure segment (" << graph_segment.original_size << " bytes)." << std::endl;
         } else {
             std::cerr << "Model structure serialization failed: produced empty data." << std::endl;
         }

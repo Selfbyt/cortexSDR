@@ -661,7 +661,6 @@ CortexError cortex_compress_from_url(
         if (format_str.empty() || format_str == "auto") {
             try {
                 format_str = CortexAICompression::ModelParserFactory::detectFormat(local_path);
-                std::cout << "[SDK] Auto-detected model format: " << format_str << std::endl;
             } catch (const std::exception& e) {
                 // As a fallback, try extension-based guess or default to onnx
                 std::cerr << "[SDK] Format auto-detection failed: " << e.what() << ". Assuming ONNX." << std::endl;

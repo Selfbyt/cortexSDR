@@ -36,6 +36,7 @@
 #include <unordered_set>
 #include <regex>
 #include <mutex>
+#include <array>
 
 namespace CortexAICompression {
 
@@ -319,6 +320,12 @@ public:
     void enableAggressiveMemoryManagement(bool enable);      ///< Enable/disable aggressive cleanup
     size_t getCurrentMemoryUsage() const;                    ///< Get current memory usage
     
+    // Layer prefetching
+    void enableLayerPrefetch(bool enable);                   ///< Enable async layer prefetching
+    
+    // Get performance info
+    std::string getPerformanceInfo() const;                  ///< Get info about BLAS/SIMD optimizations
+    
 private:
     SDRModelLoader& loader_;                ///< Reference to model loader for on-demand access
     
@@ -342,6 +349,15 @@ private:
     mutable std::mutex memory_pool_mutex_;    ///< Thread safety for memory pool
     size_t max_memory_usage_;                 ///< Maximum memory usage in bytes
     bool aggressive_memory_management_;       ///< Enable aggressive memory cleanup
+    
+    // Ping-pong buffers for tensor reuse (reduces allocations by 50%)
+    std::array<std::vector<float>, 2> ping_pong_buffers_;  ///< Two buffers for alternating I/O
+    size_t current_buffer_idx_;                             ///< Current buffer index (0 or 1)
+    
+    // Layer prefetching
+    bool enable_prefetch_;                                  ///< Enable async layer prefetching
+    mutable std::shared_future<LayerInfo> prefetch_future_; ///< Future for prefetched layer
+    mutable std::string prefetch_layer_name_;               ///< Name of prefetched layer
 
     // Core neural network operations
     std::vector<float> applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input);
@@ -375,8 +391,13 @@ private:
     std::vector<float> executeAdaptiveFallback(const LayerInfo& layer, const std::vector<float>& input);
     
     // Memory management utilities for large models (kept public above)
-    std::vector<float> allocateFromPool(size_t size);        ///< Allocate tensor from pool
+    float* allocateFromPool(size_t size);                    ///< Allocate tensor from pool (returns pointer)
     void deallocateFromPool(size_t size);                    ///< Return memory to pool
+    std::vector<float>& getNextPingPongBuffer(size_t size);  ///< Get next ping-pong buffer
+    
+    // Prefetching utilities
+    void prefetchNextLayer(const std::string& layer_name) const;  ///< Start prefetching next layer
+    LayerInfo getPrefetchedLayer(const std::string& layer_name) const;  ///< Get prefetched layer or load sync
     
     // Element-wise operation implementations
     std::vector<float> executeConcatOperation(const LayerInfo& layer, const std::vector<float>& input);

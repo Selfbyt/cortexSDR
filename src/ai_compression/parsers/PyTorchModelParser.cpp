@@ -133,7 +133,6 @@ bool PyTorchModelParser::isZipFile(const std::string& modelPath) const {
 std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractFromZipArchive(const std::string& modelPath) const {
     std::vector<PyTorchTensorInfo> tensors;
     
-    std::cout << "Detected ZIP archive format (LLaMA-style consolidated.pth)" << std::endl;
     
     int err = 0;
     zip_t* archive = zip_open(modelPath.c_str(), ZIP_RDONLY, &err);
@@ -156,7 +155,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractFr
                 std::string filename(name);
                 if (filename.find(".pkl") != std::string::npos) {
                     pklFile = filename;
-                    std::cout << "Found pickle file: " << pklFile << std::endl;
                     break;
                 }
             }
@@ -182,7 +180,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractFr
         if (bytes_read != static_cast<zip_int64_t>(pkl_data.size())) {
             throw std::runtime_error("Failed to read complete pickle file");
         }
-        std::cout << "Unpickling model structure..." << std::endl;
         // Use vector-based pickle loader (compatible across libtorch versions)
         torch::IValue iv = torch::pickle_load(pkl_data);
         
@@ -246,7 +243,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractFr
         
         zip_close(archive);
         
-        std::cout << "Successfully loaded ZIP archive with " << tensors.size() << " tensors" << std::endl;
         
     } catch (const std::exception& e) {
         zip_close(archive);
@@ -260,7 +256,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
     std::vector<PyTorchTensorInfo> tensors;
     
     try {
-        std::cout << "Loading PyTorch model from: " << modelPath << std::endl;
         
         // Check if this is a ZIP archive (LLaMA consolidated.pth format)
         if (isZipFile(modelPath)) {
@@ -285,10 +280,8 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
                 tensors.push_back(std::move(tensorInfo));
             }
             
-            std::cout << "Successfully loaded TorchScript model with " << tensors.size() << " parameters" << std::endl;
             
         } catch (const std::exception& e) {
-            std::cout << "Failed to load as TorchScript model, trying as state dict: " << e.what() << std::endl;
             
             // Fallback: try to load as a pickled state dict
             try {
@@ -328,7 +321,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
 
                     walk(std::string(), archive);
                     if (!tensors.empty()) {
-                        std::cout << "Successfully loaded zip-archive state dict with " << tensors.size() << " tensors" << std::endl;
                         return tensors;
                     }
                 } catch (const std::exception& zipe) {
@@ -412,7 +404,6 @@ std::vector<PyTorchModelParser::PyTorchTensorInfo> PyTorchModelParser::extractTe
                     throw std::runtime_error("No tensors found in state dict");
                 }
 
-                std::cout << "Successfully loaded state dict with " << tensors.size() << " tensors" << std::endl;
             } catch (const std::exception& e2) {
                 std::cerr << "Failed to load as state dict: " << e2.what() << std::endl;
                 throw ParsingError("Failed to load PyTorch model in any supported format");
@@ -462,7 +453,6 @@ std::vector<ModelSegment> PyTorchModelParser::parse(const std::string& modelPath
     
 #ifdef ENABLE_PYTORCH
     try {
-        std::cout << "Parsing PyTorch model: " << modelPath << std::endl;
         
         auto tensorInfos = extractTensorInfo(modelPath);
         segments.reserve(tensorInfos.size());
@@ -471,7 +461,6 @@ std::vector<ModelSegment> PyTorchModelParser::parse(const std::string& modelPath
             segments.push_back(createSegmentFromTensor(tensorInfo));
         }
         
-        std::cout << "Successfully parsed PyTorch model with " << segments.size() << " tensors" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error parsing PyTorch model: " << e.what() << std::endl;

@@ -175,7 +175,6 @@ void StreamingCompressor::finalizeArchive() {
     }
     outputFile_.close();
 
-    std::cout << "Archive finalized successfully. Total Segments: " << num_segments << std::endl;
 }
 
 

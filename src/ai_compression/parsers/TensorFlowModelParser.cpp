@@ -120,7 +120,6 @@ std::vector<TensorFlowModelParser::TFVariableInfo> TensorFlowModelParser::extrac
             throw ParsingError("Failed to load TensorFlow SavedModel: " + status.ToString());
         }
         
-        std::cout << "Successfully loaded TensorFlow SavedModel from: " << modelPath << std::endl;
         
         // Get all variables from the session
         std::vector<tensorflow::Tensor> outputs;
@@ -255,7 +254,6 @@ std::vector<ModelSegment> TensorFlowModelParser::parse(const std::string& modelP
     
 #ifdef ENABLE_TENSORFLOW
     try {
-        std::cout << "Parsing TensorFlow SavedModel: " << modelPath << std::endl;
         
         auto variableInfos = extractVariableInfo(modelPath);
         segments.reserve(variableInfos.size());
@@ -265,7 +263,6 @@ std::vector<ModelSegment> TensorFlowModelParser::parse(const std::string& modelP
             segments.push_back(createSegmentFromVariable(varInfo, data));
         }
         
-        std::cout << "Successfully parsed TensorFlow model with " << segments.size() << " variables" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error parsing TensorFlow model: " << e.what() << std::endl;

@@ -41,41 +41,7 @@ public:
 private:
     // Helper method to print segment metadata
     void printSegmentMetadata(const ModelSegment& segment) const {
-        std::cout << "Segment: " << segment.name << std::endl;
-        std::cout << "  Type: " << static_cast<int>(segment.type) << std::endl;
-        std::cout << "  Original Size: " << segment.original_size << " bytes" << std::endl;
-        
-        if (segment.tensor_metadata) {
-            const auto& metadata = segment.tensor_metadata.value();
-            std::cout << "  Tensor Metadata:" << std::endl;
-            std::cout << "    Dimensions: [";
-            for (size_t i = 0; i < metadata.dimensions.size(); ++i) {
-                std::cout << metadata.dimensions[i];
-                if (i < metadata.dimensions.size() - 1) std::cout << ", ";
-            }
-            std::cout << "]" << std::endl;
-            std::cout << "    Sparsity Ratio: " << metadata.sparsity_ratio << std::endl;
-            std::cout << "    Is Sorted: " << (metadata.is_sorted ? "true" : "false") << std::endl;
-            if (metadata.scale) {
-                std::cout << "    Scale: " << metadata.scale.value() << std::endl;
-            }
-            if (metadata.zero_point) {
-                std::cout << "    Zero Point: " << metadata.zero_point.value() << std::endl;
-            }
-        } else {
-            std::cout << "  No tensor metadata available" << std::endl;
-        }
-        
-        if (!segment.layer_name.empty()) {
-            std::cout << "  Layer Name: " << segment.layer_name << std::endl;
-            std::cout << "  Layer Index: " << segment.layer_index << std::endl;
-        }
-        
-        if (!segment.data_format.empty()) {
-            std::cout << "  Data Format: " << segment.data_format << std::endl;
-        }
-        
-        std::cout << std::endl;
+        // Debug output disabled
     }
 
 #ifdef ENABLE_ONNX

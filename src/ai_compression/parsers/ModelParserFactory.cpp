@@ -31,7 +31,6 @@ std::unique_ptr<IAIModelParser> ModelParserFactory::createParser(const std::stri
     // Find the appropriate parser
     auto it = parserRegistry.find(format);
     if (it != parserRegistry.end()) {
-        std::cout << "Creating " << format << " parser for model: " << modelPath << std::endl;
         return it->second();
     }
     
@@ -183,7 +182,6 @@ void ModelParserFactory::initializeRegistry() {
     };
 #endif
 
-    std::cout << "Model parser factory initialized with " << parserRegistry.size() << " parsers" << std::endl;
 }
 
 } // namespace CortexAICompression

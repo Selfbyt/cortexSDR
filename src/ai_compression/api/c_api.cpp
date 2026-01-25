@@ -92,10 +92,8 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         if (!ModelParserFactory::isFormatSupported(format)) {
             // Fallback to ONNX conversion for unsupported formats
             try {
-                std::cout << "Format " << format << " not directly supported, converting to ONNX format..." << std::endl;
                 actualModelPath = ModelConverter::convertToONNX(model_path, format);
                 actualFormat = "onnx";
-                std::cout << "Model successfully converted to ONNX: " << actualModelPath << std::endl;
             } catch (const ModelConversionError& e) {
                 std::cerr << "Warning: " << e.what() << std::endl;
                 std::cerr << "Please convert your model to a supported format manually..." << std::endl;
@@ -294,7 +292,6 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
         inputFile.close();
 
 #if defined(ENABLE_ONNX) && defined(ENABLE_ONNX_PROTOBUF)
-        std::cout << "Attempting ONNX model reconstruction from " << handler.segments.size() << " segments..." << std::endl;
         onnx::ModelProto reconstructed_model_proto;
         onnx::GraphProto* reconstructed_graph_proto = reconstructed_model_proto.mutable_graph();
         const ModelSegment* graph_structure_segment = nullptr;
@@ -314,7 +311,6 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
         }
 
         if (graph_structure_segment) {
-            std::cout << "  Processing model structure segment..." << std::endl;
             
             // Check if the model segment data is all zeros
             bool is_all_zeros = true;
@@ -395,16 +391,8 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
                 
                 // Try to parse as a complete ModelProto first
                 if (reconstructed_model_proto.ParseFromString(model_str)) {
-                    std::cout << "  Successfully parsed complete model structure." << std::endl;
-                    std::cout << "  Model IR Version: " << reconstructed_model_proto.ir_version() << std::endl;
-                    std::cout << "  Model has graph: " << (reconstructed_model_proto.has_graph() ? "yes" : "no") << std::endl;
                     if (reconstructed_model_proto.has_graph()) {
                         const auto& graph = reconstructed_model_proto.graph();
-                        std::cout << "    Graph name: " << (graph.has_name() ? graph.name() : "<unnamed>") << std::endl;
-                        std::cout << "    Inputs: " << graph.input_size() << std::endl;
-                        std::cout << "    Outputs: " << graph.output_size() << std::endl;
-                        std::cout << "    Nodes: " << graph.node_size() << std::endl;
-                        std::cout << "    Initializers: " << graph.initializer_size() << std::endl;
                     }
                     // The graph is already set in the model_proto, no need to do anything else
                 } else {
@@ -510,17 +498,10 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
                         auto* output_type = output_info->mutable_type()->mutable_tensor_type();
                         output_type->set_elem_type(onnx::TensorProto::FLOAT);
                     } else {
-                        std::cout << "  Successfully parsed graph structure." << std::endl;
-                        std::cout << "  Graph name: " << (reconstructed_graph_proto->has_name() ? reconstructed_graph_proto->name() : "<unnamed>") << std::endl;
-                        std::cout << "  Inputs: " << reconstructed_graph_proto->input_size() << std::endl;
-                        std::cout << "  Outputs: " << reconstructed_graph_proto->output_size() << std::endl;
-                        std::cout << "  Nodes: " << reconstructed_graph_proto->node_size() << std::endl;
-                        std::cout << "  Initializers: " << reconstructed_graph_proto->initializer_size() << std::endl;
                     }
                 }
             }
         } else {
-            std::cout << "  Warning: GRAPH_STRUCTURE_PROTO segment not found in archive. Creating minimal valid graph." << std::endl;
             reconstructed_graph_proto->set_name("minimal_graph");
         }
 
@@ -587,7 +568,6 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
 
         // Ensure the model has at least one input and one output
         if (reconstructed_graph_proto->input_size() == 0) {
-            std::cout << "  Adding default input specification..." << std::endl;
             onnx::ValueInfoProto* input = reconstructed_graph_proto->add_input();
             input->set_name("input_0");
             onnx::TypeProto* input_type = input->mutable_type();
@@ -599,7 +579,6 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
         }
 
         if (reconstructed_graph_proto->output_size() == 0) {
-            std::cout << "  Adding default output specification..." << std::endl;
             onnx::ValueInfoProto* output = reconstructed_graph_proto->add_output();
             output->set_name("output_0");
             onnx::TypeProto* output_type = output->mutable_type();
@@ -843,7 +822,6 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
             std::cerr << "  Warning: Serialized model cannot be parsed as a valid ONNX model" << std::endl;
         }
 
-        std::cout << "  Successfully reconstructed model with " 
                   << reconstructed_graph_proto->node_size() << " nodes and "
                   << reconstructed_graph_proto->initializer_size() << " initializers" << std::endl;
 
@@ -858,7 +836,6 @@ CortexError cortex_decompressor_decompress(CortexDecompressorHandle handle,
             }
 
             output_stream.close();
-        std::cout << "Reconstruction complete." << std::endl;
         return {nullptr, 0};
 #else 
         std::string error_msg = "Error: Decompression successful but reconstructing requires ONNX Protobuf support.";

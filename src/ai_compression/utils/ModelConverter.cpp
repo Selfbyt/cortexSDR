@@ -54,13 +54,9 @@ std::string ModelConverter::convertToONNX(const std::string& modelPath, const st
     std::string actualOutputPath = outputPath.empty() ? generateOutputPath(modelPath) : outputPath;
     
     // Provide information about model conversion
-    std::cout << "Model conversion from " << format << " to ONNX format" << std::endl;
-    std::cout << "Input model: " << modelPath << std::endl;
-    std::cout << "Output model: " << actualOutputPath << std::endl;
     
 #ifdef ENABLE_PYTORCH
     if (format == "pytorch") {
-        std::cout << "Using PyTorch to ONNX conversion..." << std::endl;
         
         // Create a Python script to convert the model
         std::string scriptPath = std::filesystem::path(modelPath).parent_path().string() + "/torch_to_onnx_converter.py";
@@ -110,7 +106,6 @@ std::string ModelConverter::convertToONNX(const std::string& modelPath, const st
 
 #ifdef ENABLE_TENSORFLOW
     if (format == "tensorflow") {
-        std::cout << "Using TensorFlow to ONNX conversion..." << std::endl;
         
         // Create a Python script to convert the model
         std::string scriptPath = std::filesystem::path(modelPath).parent_path().string() + "/tf_to_onnx_converter.py";

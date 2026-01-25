@@ -6,6 +6,14 @@ firmware/build/
 firmware/build_test/
 test/build/
 
+# Python build artifacts
+python/dist/
+python/build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+
 # IDE files
 .vscode/
 .idea/

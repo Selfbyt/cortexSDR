@@ -66,14 +66,6 @@ std::vector<size_t> WordEncoding::encodeWord(const std::string& word) {
         indices.push_back(idx);
     }
     
-    // Debug output for first few words
-    if (wordIndex < 5) {
-        std::cout << "[DEBUG-ENCODE] Word '" << normWord << "' (index " << wordIndex << ") fingerprint: ";
-        for (size_t i = 0; i < indices.size(); ++i) {
-            std::cout << indices[i] << " ";
-        }
-        std::cout << std::endl;
-    }
     return indices;
 }
 
@@ -116,14 +108,6 @@ std::string WordEncoding::decodeIndices(const std::vector<size_t>& indices) cons
         }
         fingerprints.push_back(bits);
         
-        // Debug output for first few words
-        if (wordIndex < 5) {
-            std::cout << "[DEBUG-DECODE] Word '" << vocabulary_[wordIndex] << "' (index " << wordIndex << ") fingerprint: ";
-            for (size_t i = 0; i < bits.size(); ++i) {
-                std::cout << bits[i] << " ";
-            }
-            std::cout << std::endl;
-        }
     }
     // Debug: print first 5 windows and their best overlaps
     for (size_t i = 0; i + K <= indices.size() && i < 5 * K; i += K) {
@@ -140,9 +124,6 @@ std::string WordEncoding::decodeIndices(const std::vector<size_t>& indices) cons
                 bestOverlap = overlap;
             }
         }
-        std::cout << "[DEBUG] Window " << (i/K) << ": bestOverlap=" << bestOverlap << ", bestWord=";
-        if (best != -1 && bestOverlap > K/2) std::cout << vocabulary_[best] << std::endl;
-        else std::cout << "<UNK>" << std::endl;
     }
     // SIMPLIFIED DECODING APPROACH
     // With our new direct encoding scheme, we can directly map indices to words

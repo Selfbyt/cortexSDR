@@ -139,9 +139,6 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
                     // If compress succeeds without throwing CompressionError, we're done for this segment
                     header.compression_strategy_id = stratInfo.id;
                     compressionSuccessful = true;
-                     std::cerr << "Successfully compressed segment '" << segment.name
-                               << "' with strategy ID " << static_cast<int>(stratInfo.id)
-                               << " (Priority: " << stratInfo.priority << ")" << std::endl;
                     break; // Exit the strategy loop for this segment
                 } catch (const CompressionError& e) {
                     std::cerr << "Warning: Compression failed for segment '" << segment.name
@@ -256,8 +253,6 @@ AICompressor::compressSegment(const ModelSegment& segment) const {
                 winningStrategyId = stratInfo.id;
                 compressionSuccessful = true;
                 // Log success
-                std::cerr << "Success: Segment '" << segment.name << "', Strategy ID " 
-                          << static_cast<int>(stratInfo.id) << std::endl;
                 break;
             } catch (const CompressionError& e) {
                 // Log failure 
@@ -306,8 +301,6 @@ AICompressor::compressSegmentsParallel(const std::vector<ModelSegment>& segments
         const ModelSegment& segment = segmentRef.get();
         
         if (segment.data.size() >= LARGE_SEGMENT_THRESHOLD) {
-            std::cerr << "Processing large segment '" << segment.name << "' sequentially (" 
-                      << (segment.data.size() / (1024 * 1024)) << " MB)" << std::endl;
             
             // Process large segment sequentially
             auto result = compressSegment(segment);
