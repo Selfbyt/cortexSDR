@@ -68,6 +68,7 @@ set(COMMON_SOURCES
     src/ai_compression/kernels/fused_kernels.cpp
     src/ai_compression/kernels/quantized_kernels.cpp
     src/ai_compression/kernels/attention_kernels.cpp
+    src/ai_compression/kernels/sparse_kernels.cpp
 )
 
 # Remove desktop UI and application sources

@@ -23,6 +23,9 @@
 #include "kernels/fused_kernels.hpp"
 #include "kernels/quantized_kernels.hpp"
 #include "kernels/attention_kernels.hpp"
+#include "kernels/sparse_kernels.hpp"
+#include "utils/fp16_convert.hpp"
+#include "utils/kv_cache.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -52,6 +55,33 @@
 #endif
 
 namespace CortexAICompression {
+
+// Helper function for FP16 to FP32 conversion
+static inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exponent = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+    
+    uint32_t f;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            f = sign << 31;
+        } else {
+            exponent = 1;
+            while ((mantissa & 0x400) == 0) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            mantissa &= 0x3FF;
+            f = (sign << 31) | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1F) {
+        f = (sign << 31) | 0x7F800000 | (mantissa << 13);
+    } else {
+        f = (sign << 31) | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
+    }
+    return *reinterpret_cast<float*>(&f);
+}
 
 /**
  * @brief Decode varint-encoded indices from SDR compressed data.
@@ -207,17 +237,27 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
         if (!layer.raw_data.empty()) {
             layer.biases.resize(num_elements);
              if (model_segment.type == SegmentType::WEIGHTS_FP16) {
-                // TODO: Implement FP16 to FP32 conversion if needed
+                // Convert FP16 to FP32
+                const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
+                for (size_t i = 0; i < num_elements; ++i) {
+                    layer.biases[i] = fp16_to_fp32(fp16_data[i]);
+                }
+            } else {
+                std::memcpy(layer.biases.data(), layer.raw_data.data(), std::min(layer.raw_data.size(), layer.biases.size() * sizeof(float)));
             }
-            std::memcpy(layer.biases.data(), layer.raw_data.data(), layer.raw_data.size());
         }
     } else {
         if (!layer.raw_data.empty()) {
             layer.weights.resize(num_elements);
             if (model_segment.type == SegmentType::WEIGHTS_FP16) {
-                // TODO: Implement FP16 to FP32 conversion if needed
+                // Convert FP16 to FP32
+                const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
+                for (size_t i = 0; i < num_elements; ++i) {
+                    layer.weights[i] = fp16_to_fp32(fp16_data[i]);
+                }
+            } else {
+                std::memcpy(layer.weights.data(), layer.raw_data.data(), std::min(layer.raw_data.size(), layer.weights.size() * sizeof(float)));
             }
-            std::memcpy(layer.weights.data(), layer.raw_data.data(), layer.raw_data.size());
         }
     }
 
@@ -414,8 +454,8 @@ SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
     
     // Log performance optimizations
     std::cout << "[SDRInferenceEngine] Performance optimizations:" << std::endl;
-    std::cout << "  - BLAS: " << Kernels::get_blas_implementation() << std::endl;
-    std::cout << "  - SIMD: " << Kernels::get_simd_level() << std::endl;
+    std::cout << "  - BLAS: " << CortexAICompression::Kernels::get_blas_implementation() << std::endl;
+    std::cout << "  - SIMD: " << CortexAICompression::Kernels::get_simd_level() << std::endl;
 }
 
 /**
@@ -453,39 +493,65 @@ void SDRInferenceEngine::setForceCompressedCompute(bool enable) {
  * @return Output tensor after linear transformation
  */
 std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    if (layer.input_shape.empty() || layer.output_shape.empty()) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Missing input/output shape for linear layer: " << layer.name << std::endl;
+    // Validate shapes
+    try {
+        if (layer.input_shape.empty() || layer.output_shape.empty()) {
+            throw Utils::TensorValidationError("Missing input/output shape for linear layer: " + layer.name);
+        }
+        
+        size_t input_size = 1;
+        for (size_t d : layer.input_shape) input_size *= d;
+        size_t output_size = 1;
+        for (size_t d : layer.output_shape) output_size *= d;
+        
+        Utils::TensorValidator::validate_size(input, layer.input_shape, layer.name + "_input");
+        
+        if (!layer.weights.empty()) {
+            Utils::TensorValidator::validate_linear_weights(
+                layer.weights.size(), input_size, output_size, layer.name
+            );
+        }
+    } catch (const Utils::TensorValidationError& e) {
+        std::cerr << "[SDRInferenceEngine] Validation error: " << e.what() << std::endl;
         return {};
     }
+    
     size_t input_size = 1;
     for (size_t d : layer.input_shape) input_size *= d;
     size_t output_size = 1;
     for (size_t d : layer.output_shape) output_size *= d;
-    if (input.size() != input_size) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size() << " does not match expected " << input_size << " for linear layer: " << layer.name << std::endl;
-        return {};
-    }
     if (force_compressed_compute_ || layer.weights.size() != input_size * output_size) {
-        // Attempt zero-decompression path using compressed SDR payload
+        // OPTIMIZED: Use sparse kernels for zero-decompression inference
         std::vector<float> output(output_size, 0.0f);
         try {
             CortexAICompression::SDRIndexStorageStrategy s;
-            // Iterate (index, value) pairs directly from compressed buffer
-            size_t pair_count = 0;
+            
+            // Collect sparse indices and values for optimized computation
+            std::vector<size_t> indices;
+            std::vector<float> values;
+            indices.reserve(input_size * output_size * 0.05f); // Reserve for ~5% sparsity
+            values.reserve(input_size * output_size * 0.05f);
+            
             s.forEachIndexValue(layer.raw_data, input_size * output_size, [&](size_t flatIndex, float w) {
-                size_t out_i = flatIndex / input_size;
-                size_t in_j  = flatIndex % input_size;
-                if (out_i < output_size && in_j < input_size) {
-                    output[out_i] += w * input[in_j];
-                }
-                ++pair_count;
+                indices.push_back(flatIndex);
+                values.push_back(w);
             });
+            
+            // Use optimized sparse linear forward kernel
+            CortexAICompression::SparseKernels::sparse_linear_forward(
+                indices,
+                values,
+                input.data(),
+                layer.biases.empty() ? nullptr : layer.biases.data(),
+                output.data(),
+                input_size,
+                output_size
+            );
+            
             last_layer_used_compressed_ = true;
-            last_layer_retained_ratio_ = (input_size * output_size) ? (static_cast<double>(pair_count) / static_cast<double>(input_size * output_size)) : 0.0;
-
-            if (!layer.biases.empty()) {
-                Kernels::add(output.data(), layer.biases.data(), output.data(), output_size);
-            }
+            last_layer_retained_ratio_ = (input_size * output_size) ? 
+                (static_cast<double>(indices.size()) / static_cast<double>(input_size * output_size)) : 0.0;
+            
             return output;
         } catch (const std::exception& e) {
             std::cerr << "[SDRInferenceEngine] Compressed linear path failed: " << e.what() << std::endl;
@@ -503,7 +569,7 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
     std::vector<float>& output = getNextPingPongBuffer(output_size);
     
     // Use BLAS-accelerated linear forward: output = input * weights^T + bias
-    Kernels::linear_forward(
+    CortexAICompression::Kernels::linear_forward(
         input.data(),
         layer.weights.data(),
         layer.biases.empty() ? nullptr : layer.biases.data(),
@@ -523,10 +589,23 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
  * @return Output tensor after convolution operation
  */
 std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    if (layer.input_shape.size() != 4 || layer.output_shape.size() != 4 ||
-        layer.properties.kernel_shape.size() != 2 || layer.properties.strides.size() != 2 || 
-        layer.properties.padding.size() != 2) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Invalid or missing shape/params for convolutional layer: " << layer.name << std::endl;
+    // Validate convolution parameters
+    try {
+        if (layer.input_shape.size() != 4 || layer.output_shape.size() != 4 ||
+            layer.properties.kernel_shape.size() != 2 || layer.properties.strides.size() != 2 || 
+            layer.properties.padding.size() != 2) {
+            throw Utils::TensorValidationError("Invalid shape/params for convolutional layer: " + layer.name);
+        }
+        
+        Utils::TensorValidator::validate_conv_params(
+            layer.input_shape, 
+            layer.properties.kernel_shape,
+            layer.properties.strides,
+            layer.properties.padding,
+            layer.name
+        );
+    } catch (const Utils::TensorValidationError& e) {
+        std::cerr << "[SDRInferenceEngine] Validation error: " << e.what() << std::endl;
         return {};
     }
     int batch = layer.input_shape[0];
@@ -614,7 +693,7 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
     // Use optimized im2col + GEMM convolution
     std::vector<float> output(batch * out_channels * out_height * out_width, 0.0f);
     
-    Kernels::conv2d_im2col(
+    CortexAICompression::Kernels::conv2d_im2col(
         input.data(),
         layer.weights.data(),
         layer.biases.empty() ? nullptr : layer.biases.data(),
@@ -676,19 +755,19 @@ std::vector<float> SDRInferenceEngine::applyActivation(const std::string& type, 
     
     // Use SIMD-optimized activation functions
     if (type == "relu") {
-        Kernels::relu(input.data(), output.data(), input.size());
+        CortexAICompression::Kernels::relu(input.data(), output.data(), input.size());
     } else if (type == "leaky_relu") {
-        Kernels::leaky_relu(input.data(), output.data(), input.size(), 0.01f);
+        CortexAICompression::Kernels::leaky_relu(input.data(), output.data(), input.size(), 0.01f);
     } else if (type == "gelu") {
-        Kernels::gelu(input.data(), output.data(), input.size());
+        CortexAICompression::Kernels::gelu(input.data(), output.data(), input.size());
     } else if (type == "swish" || type == "silu") {
-        Kernels::swish(input.data(), output.data(), input.size());
+        CortexAICompression::Kernels::swish(input.data(), output.data(), input.size());
     } else if (type == "sigmoid") {
-        Kernels::sigmoid(input.data(), output.data(), input.size());
+        CortexAICompression::Kernels::sigmoid(input.data(), output.data(), input.size());
     } else if (type == "tanh") {
-        Kernels::tanh_activation(input.data(), output.data(), input.size());
+        CortexAICompression::Kernels::tanh_activation(input.data(), output.data(), input.size());
     } else if (type == "softmax") {
-        Kernels::softmax(input.data(), output.data(), input.size());
+        CortexAICompression::Kernels::softmax(input.data(), output.data(), input.size());
     } else {
         // Unknown activation, pass through
         output = input;
@@ -899,8 +978,11 @@ std::vector<float> SDRInferenceEngine::reshapeTensor(const std::vector<float>& i
  * @return Flattened tensor
  */
 std::vector<float> SDRInferenceEngine::flattenTensor(const std::vector<float>& input) {
-    // Flattening is just returning the input as-is since we store tensors as 1D vectors
-    // In a more sophisticated implementation, we'd handle multi-dimensional indexing
+    // For tensors already in 1D memory layout, flatten is a no-op on data
+    // However, we validate the operation is semantically valid
+    if (!Utils::TensorValidator::is_finite(input)) {
+        std::cerr << "[SDRInferenceEngine] WARNING: Non-finite values detected in flatten operation" << std::endl;
+    }
     return input;
 }
 
@@ -964,6 +1046,7 @@ void SDRInferenceEngine::cleanupMemoryPool() {
     
     std::fill(memory_pool_.begin(), memory_pool_.end(), 0.0f);
     memory_pool_offset_ = 0;
+    free_list_.clear();
 }
 
 /**
@@ -991,10 +1074,47 @@ std::vector<float> SDRInferenceEngine::allocateFromPool(size_t size) {
  * @brief Return memory to pool (simplified - just tracks usage)
  * @param size Number of floats to deallocate
  */
+/**
+ * @brief Deallocate memory from pool by marking block as free
+ * @param ptr Pointer to memory block to deallocate
+ * 
+ * Note: Pass the pointer returned by allocateFromPool, not the size
+ */
+void SDRInferenceEngine::deallocateFromPool(float* ptr) {
+    if (!ptr) return;
+    
+    std::lock_guard<std::mutex> lock(memory_pool_mutex_);
+    
+    // Find the block corresponding to this pointer
+    size_t offset = ptr - memory_pool_.data();
+    
+    for (auto& block : free_list_) {
+        if (block.offset == offset && !block.is_free) {
+            block.is_free = true;
+            
+            // Try to coalesce with adjacent free blocks
+            coalesceFreeBlocks();
+            return;
+        }
+    }
+    
+    std::cerr << "[SDRInferenceEngine] WARNING: Attempted to deallocate unknown block" << std::endl;
+}
+
+/**
+ * @brief Legacy interface for deallocateFromPool (deprecated)
+ */
 void SDRInferenceEngine::deallocateFromPool(size_t size) {
-    // In a simple implementation, we don't actually deallocate
-    // The pool is reset between inference runs
-    // For more sophisticated management, we could implement a free list
+    // Legacy interface - search by size (less efficient)
+    std::lock_guard<std::mutex> lock(memory_pool_mutex_);
+    
+    for (auto& block : free_list_) {
+        if (block.size == size && !block.is_free) {
+            block.is_free = true;
+            coalesceFreeBlocks();
+            return;
+        }
+    }
 }
 
 /**
@@ -1057,31 +1177,90 @@ std::vector<float> SDRInferenceEngine::executeAttentionOperation(const LayerInfo
         }
     }
     
-    // For proper multi-head attention, we need Q, K, V weight matrices
-    // In a full implementation, these would be separate layers loaded beforehand
-    // For now, we perform Q/K/V projections using the layer weights
+    // Full multi-head attention implementation with proper Q, K, V projections
     
     size_t qkv_dim = hidden_dim;  // Assuming same dimension for Q, K, V
+    size_t head_dim = hidden_dim / num_heads;
     
-    // Use the input as Q, K, and V (self-attention)
-    // In practice, these would be separate linear projections
     std::vector<float>& output = getNextPingPongBuffer(input.size());
     
-    // Call optimized multi-head attention kernel
-    Kernels::multi_head_attention(
-        input.data(),  // Query
-        input.data(),  // Key  
-        input.data(),  // Value
-        output.data(),
-        batch_size,
-        seq_len,
-        hidden_dim,
-        num_heads,
-        false  // causal mask - set true for autoregressive generation
-    );
-    
-    // Apply output projection if weights available
-    // (In full implementation, this would be a separate linear layer)
+    // Check if we have separate Q, K, V weight matrices in the layer
+    // Expected weight layout: [Wq | Wk | Wv] concatenated (3 * hidden_dim x hidden_dim)
+    if (!layer.weights.empty() && layer.weights.size() >= 3 * hidden_dim * hidden_dim) {
+        // Project input to Q, K, V
+        std::vector<float> query(input.size());
+        std::vector<float> key(input.size());
+        std::vector<float> value(input.size());
+        
+        // Extract weight matrices
+        const float* Wq = layer.weights.data();
+        const float* Wk = layer.weights.data() + hidden_dim * hidden_dim;
+        const float* Wv = layer.weights.data() + 2 * hidden_dim * hidden_dim;
+        
+        // Project to Q, K, V spaces
+        for (size_t b = 0; b < batch_size; ++b) {
+            for (size_t t = 0; t < seq_len; ++t) {
+                size_t offset = (b * seq_len + t) * hidden_dim;
+                const float* x = input.data() + offset;
+                
+                // Q = x @ Wq^T
+                CortexAICompression::Kernels::gemv(Wq, x, query.data() + offset, 
+                                                    hidden_dim, hidden_dim);
+                // K = x @ Wk^T
+                CortexAICompression::Kernels::gemv(Wk, x, key.data() + offset,
+                                                    hidden_dim, hidden_dim);
+                // V = x @ Wv^T
+                CortexAICompression::Kernels::gemv(Wv, x, value.data() + offset,
+                                                    hidden_dim, hidden_dim);
+            }
+        }
+        
+        // Use Flash Attention if available for memory efficiency
+        CortexAICompression::Kernels::FlashAttentionConfig config;
+        config.use_causal_mask = (layer.properties.activation_type == "causal");
+        
+        CortexAICompression::Kernels::flash_attention_forward(
+            query.data(),
+            key.data(),
+            value.data(),
+            output.data(),
+            batch_size,
+            seq_len,
+            hidden_dim,
+            num_heads,
+            config
+        );
+        
+        // Apply output projection if available
+        if (layer.weights.size() >= 4 * hidden_dim * hidden_dim) {
+            const float* Wo = layer.weights.data() + 3 * hidden_dim * hidden_dim;
+            std::vector<float> temp = output;
+            
+            for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t t = 0; t < seq_len; ++t) {
+                    size_t offset = (b * seq_len + t) * hidden_dim;
+                    CortexAICompression::Kernels::gemv(Wo, temp.data() + offset,
+                                                        output.data() + offset,
+                                                        hidden_dim, hidden_dim);
+                }
+            }
+        }
+    } else {
+        // Fallback: use input as Q, K, V (self-attention without learned projections)
+        std::cerr << "[SDRInferenceEngine] WARNING: No QKV weights found, using input directly" << std::endl;
+        
+        CortexAICompression::Kernels::multi_head_attention(
+            input.data(),  // Query
+            input.data(),  // Key  
+            input.data(),  // Value
+            output.data(),
+            batch_size,
+            seq_len,
+            hidden_dim,
+            num_heads,
+            false  // causal mask
+        );
+    }
     
     return output;
 }
@@ -1103,7 +1282,7 @@ std::vector<float> SDRInferenceEngine::executeNormalizationOperation(const Layer
         std::vector<float>& output = getNextPingPongBuffer(input.size());
         
         if (!layer.properties.bn_weights.empty() && !layer.properties.bn_biases.empty()) {
-            Kernels::layer_norm(
+            CortexAICompression::Kernels::layer_norm(
                 input.data(),
                 output.data(),
                 layer.properties.bn_weights.data(),
@@ -1158,9 +1337,32 @@ std::vector<float> SDRInferenceEngine::executePoolingOperation(const LayerInfo& 
  * @return Output tensor after elementwise operation
  */
 std::vector<float> SDRInferenceEngine::executeElementwiseOperation(const LayerInfo& layer, const std::vector<float>& input) {
+    std::string lower_type = layer.layer_type;
+    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), ::tolower);
     
-    // For elementwise operations, we typically just return the input
-    // In a full implementation, we'd handle operations like Add, Mul, etc.
+    // Route to specific elementwise operation
+    if (lower_type.find("concat") != std::string::npos) {
+        return executeConcatOperation(layer, input);
+    } else if (lower_type.find("add") != std::string::npos || lower_type.find("sum") != std::string::npos) {
+        return executeAddOperation(layer, input);
+    } else if (lower_type.find("sub") != std::string::npos || lower_type.find("subtract") != std::string::npos) {
+        return executeSubOperation(layer, input);
+    } else if (lower_type.find("mul") != std::string::npos || lower_type.find("multiply") != std::string::npos) {
+        return executeMulOperation(layer, input);
+    } else if (lower_type.find("div") != std::string::npos || lower_type.find("divide") != std::string::npos) {
+        return executeDivOperation(layer, input);
+    } else if (lower_type.find("slice") != std::string::npos) {
+        return executeSliceOperation(layer, input);
+    } else if (lower_type.find("reshape") != std::string::npos) {
+        return executeReshapeOperation(layer, input);
+    } else if (lower_type.find("transpose") != std::string::npos) {
+        return executeTransposeOperation(layer, input);
+    } else if (lower_type.find("flatten") != std::string::npos) {
+        return executeFlattenOperation(layer, input);
+    }
+    
+    // Unknown elementwise operation - log and pass through
+    std::cerr << "[SDRInferenceEngine] WARNING: Unknown elementwise operation: " << layer.layer_type << std::endl;
     return input;
 }
 
@@ -1171,9 +1373,51 @@ std::vector<float> SDRInferenceEngine::executeElementwiseOperation(const LayerIn
  * @return Output tensor (pass-through for unknown operations)
  */
 std::vector<float> SDRInferenceEngine::executeAdaptiveFallback(const LayerInfo& layer, const std::vector<float>& input) {
+    // Adaptive fallback with intelligent guessing based on layer properties
     
-    // For unknown operations, we use a pass-through approach
-    // This allows the model to continue running even with unsupported layers
+    // Log the unknown operation for debugging
+    std::cerr << "[SDRInferenceEngine] INFO: Using adaptive fallback for layer: " 
+              << layer.name << " (type: " << layer.layer_type << ")" << std::endl;
+    
+    // Try to infer operation from available data
+    bool has_weights = !layer.weights.empty();
+    bool has_biases = !layer.biases.empty();
+    bool has_valid_shapes = !layer.input_shape.empty() && !layer.output_shape.empty();
+    
+    // Attempt learned transformation if weights are available
+    if (has_weights && has_valid_shapes) {
+        size_t input_size = 1;
+        for (size_t d : layer.input_shape) input_size *= d;
+        size_t output_size = 1;
+        for (size_t d : layer.output_shape) output_size *= d;
+        
+        // If dimensions suggest linear transformation
+        if (layer.weights.size() == input_size * output_size && input.size() == input_size) {
+            std::cerr << "[SDRInferenceEngine] Attempting linear transformation fallback" << std::endl;
+            try {
+                return applyLinearLayer(layer, input);
+            } catch (...) {
+                std::cerr << "[SDRInferenceEngine] Linear fallback failed" << std::endl;
+            }
+        }
+    }
+    
+    // Attempt bias-only transformation
+    if (has_biases && layer.biases.size() == input.size()) {
+        std::cerr << "[SDRInferenceEngine] Applying bias-only transformation" << std::endl;
+        std::vector<float> output = input;
+        for (size_t i = 0; i < output.size(); ++i) {
+            output[i] += layer.biases[i];
+        }
+        return output;
+    }
+    
+    // Last resort: identity transformation with validation
+    if (!Utils::TensorValidator::is_finite(input)) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Non-finite values in fallback layer" << std::endl;
+    }
+    
+    std::cerr << "[SDRInferenceEngine] Using identity transformation (pass-through)" << std::endl;
     return input;
 }
 
@@ -1326,13 +1570,26 @@ std::vector<float> SDRInferenceEngine::runLayersOnDemand(const std::vector<std::
         stat.retained_index_ratio = last_layer_retained_ratio_;
         last_run_stats_.layers.push_back(std::move(stat));
         
+        // Store intermediate tensor for multi-input layers
+        if (execution_graph_) {
+            intermediate_tensors_[layer_name] = current;
+        }
+        
         // Aggressive memory management for large models
         if (aggressive_memory_management_) {
             loader_.clearLayerFromCache(layer_name);
             
+            // Clean up old intermediate tensors that are no longer needed
+            if (execution_graph_) {
+                auto successors = execution_graph_->get_successors(layer_name);
+                if (successors.empty()) {
+                    // This is an output layer, can clean up
+                    intermediate_tensors_.erase(layer_name);
+                }
+            }
+            
             // Force garbage collection every 10 layers for very large models
             if ((i + 1) % 10 == 0) {
-                // Clear any cached intermediate results
                 current.shrink_to_fit();
             }
         }
@@ -1505,10 +1762,33 @@ std::vector<float> SDRInferenceEngine::executeConvolutionalOperation(const Layer
 
 // Element-wise operation implementations
 std::vector<float> SDRInferenceEngine::executeConcatOperation(const LayerInfo& layer, const std::vector<float>& input) {
-    // Concat requires multiple input tensors - this is a limitation of the current API
-    // which only passes one input at a time. For full support, we'd need to modify
-    // the execution graph to track multiple inputs per layer.
-    // For now, pass through as identity operation
+    // Check if layer has multiple inputs defined in execution graph
+    if (execution_graph_) {
+        auto predecessors = execution_graph_->get_predecessors(layer.name);
+        if (predecessors.size() > 1) {
+            // Gather all input tensors
+            std::vector<std::vector<float>> inputs;
+            size_t total_size = 0;
+            
+            for (const auto& pred : predecessors) {
+                auto it = intermediate_tensors_.find(pred);
+                if (it != intermediate_tensors_.end()) {
+                    inputs.push_back(it->second);
+                    total_size += it->second.size();
+                }
+            }
+            
+            // Concatenate along the last dimension (default)
+            std::vector<float> result;
+            result.reserve(total_size);
+            for (const auto& tensor : inputs) {
+                result.insert(result.end(), tensor.begin(), tensor.end());
+            }
+            return result;
+        }
+    }
+    
+    // Single input - pass through
     return input;
 }
 
@@ -1536,8 +1816,29 @@ std::vector<float> SDRInferenceEngine::executeSliceOperation(const LayerInfo& la
 }
 
 std::vector<float> SDRInferenceEngine::executeAddOperation(const LayerInfo& layer, const std::vector<float>& input) {
+    // Check for multi-input add (residual connection)
+    if (execution_graph_) {
+        auto predecessors = execution_graph_->get_predecessors(layer.name);
+        if (predecessors.size() > 1) {
+            // Element-wise addition of multiple inputs
+            std::vector<float> result = input;
+            
+            for (size_t i = 1; i < predecessors.size(); ++i) {
+                auto it = intermediate_tensors_.find(predecessors[i]);
+                if (it != intermediate_tensors_.end()) {
+                    const auto& other = it->second;
+                    if (other.size() == result.size()) {
+                        for (size_t j = 0; j < result.size(); ++j) {
+                            result[j] += other[j];
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+    }
     
-    // Element-wise addition with bias if available
+    // Single input with bias
     std::vector<float> output = input;
     if (!layer.biases.empty() && layer.biases.size() == input.size()) {
         for (size_t i = 0; i < output.size(); ++i) {
@@ -1647,20 +1948,61 @@ std::vector<float>& SDRInferenceEngine::getNextPingPongBuffer(size_t size) {
 }
 
 /**
- * @brief Fixed memory pool allocation that returns pointer instead of copy
+ * @brief Fixed memory pool allocation with free list management
  * @param size Number of floats to allocate
  * @return Pointer to allocated memory in pool
  */
 float* SDRInferenceEngine::allocateFromPool(size_t size) {
     std::lock_guard<std::mutex> lock(memory_pool_mutex_);
     
+    // First, try to find a suitable free block using first-fit strategy
+    for (auto& block : free_list_) {
+        if (block.is_free && block.size >= size) {
+            // Found a suitable block
+            block.is_free = false;
+            
+            // If block is significantly larger, split it
+            if (block.size > size + 64) {  // 64-element minimum split threshold
+                size_t remaining = block.size - size;
+                block.size = size;
+                
+                // Add remaining part back to free list
+                free_list_.emplace_back(block.offset + size, remaining, true);
+            }
+            
+            return memory_pool_.data() + block.offset;
+        }
+    }
+    
+    // No suitable free block found, allocate from end of pool
     if (memory_pool_offset_ + size > memory_pool_.size()) {
         // Pool exhausted, expand it
         size_t new_size = memory_pool_.size() + std::max(size, memory_pool_.size() / 2);
+        if (new_size * sizeof(float) > max_memory_usage_) {
+            // Exceeded memory limit - try to compact free list first
+            compactFreeList();
+            
+            // Check again after compaction
+            if (memory_pool_offset_ + size > memory_pool_.size()) {
+                // Still need more space
+                new_size = std::min(new_size, max_memory_usage_ / sizeof(float));
+                if (memory_pool_offset_ + size > new_size) {
+                    std::cerr << "[SDRInferenceEngine] ERROR: Memory pool exhausted. "
+                              << "Requested: " << size * sizeof(float) / (1024*1024) << "MB, "
+                              << "Available: " << (new_size - memory_pool_offset_) * sizeof(float) / (1024*1024) << "MB"
+                              << std::endl;
+                    return nullptr;
+                }
+            }
+        }
         memory_pool_.resize(new_size, 0.0f);
     }
     
     float* ptr = memory_pool_.data() + memory_pool_offset_;
+    
+    // Add to free list as allocated block
+    free_list_.emplace_back(memory_pool_offset_, size, false);
+    
     memory_pool_offset_ += size;
     
     return ptr;
@@ -1705,11 +2047,79 @@ LayerInfo SDRInferenceEngine::getPrefetchedLayer(const std::string& layer_name) 
 std::string SDRInferenceEngine::getPerformanceInfo() const {
     std::ostringstream oss;
     oss << "Performance Optimizations:\n";
-    oss << "  BLAS: " << Kernels::get_blas_implementation() << "\n";
-    oss << "  SIMD: " << Kernels::get_simd_level() << "\n";
+    oss << "  BLAS: " << CortexAICompression::Kernels::get_blas_implementation() << "\n";
+    oss << "  SIMD: " << CortexAICompression::Kernels::get_simd_level() << "\n";
     oss << "  Prefetch: " << (enable_prefetch_ ? "Enabled" : "Disabled") << "\n";
     oss << "  Ping-pong buffers: Enabled\n";
+    oss << "  Memory pool: " << (memory_pool_.size() * sizeof(float) / (1024*1024)) << " MB\n";
+    oss << "  Free blocks: " << std::count_if(free_list_.begin(), free_list_.end(),
+                                               [](const MemoryBlock& b) { return b.is_free; }) << "\n";
     return oss.str();
+}
+
+/**
+ * @brief Coalesce adjacent free blocks in the free list
+ * 
+ * Merges contiguous free blocks to reduce fragmentation and improve
+ * allocation efficiency. Called automatically after deallocation.
+ */
+void SDRInferenceEngine::coalesceFreeBlocks() {
+    // Sort free list by offset
+    std::sort(free_list_.begin(), free_list_.end(),
+              [](const MemoryBlock& a, const MemoryBlock& b) {
+                  return a.offset < b.offset;
+              });
+    
+    // Merge adjacent free blocks
+    for (size_t i = 0; i < free_list_.size(); ) {
+        if (!free_list_[i].is_free) {
+            ++i;
+            continue;
+        }
+        
+        // Look for adjacent free blocks
+        size_t j = i + 1;
+        while (j < free_list_.size() && 
+               free_list_[j].is_free &&
+               free_list_[i].offset + free_list_[i].size == free_list_[j].offset) {
+            // Merge block j into block i
+            free_list_[i].size += free_list_[j].size;
+            free_list_.erase(free_list_.begin() + j);
+        }
+        
+        ++i;
+    }
+}
+
+/**
+ * @brief Compact the free list and defragment memory pool
+ * 
+ * Removes empty entries and attempts to consolidate allocated memory
+ * to reclaim space at the end of the pool. This is an expensive operation
+ * and should only be called when memory pressure is high.
+ */
+void SDRInferenceEngine::compactFreeList() {
+    coalesceFreeBlocks();
+    
+    // Remove blocks that are beyond current offset
+    free_list_.erase(
+        std::remove_if(free_list_.begin(), free_list_.end(),
+                      [this](const MemoryBlock& block) {
+                          return block.offset >= memory_pool_offset_;
+                      }),
+        free_list_.end()
+    );
+    
+    // If there's a large free block at the end, we can reclaim it
+    if (!free_list_.empty()) {
+        auto& last_block = free_list_.back();
+        if (last_block.is_free && 
+            last_block.offset + last_block.size == memory_pool_offset_) {
+            // Reclaim space
+            memory_pool_offset_ = last_block.offset;
+            free_list_.pop_back();
+        }
+    }
 }
 
 } // namespace CortexAICompression 

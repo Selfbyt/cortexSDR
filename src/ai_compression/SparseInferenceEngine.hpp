@@ -344,9 +344,19 @@ private:
     std::unordered_set<std::string> unhandled_layer_types_;    ///< Types using fallback processing
     
     // Memory management for large models
+    struct MemoryBlock {
+        size_t offset;      // Offset in memory pool
+        size_t size;        // Size of block
+        bool is_free;       // Whether block is available
+        
+        MemoryBlock(size_t o, size_t s, bool f = true) 
+            : offset(o), size(s), is_free(f) {}
+    };
+    
     mutable std::vector<float> memory_pool_;  ///< Pre-allocated memory pool for tensors
     mutable size_t memory_pool_offset_;       ///< Current offset in memory pool
     mutable std::mutex memory_pool_mutex_;    ///< Thread safety for memory pool
+    mutable std::vector<MemoryBlock> free_list_;  ///< Free list for deallocated blocks
     size_t max_memory_usage_;                 ///< Maximum memory usage in bytes
     bool aggressive_memory_management_;       ///< Enable aggressive memory cleanup
     
@@ -358,6 +368,14 @@ private:
     bool enable_prefetch_;                                  ///< Enable async layer prefetching
     mutable std::shared_future<LayerInfo> prefetch_future_; ///< Future for prefetched layer
     mutable std::string prefetch_layer_name_;               ///< Name of prefetched layer
+    
+    // Multi-input support
+    std::unordered_map<std::string, std::vector<float>> intermediate_tensors_;  ///< Cache of intermediate outputs
+    std::unique_ptr<Utils::ExecutionGraph> execution_graph_;                     ///< Optional execution graph
+    std::unique_ptr<Utils::KVCacheManager> kv_cache_manager_;                   ///< KV cache for transformers
+    
+    // Grouped convolution support
+    size_t conv_groups_ = 1;                                ///< Number of groups for grouped conv
 
     // Core neural network operations
     std::vector<float> applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input);
@@ -392,8 +410,13 @@ private:
     
     // Memory management utilities for large models (kept public above)
     float* allocateFromPool(size_t size);                    ///< Allocate tensor from pool (returns pointer)
-    void deallocateFromPool(size_t size);                    ///< Return memory to pool
+    void deallocateFromPool(float* ptr);                     ///< Deallocate memory block from pool
+    void deallocateFromPool(size_t size);                    ///< Legacy: deallocate by size (deprecated)
     std::vector<float>& getNextPingPongBuffer(size_t size);  ///< Get next ping-pong buffer
+    
+    // Internal memory management helpers
+    void coalesceFreeBlocks();                               ///< Merge adjacent free blocks
+    void compactFreeList();                                  ///< Compact and defragment free list
     
     // Prefetching utilities
     void prefetchNextLayer(const std::string& layer_name) const;  ///< Start prefetching next layer
