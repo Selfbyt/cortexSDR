@@ -7,7 +7,6 @@
 #include "GGUFModelParser.hpp"
 #include "TensorFlowModelParser.hpp"
 #include "PyTorchModelParser.hpp"
-#include "CoreMLModelParser.hpp"
 #include "HDF5ModelParser.hpp"
 #include <fstream>
 #include <iostream>
@@ -94,8 +93,6 @@ std::string ModelParserFactory::detectFromExtension(const std::string& modelPath
         return "tensorflow";
     } else if (extension == "pt" || extension == "pth") {
         return "pytorch";
-    } else if (extension == "mlmodel") {
-        return "coreml";
     } else if (extension == "h5" || extension == "hdf5") {
         return "hdf5";
     }
@@ -131,12 +128,6 @@ std::string ModelParserFactory::detectFromContent(const std::string& modelPath) 
             return "hdf5";
         }
         
-        // ZIP files (CoreML models are often ZIP archives)
-        if (magic[0] == 'P' && magic[1] == 'K' && magic[2] == '\x03' && magic[3] == '\x04') {
-            // Could be CoreML, but we need more sophisticated detection
-            return "coreml";
-        }
-        
         // TensorFlow SavedModel files are protobuf
         // PyTorch files have specific structure
         // For now, we'll rely on extension detection for these
@@ -169,12 +160,6 @@ void ModelParserFactory::initializeRegistry() {
         return std::make_unique<PyTorchModelParser>();
     };
 #endif
-
-    // Register CoreML parser (always available as it doesn't require external dependencies)
-    parserRegistry["coreml"] = []() -> std::unique_ptr<IAIModelParser> {
-        return std::make_unique<CoreMLModelParser>();
-    };
-
 #ifdef ENABLE_HDF5
     // Register HDF5 parser
     parserRegistry["hdf5"] = []() -> std::unique_ptr<IAIModelParser> {

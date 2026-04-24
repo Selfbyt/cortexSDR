@@ -13,6 +13,7 @@
 #include <future>
 #include <thread>
 #include <iostream>
+#include <array>
 
 #ifdef ENABLE_ONNX
 // ONNX Runtime headers can be in different locations depending on installation
@@ -66,11 +67,13 @@ private:
 #endif
 #endif
 
+#ifdef ENABLE_ONNX_PROTOBUF
     // New optimized parsing methods
     void processMetadata(const onnx::ModelProto& model_proto, std::vector<ModelSegment>& segments) const;
     void processGraphStructure(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const;
     void processInitializers(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const;
     void processInitializersParallel(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const;
+#endif
 };
 
 } // namespace CortexAICompression

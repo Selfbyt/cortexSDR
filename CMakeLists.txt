@@ -53,7 +53,6 @@ set(COMMON_SOURCES
     src/ai_compression/parsers/ONNXModelParser.cpp
     src/ai_compression/parsers/TensorFlowModelParser.cpp
     src/ai_compression/parsers/PyTorchModelParser.cpp
-    src/ai_compression/parsers/CoreMLModelParser.cpp
     src/ai_compression/parsers/HDF5ModelParser.cpp
     src/ai_compression/parsers/ModelParserFactory.cpp
     src/ai_compression/utils/ModelConverter.cpp
@@ -97,7 +96,6 @@ option(ENABLE_GGUF "Enable GGUF model support" ON)
 option(ENABLE_ONNX "Enable ONNX model support" ON)
 option(ENABLE_TENSORFLOW "Enable TensorFlow model conversion support" OFF)
 option(ENABLE_PYTORCH "Enable PyTorch model conversion support" ON)
-option(ENABLE_COREML "Enable CoreML model support" ON)
 option(ENABLE_HDF5 "Enable HDF5/Keras model support" ON)
 
 # Performance optimization options
@@ -345,7 +343,6 @@ set(SDK_SOURCES
     src/ai_compression/parsers/ONNXModelParser.cpp
     src/ai_compression/parsers/TensorFlowModelParser.cpp
     src/ai_compression/parsers/PyTorchModelParser.cpp
-    src/ai_compression/parsers/CoreMLModelParser.cpp
     src/ai_compression/parsers/HDF5ModelParser.cpp
     src/ai_compression/parsers/ModelParserFactory.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc

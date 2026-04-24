@@ -26,7 +26,6 @@ void printUsage(const char* programName) {
     std::cout << "  - gguf: GGUF models (direct support)\n";
     std::cout << "  - tensorflow: TensorFlow SavedModel (.pb files)\n";
     std::cout << "  - pytorch: PyTorch models (.pt/.pth files)\n";
-    std::cout << "  - coreml: CoreML models (.mlmodel files)\n";
     std::cout << "  - hdf5: HDF5/Keras models (.h5 files)\n";
     std::cout << "\nNote: All formats are compressed using the same SDR-based compression strategies.\n";
     std::cout << "\nOptions:\n";
