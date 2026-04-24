@@ -14,7 +14,7 @@
  * - Streaming compression for large models
  * - Parallel processing for performance optimization
  * - Comprehensive error handling and validation
- * - SHA-256 integrity verification
+ * - Streaming-friendly archive layout with indexed random access
  */
 
 #include "AICompressor.hpp"
@@ -92,9 +92,6 @@ const std::list<AICompressor::StrategyInfo>* AICompressor::selectStrategies(Segm
 
 
 void AICompressor::compressModel(const std::string& modelPath, std::ostream& outputArchiveStream) {
-    // NOTE: This non-streaming version needs updating to use the new strategy selection logic
-    // if it's intended to be used. For now, focusing on the streaming version used by the C API.
-    // Consider deprecating or updating this method.
     // Reset statistics
     stats_ = CompressionStats();
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -127,6 +124,9 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         header.layer_type = segment.layer_type;
         header.input_shape = segment.input_shape;
         header.output_shape = segment.output_shape;
+        header.tensor_metadata = segment.tensor_metadata;
+        header.layer_name = segment.layer_name;
+        header.layer_index = segment.layer_index;
 
         const auto* strategies = selectStrategies(segment.type);
         std::vector<std::byte> compressedData;
@@ -165,59 +165,84 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         compressedDatas.push_back(std::move(compressedData));
     }
 
-    // 3. Write archive header and index
-    // Write Magic Number & Version
+    // 3. Write archive header placeholders matching the streaming archive format
     outputArchiveStream.write(ARCHIVE_MAGIC, sizeof(ARCHIVE_MAGIC));
     writeBasicType(outputArchiveStream, ARCHIVE_VERSION);
-
-    // Write Number of Segments
-    uint32_t numSegments = static_cast<uint32_t>(headers.size());
+    uint64_t numSegments = static_cast<uint64_t>(headers.size());
+    uint64_t indexOffsetPlaceholder = 0;
     writeBasicType(outputArchiveStream, numSegments);
+    writeBasicType(outputArchiveStream, indexOffsetPlaceholder);
 
-    // Calculate initial offset for the first data block (after magic, version, count, and index table)
-    uint64_t currentOffset = sizeof(ARCHIVE_MAGIC) + sizeof(ARCHIVE_VERSION) + sizeof(numSegments);
-    // Calculate size of the index table itself
-    uint64_t indexTableSize = 0;
-    for (const auto& header : headers) {
-        indexTableSize += sizeof(uint32_t) + header.name.length(); // Name length + name (now uint32_t)
-        indexTableSize += sizeof(uint32_t) + segments[&header - &headers[0]].layer_type.length(); // Layer type string (now uint32_t)
-        indexTableSize += sizeof(uint8_t); // Original Type
-        indexTableSize += sizeof(uint8_t); // Strategy ID
-        indexTableSize += sizeof(uint64_t); // Original Size
-        indexTableSize += sizeof(uint64_t); // Compressed Size
-        indexTableSize += sizeof(uint64_t); // Offset
-    }
-    currentOffset += indexTableSize;
-
-    // Write Index Table Entries
-    std::vector<uint64_t> dataOffsets;
-    dataOffsets.reserve(headers.size());
+    // 4. Write compressed payloads first and record offsets
     for (size_t i = 0; i < headers.size(); ++i) {
-        dataOffsets.push_back(currentOffset);
-        currentOffset += headers[i].compressed_size; // Update offset for the *next* block
-
-        writeString(outputArchiveStream, headers[i].name);
-        writeString(outputArchiveStream, segments[i].layer_type);
-        uint8_t type_val = static_cast<uint8_t>(headers[i].original_type);
-        writeBasicType(outputArchiveStream, type_val);
-        writeBasicType(outputArchiveStream, headers[i].compression_strategy_id);
-        writeBasicType(outputArchiveStream, headers[i].original_size);
-        writeBasicType(outputArchiveStream, headers[i].compressed_size);
-        writeBasicType(outputArchiveStream, dataOffsets[i]); // Write calculated offset
+        headers[i].data_offset = static_cast<uint64_t>(outputArchiveStream.tellp());
+        outputArchiveStream.write(reinterpret_cast<const char*>(compressedDatas[i].data()), compressedDatas[i].size());
     }
 
-    // 4. Write Compressed Data Blocks and their checksums
-    for (const auto& data : compressedDatas) {
-        outputArchiveStream.write(reinterpret_cast<const char*>(data.data()), data.size());
-        // Compute and write SHA256 checksum for this block
-        CortexAICompression::SHA256 hasher;
-        hasher.update(data);
-        auto digest = hasher.digest();
-        outputArchiveStream.write(reinterpret_cast<const char*>(digest.data()), digest.size());
+    // 5. Write index table at the end, matching StreamingCompressor::finalizeArchive
+    const uint64_t indexOffset = static_cast<uint64_t>(outputArchiveStream.tellp());
+    for (size_t i = 0; i < headers.size(); ++i) {
+        const auto& header = headers[i];
+
+        writeString(outputArchiveStream, header.name);
+        writeString(outputArchiveStream, header.layer_type);
+        writeBasicType(outputArchiveStream, static_cast<uint8_t>(header.original_type));
+        writeBasicType(outputArchiveStream, header.compression_strategy_id);
+        writeBasicType(outputArchiveStream, header.original_size);
+        writeBasicType(outputArchiveStream, header.compressed_size);
+        writeBasicType(outputArchiveStream, header.data_offset);
+        writeString(outputArchiveStream, header.layer_name);
+        writeBasicType(outputArchiveStream, static_cast<uint32_t>(header.layer_index));
+
+        const bool hasMetadata = header.tensor_metadata.has_value();
+        writeBasicType(outputArchiveStream, hasMetadata);
+        if (hasMetadata) {
+            const auto& meta = header.tensor_metadata.value();
+            const uint8_t numDims = static_cast<uint8_t>(meta.dimensions.size());
+            writeBasicType(outputArchiveStream, numDims);
+            for (size_t dim : meta.dimensions) {
+                writeBasicType(outputArchiveStream, static_cast<uint32_t>(dim));
+            }
+            writeBasicType(outputArchiveStream, meta.sparsity_ratio);
+            writeBasicType(outputArchiveStream, meta.is_sorted);
+            const bool hasScale = meta.scale.has_value();
+            writeBasicType(outputArchiveStream, hasScale);
+            if (hasScale) {
+                writeBasicType(outputArchiveStream, meta.scale.value());
+            }
+            const bool hasZeroPoint = meta.zero_point.has_value();
+            writeBasicType(outputArchiveStream, hasZeroPoint);
+            if (hasZeroPoint) {
+                writeBasicType(outputArchiveStream, meta.zero_point.value());
+            }
+        }
+
+        const uint8_t hasInputShape = header.input_shape.empty() ? 0 : 1;
+        writeBasicType(outputArchiveStream, hasInputShape);
+        if (hasInputShape) {
+            const uint8_t numIn = static_cast<uint8_t>(header.input_shape.size());
+            writeBasicType(outputArchiveStream, numIn);
+            for (size_t dim : header.input_shape) {
+                writeBasicType(outputArchiveStream, static_cast<uint32_t>(dim));
+            }
+        }
+
+        const uint8_t hasOutputShape = header.output_shape.empty() ? 0 : 1;
+        writeBasicType(outputArchiveStream, hasOutputShape);
+        if (hasOutputShape) {
+            const uint8_t numOut = static_cast<uint8_t>(header.output_shape.size());
+            writeBasicType(outputArchiveStream, numOut);
+            for (size_t dim : header.output_shape) {
+                writeBasicType(outputArchiveStream, static_cast<uint32_t>(dim));
+            }
+        }
     }
 
-    // 5. Write the archive footer (if any)
-    // For now, just flush the stream
+    // 6. Patch the index offset in the fixed header.
+    outputArchiveStream.seekp(sizeof(ARCHIVE_MAGIC) + sizeof(ARCHIVE_VERSION) + sizeof(numSegments), std::ios::beg);
+    writeBasicType(outputArchiveStream, indexOffset);
+
+    outputArchiveStream.seekp(0, std::ios::end);
     outputArchiveStream.flush();
     
     // Update compression statistics

@@ -83,6 +83,50 @@ static inline float fp16_to_fp32(uint16_t h) {
     return *reinterpret_cast<float*>(&f);
 }
 
+static bool isWeightLikeSegmentType(SegmentType type) {
+    return type == SegmentType::WEIGHTS_FP32 ||
+           type == SegmentType::WEIGHTS_FP16 ||
+           type == SegmentType::WEIGHTS_INT8 ||
+           type == SegmentType::WEIGHTS_INT4 ||
+           type == SegmentType::ATTENTION_WEIGHTS ||
+           type == SegmentType::FEED_FORWARD_WEIGHTS ||
+           type == SegmentType::EMBEDDING_WEIGHTS ||
+           type == SegmentType::LAYER_NORM_WEIGHTS;
+}
+
+static bool isBiasLikeSegmentName(const std::string& segment_name) {
+    return segment_name.find(".bias") != std::string::npos ||
+           segment_name.find("/bias") != std::string::npos ||
+           segment_name.find("_bias") != std::string::npos;
+}
+
+static std::string toLowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static std::string deriveExecutionName(const CompressedSegmentHeader& seg) {
+    if (!seg.layer_name.empty()) {
+        return seg.layer_name;
+    }
+
+    std::string name = seg.name;
+    static const std::array<const char*, 8> suffixes = {
+        ".weight", ".weights", ".bias", "/weight", "/weights", "/bias", "_weight", "_bias"
+    };
+    for (const char* suffix : suffixes) {
+        const std::string suffix_str(suffix);
+        if (name.size() > suffix_str.size() &&
+            name.compare(name.size() - suffix_str.size(), suffix_str.size(), suffix_str) == 0) {
+            name.erase(name.size() - suffix_str.size());
+            break;
+        }
+    }
+    return name;
+}
+
 /**
  * @brief Decode varint-encoded indices from SDR compressed data.
  * @param data Raw compressed byte buffer containing varint-encoded indices.
@@ -219,7 +263,12 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
         layer.output_shape = meta.dimensions;
     }
 
-    layer.raw_data = model_segment.data;
+    if (layer.raw_data.empty()) {
+        layer.raw_data = model_segment.data;
+    }
+    const auto& source_data = model_segment.data;
+    const std::string lower_layer_type = toLowerCopy(layer.layer_type);
+    const bool norm_like = lower_layer_type.find("norm") != std::string::npos;
 
     // Calculate element count based on data type
     size_t num_elements = 0;
@@ -233,30 +282,36 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     }
 
     // Distinguish between weights and biases by name convention
-    if (model_segment.name.find(".bias") != std::string::npos) {
-        if (!layer.raw_data.empty()) {
+    if (isBiasLikeSegmentName(model_segment.name)) {
+        if (!source_data.empty()) {
             layer.biases.resize(num_elements);
              if (model_segment.type == SegmentType::WEIGHTS_FP16) {
                 // Convert FP16 to FP32
-                const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
+                const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
                 for (size_t i = 0; i < num_elements; ++i) {
                     layer.biases[i] = fp16_to_fp32(fp16_data[i]);
                 }
             } else {
-                std::memcpy(layer.biases.data(), layer.raw_data.data(), std::min(layer.raw_data.size(), layer.biases.size() * sizeof(float)));
+                std::memcpy(layer.biases.data(), source_data.data(), std::min(source_data.size(), layer.biases.size() * sizeof(float)));
+            }
+            if (norm_like) {
+                layer.properties.bn_biases = layer.biases;
             }
         }
     } else {
-        if (!layer.raw_data.empty()) {
+        if (!source_data.empty()) {
             layer.weights.resize(num_elements);
             if (model_segment.type == SegmentType::WEIGHTS_FP16) {
                 // Convert FP16 to FP32
-                const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(layer.raw_data.data());
+                const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
                 for (size_t i = 0; i < num_elements; ++i) {
                     layer.weights[i] = fp16_to_fp32(fp16_data[i]);
                 }
             } else {
-                std::memcpy(layer.weights.data(), layer.raw_data.data(), std::min(layer.raw_data.size(), layer.weights.size() * sizeof(float)));
+                std::memcpy(layer.weights.data(), source_data.data(), std::min(source_data.size(), layer.weights.size() * sizeof(float)));
+            }
+            if (norm_like) {
+                layer.properties.bn_weights = layer.weights;
             }
         }
     }
@@ -283,8 +338,7 @@ void SDRModelLoader::loadFromArchive(const std::string& archive_path) {
     try {
         std::ifstream infile(archive_path, std::ios::binary);
         if (!infile) {
-            std::cerr << "[SDRModelLoader] Failed to open archive: " << archive_path << std::endl;
-            return;
+            throw std::runtime_error("[SDRModelLoader] Failed to open archive: " + archive_path);
         }
 
         // Read only headers for on-demand loading efficiency
@@ -314,66 +368,95 @@ LayerInfo SDRModelLoader::loadLayerByName(const std::string& name) const {
  * already in progress or completed, returns the cached future.
  */
 std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::string& name) const {
-    auto it = layer_cache_.find(name);
-    if (it != layer_cache_.end()) {
-        return it->second;
+    {
+        std::lock_guard<std::mutex> lock(layer_cache_mutex_);
+        auto it = layer_cache_.find(name);
+        if (it != layer_cache_.end()) {
+            return it->second;
+        }
     }
 
-    std::packaged_task<LayerInfo()> task([this, name]() {
-        auto seg_it = std::find_if(segments_.begin(), segments_.end(), 
-            [&](const CompressedSegmentHeader& seg) { return seg.name == name; });
-        if (seg_it == segments_.end()) {
+    auto future = std::async(std::launch::async, [this, name]() {
+        std::vector<const CompressedSegmentHeader*> matched_segments;
+        matched_segments.reserve(8);
+
+        for (const auto& seg : segments_) {
+            if ((!seg.layer_name.empty() && seg.layer_name == name) ||
+                (seg.layer_name.empty() && seg.name == name)) {
+                matched_segments.push_back(&seg);
+            }
+        }
+
+        if (matched_segments.empty()) {
+            auto seg_it = std::find_if(segments_.begin(), segments_.end(),
+                [&](const CompressedSegmentHeader& seg) { return seg.name == name; });
+            if (seg_it != segments_.end()) {
+                matched_segments.push_back(&(*seg_it));
+            }
+        }
+
+        if (matched_segments.empty()) {
             throw std::runtime_error("Segment info not found for layer: " + name);
         }
-        const CompressedSegmentHeader& seg_info = *seg_it;
 
-        // Calculate streaming format offset
-        uint64_t offset = sizeof(ARCHIVE_MAGIC) + sizeof(ARCHIVE_VERSION) + sizeof(uint64_t) + sizeof(uint64_t);
-        
-        for (const auto& seg : segments_) {
-            if (seg.name == name) break;
-            offset += seg.compressed_size;
-        }
-
-        // For weight tensors, prefer keeping compressed bytes for streaming compute
         LayerInfo layer;
         layer.name = name;
-        if (seg_info.original_type == SegmentType::WEIGHTS_FP32 ||
-            seg_info.original_type == SegmentType::WEIGHTS_FP16 ||
-            seg_info.original_type == SegmentType::WEIGHTS_INT8 ||
-            seg_info.original_type == SegmentType::WEIGHTS_INT4 ||
-            seg_info.original_type == SegmentType::ATTENTION_WEIGHTS ||
-            seg_info.original_type == SegmentType::FEED_FORWARD_WEIGHTS ||
-            seg_info.original_type == SegmentType::EMBEDDING_WEIGHTS ||
-            seg_info.original_type == SegmentType::LAYER_NORM_WEIGHTS) {
-            // Read compressed payload only; avoid dense inflation
-            std::vector<std::byte> compressedPayload = decompressor_->readCompressedBytes(archive_path_, seg_info, offset);
-            layer.raw_data = std::move(compressedPayload);
-            // Still need shapes/metadata for execution
-            ModelSegment headerOnly;
-            headerOnly.name = seg_info.name;
-            headerOnly.type = seg_info.original_type;
-            headerOnly.original_size = seg_info.original_size;
-            headerOnly.tensor_metadata = seg_info.tensor_metadata;
-            headerOnly.layer_name = seg_info.layer_name;
-            headerOnly.layer_index = seg_info.layer_index;
-            headerOnly.layer_type = seg_info.layer_type;
-            headerOnly.input_shape = seg_info.input_shape;
-            headerOnly.output_shape = seg_info.output_shape;
-            fillLayerInfoFromSegment(headerOnly, layer);
-        } else {
-            // Non-weight tensors or metadata: decompress fully
-            ModelSegment model_segment = decompressor_->decompressSegment(archive_path_, seg_info, offset);
+        bool have_primary_compressed_weights = false;
+
+        for (const auto* seg_ptr : matched_segments) {
+            const auto& seg_info = *seg_ptr;
+            const bool weight_like =
+                seg_info.original_type == SegmentType::WEIGHTS_FP32 ||
+                seg_info.original_type == SegmentType::WEIGHTS_FP16 ||
+                seg_info.original_type == SegmentType::WEIGHTS_INT8 ||
+                seg_info.original_type == SegmentType::WEIGHTS_INT4 ||
+                seg_info.original_type == SegmentType::ATTENTION_WEIGHTS ||
+                seg_info.original_type == SegmentType::FEED_FORWARD_WEIGHTS ||
+                seg_info.original_type == SegmentType::EMBEDDING_WEIGHTS ||
+                seg_info.original_type == SegmentType::LAYER_NORM_WEIGHTS;
+            const bool bias_segment = isBiasLikeSegmentName(seg_info.name);
+
+            if (layer.layer_type.empty() && !seg_info.layer_type.empty()) {
+                layer.layer_type = seg_info.layer_type;
+            }
+            if (seg_info.tensor_metadata) {
+                const auto& meta = seg_info.tensor_metadata.value();
+                if (layer.input_shape.empty() && !meta.dimensions.empty()) {
+                    layer.input_shape = meta.dimensions;
+                }
+                if (layer.output_shape.empty() && !meta.dimensions.empty()) {
+                    layer.output_shape = meta.dimensions;
+                }
+            }
+            if (!seg_info.input_shape.empty()) {
+                layer.input_shape = seg_info.input_shape;
+            }
+            if (!seg_info.output_shape.empty()) {
+                layer.output_shape = seg_info.output_shape;
+            }
+
+            if (weight_like && !bias_segment && !have_primary_compressed_weights) {
+                layer.raw_data = decompressor_->readCompressedBytes(archive_path_, seg_info, seg_info.data_offset);
+                have_primary_compressed_weights = true;
+                continue;
+            }
+
+            ModelSegment model_segment = decompressor_->decompressSegment(
+                archive_path_, seg_info, seg_info.data_offset
+            );
             fillLayerInfoFromSegment(model_segment, layer);
         }
         
         return layer;
-    });
+    }).share();
 
-    std::shared_future<LayerInfo> future = task.get_future();
-    layer_cache_[name] = future;
-    
-    std::thread(std::move(task)).detach();
+    {
+        std::lock_guard<std::mutex> lock(layer_cache_mutex_);
+        auto [it, inserted] = layer_cache_.emplace(name, future);
+        if (!inserted) {
+            return it->second;
+        }
+    }
 
     return future;
 }
@@ -383,6 +466,7 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
  * @param name Layer name to remove from cache.
  */
 void SDRModelLoader::clearLayerFromCache(const std::string& name) const {
+    std::lock_guard<std::mutex> lock(layer_cache_mutex_);
     auto it = layer_cache_.find(name);
     if (it != layer_cache_.end()) {
         layer_cache_.erase(it);
@@ -440,6 +524,21 @@ SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
     op_dispatch_["LINEAR"] = [this](const LayerInfo& l, const std::vector<float>& in) { 
         return applyLinearLayer(l, in); 
     };
+    op_dispatch_["ATTENTION"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeAttentionOperation(l, in);
+    };
+    op_dispatch_["FEED_FORWARD"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return applyLinearLayer(l, in);
+    };
+    op_dispatch_["NORM"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeNormalizationOperation(l, in);
+    };
+    op_dispatch_["EMBEDDING"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return applyLinearLayer(l, in);
+    };
+    op_dispatch_["TOKEN_EMBEDDING"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return applyLinearLayer(l, in);
+    };
     op_dispatch_["BATCH_NORM"] = [this](const LayerInfo& l, const std::vector<float>& in) { 
         return applyBatchNorm(l, in); 
     };
@@ -463,6 +562,11 @@ SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
  * @param size Number of samples to process simultaneously.
  */
 void SDRInferenceEngine::setBatchSize(size_t size) {
+    if (size == 0) {
+        std::cerr << "[SDRInferenceEngine] WARNING: batch size cannot be 0, using 1" << std::endl;
+        batch_size = 1;
+        return;
+    }
     batch_size = size;
 }
 
@@ -493,19 +597,47 @@ void SDRInferenceEngine::setForceCompressedCompute(bool enable) {
  * @return Output tensor after linear transformation
  */
 std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    // Validate shapes
-    try {
-        if (layer.input_shape.empty() || layer.output_shape.empty()) {
-            throw Utils::TensorValidationError("Missing input/output shape for linear layer: " + layer.name);
+    if (layer.input_shape.empty() || layer.output_shape.empty()) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Missing input/output shape for linear layer: " << layer.name << std::endl;
+        return {};
+    }
+
+    size_t input_size = 1;
+    if (layer.input_shape.size() >= 2) {
+        for (size_t i = 1; i < layer.input_shape.size(); ++i) {
+            input_size *= layer.input_shape[i];
         }
-        
-        size_t input_size = 1;
+    } else {
         for (size_t d : layer.input_shape) input_size *= d;
-        size_t output_size = 1;
+    }
+    if (input_size == 0) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Invalid input feature size for linear layer: " << layer.name << std::endl;
+        return {};
+    }
+
+    size_t output_size = 1;
+    if (layer.output_shape.size() >= 2) {
+        for (size_t i = 1; i < layer.output_shape.size(); ++i) {
+            output_size *= layer.output_shape[i];
+        }
+    } else {
         for (size_t d : layer.output_shape) output_size *= d;
-        
-        Utils::TensorValidator::validate_size(input, layer.input_shape, layer.name + "_input");
-        
+    }
+    if (output_size == 0) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Invalid output feature size for linear layer: " << layer.name << std::endl;
+        return {};
+    }
+
+    if (input.size() % input_size != 0) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size()
+                  << " is not divisible by expected per-sample size " << input_size
+                  << " for linear layer: " << layer.name << std::endl;
+        return {};
+    }
+
+    const size_t effective_batch = input.size() / input_size;
+
+    try {
         if (!layer.weights.empty()) {
             Utils::TensorValidator::validate_linear_weights(
                 layer.weights.size(), input_size, output_size, layer.name
@@ -515,14 +647,10 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
         std::cerr << "[SDRInferenceEngine] Validation error: " << e.what() << std::endl;
         return {};
     }
-    
-    size_t input_size = 1;
-    for (size_t d : layer.input_shape) input_size *= d;
-    size_t output_size = 1;
-    for (size_t d : layer.output_shape) output_size *= d;
+
     if (force_compressed_compute_ || layer.weights.size() != input_size * output_size) {
         // OPTIMIZED: Use sparse kernels for zero-decompression inference
-        std::vector<float> output(output_size, 0.0f);
+        std::vector<float> output(effective_batch * output_size, 0.0f);
         try {
             CortexAICompression::SDRIndexStorageStrategy s;
             
@@ -537,16 +665,20 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
                 values.push_back(w);
             });
             
-            // Use optimized sparse linear forward kernel
-            CortexAICompression::SparseKernels::sparse_linear_forward(
-                indices,
-                values,
-                input.data(),
-                layer.biases.empty() ? nullptr : layer.biases.data(),
-                output.data(),
-                input_size,
-                output_size
-            );
+            // Sparse kernel currently operates on one sample at a time.
+            for (size_t b = 0; b < effective_batch; ++b) {
+                const float* input_sample = input.data() + (b * input_size);
+                float* output_sample = output.data() + (b * output_size);
+                CortexAICompression::SparseKernels::sparse_linear_forward(
+                    indices,
+                    values,
+                    input_sample,
+                    layer.biases.empty() ? nullptr : layer.biases.data(),
+                    output_sample,
+                    input_size,
+                    output_size
+                );
+            }
             
             last_layer_used_compressed_ = true;
             last_layer_retained_ratio_ = (input_size * output_size) ? 
@@ -566,7 +698,7 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
     }
     
     // Use ping-pong buffer to reduce allocations
-    std::vector<float>& output = getNextPingPongBuffer(output_size);
+    std::vector<float>& output = getNextPingPongBuffer(effective_batch * output_size);
     
     // Use BLAS-accelerated linear forward: output = input * weights^T + bias
     CortexAICompression::Kernels::linear_forward(
@@ -574,7 +706,7 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
         layer.weights.data(),
         layer.biases.empty() ? nullptr : layer.biases.data(),
         output.data(),
-        batch_size,  // For single sample, batch_size = 1
+        effective_batch,
         input_size,
         output_size
     );
@@ -608,7 +740,7 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
         std::cerr << "[SDRInferenceEngine] Validation error: " << e.what() << std::endl;
         return {};
     }
-    int batch = layer.input_shape[0];
+    int batch = static_cast<int>(layer.input_shape[0]);
     int in_channels = layer.input_shape[1];
     int in_height = layer.input_shape[2];
     int in_width = layer.input_shape[3];
@@ -622,14 +754,21 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
     int out_height = (in_height + 2 * pad_h - kernel_h) / stride_h + 1;
     int out_width = (in_width + 2 * pad_w - kernel_w) / stride_w + 1;
     
-    if (input.size() != static_cast<size_t>(batch * in_channels * in_height * in_width)) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size() << " does not match expected " << (batch * in_channels * in_height * in_width) << " for convolutional layer: " << layer.name << std::endl;
+    const size_t per_sample_size = static_cast<size_t>(in_channels) * static_cast<size_t>(in_height) * static_cast<size_t>(in_width);
+    if (per_sample_size == 0 || input.size() % per_sample_size != 0) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size()
+                  << " is incompatible with convolution input shape for layer: " << layer.name << std::endl;
         return {};
+    }
+    const size_t runtime_batch = input.size() / per_sample_size;
+    if (static_cast<size_t>(batch) != runtime_batch) {
+        std::cerr << "[SDRInferenceEngine] INFO: Using runtime batch " << runtime_batch
+                  << " (metadata batch " << batch << ") for layer: " << layer.name << std::endl;
     }
     const size_t expected_w = out_channels * in_channels * kernel_h * kernel_w;
     if (force_compressed_compute_ || layer.weights.size() != expected_w) {
         // Streaming sparse convolution using compressed weights
-        std::vector<float> output(batch_size * out_channels * out_height * out_width, 0.0f);
+        std::vector<float> output(runtime_batch * out_channels * out_height * out_width, 0.0f);
         try {
             CortexAICompression::SDRIndexStorageStrategy s;
             s.forEachIndexValue(layer.raw_data, expected_w, [&](size_t flatIndex, float w) {
@@ -643,7 +782,7 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
                 size_t kw = rem % kernel_w;
 
                 // Accumulate across batch and spatial positions
-                for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t b = 0; b < runtime_batch; ++b) {
                     for (size_t oh = 0; oh < out_height; ++oh) {
                         int ih = static_cast<int>(oh * stride_h + kh) - static_cast<int>(pad_h);
                         if (ih < 0 || ih >= static_cast<int>(in_height)) continue;
@@ -658,7 +797,7 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
                 }
             });
             if (!layer.biases.empty()) {
-                for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t b = 0; b < runtime_batch; ++b) {
                     for (size_t oc = 0; oc < out_channels; ++oc) {
                         for (size_t oh = 0; oh < out_height; ++oh) {
                             for (size_t ow = 0; ow < out_width; ++ow) {
@@ -691,14 +830,14 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
     }
     
     // Use optimized im2col + GEMM convolution
-    std::vector<float> output(batch * out_channels * out_height * out_width, 0.0f);
+    std::vector<float> output(runtime_batch * out_channels * out_height * out_width, 0.0f);
     
     CortexAICompression::Kernels::conv2d_im2col(
         input.data(),
         layer.weights.data(),
         layer.biases.empty() ? nullptr : layer.biases.data(),
         output.data(),
-        batch,
+        static_cast<int>(runtime_batch),
         in_channels, in_height, in_width,
         out_channels,
         kernel_h, kernel_w,
@@ -717,12 +856,39 @@ std::vector<float> SDRInferenceEngine::applyConvolutionalLayer(const LayerInfo& 
  */
 std::vector<float> SDRInferenceEngine::applyBatchNorm(const LayerInfo& layer, const std::vector<float>& input) {
     if (!layer.properties.use_batch_norm) return input;
+    if (layer.input_shape.size() < 2) {
+        std::cerr << "[SDRInferenceEngine] WARNING: Missing channel dimension for batch norm layer: " << layer.name << std::endl;
+        return input;
+    }
 
     std::vector<float> output = input;
     size_t channels = layer.input_shape[1];
-    size_t spatial_size = input.size() / (batch_size * channels);
+    if (channels == 0) return input;
 
-    for (size_t b = 0; b < batch_size; ++b) {
+    size_t effective_batch = batch_size > 0 ? batch_size : 1;
+    size_t elems_per_batch = channels;
+    if (layer.input_shape.size() > 2) {
+        for (size_t i = 2; i < layer.input_shape.size(); ++i) {
+            elems_per_batch *= layer.input_shape[i];
+        }
+    }
+    if (elems_per_batch > 0 && input.size() % elems_per_batch == 0) {
+        effective_batch = input.size() / elems_per_batch;
+    }
+    if (effective_batch == 0 || input.size() % (effective_batch * channels) != 0) {
+        std::cerr << "[SDRInferenceEngine] ERROR: Invalid batch norm input size for layer: " << layer.name << std::endl;
+        return {};
+    }
+    size_t spatial_size = input.size() / (effective_batch * channels);
+    if (layer.properties.bn_running_mean.size() < channels ||
+        layer.properties.bn_running_var.size() < channels ||
+        layer.properties.bn_weights.size() < channels ||
+        layer.properties.bn_biases.size() < channels) {
+        std::cerr << "[SDRInferenceEngine] WARNING: Incomplete batch norm statistics, using pass-through for layer: " << layer.name << std::endl;
+        return input;
+    }
+
+    for (size_t b = 0; b < effective_batch; ++b) {
         for (size_t c = 0; c < channels; ++c) {
             float mean = layer.properties.bn_running_mean[c];
             float var = layer.properties.bn_running_var[c];
@@ -908,9 +1074,29 @@ std::vector<float> SDRInferenceEngine::applyAvgPool(const std::vector<float>& in
  */
 void SDRInferenceEngine::updateBatchNormStats(const LayerInfo& layer, const std::vector<float>& input) {
     if (!layer.properties.use_batch_norm) return;
+    if (layer.input_shape.size() < 2) return;
 
     size_t channels = layer.input_shape[1];
-    size_t spatial_size = input.size() / (batch_size * channels);
+    if (channels == 0) return;
+    if (layer.properties.bn_running_mean.size() < channels ||
+        layer.properties.bn_running_var.size() < channels) {
+        return;
+    }
+
+    size_t effective_batch = batch_size > 0 ? batch_size : 1;
+    size_t elems_per_batch = channels;
+    if (layer.input_shape.size() > 2) {
+        for (size_t i = 2; i < layer.input_shape.size(); ++i) {
+            elems_per_batch *= layer.input_shape[i];
+        }
+    }
+    if (elems_per_batch > 0 && input.size() % elems_per_batch == 0) {
+        effective_batch = input.size() / elems_per_batch;
+    }
+    if (effective_batch == 0 || input.size() % (effective_batch * channels) != 0) {
+        return;
+    }
+    size_t spatial_size = input.size() / (effective_batch * channels);
     float momentum = 0.1f;
 
     for (size_t c = 0; c < channels; ++c) {
@@ -918,23 +1104,23 @@ void SDRInferenceEngine::updateBatchNormStats(const LayerInfo& layer, const std:
         float var = 0.0f;
 
         // Calculate batch mean
-        for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t b = 0; b < effective_batch; ++b) {
             for (size_t i = 0; i < spatial_size; ++i) {
                 size_t idx = b * channels * spatial_size + c * spatial_size + i;
                 mean += input[idx];
             }
         }
-        mean /= (batch_size * spatial_size);
+        mean /= (effective_batch * spatial_size);
 
         // Calculate batch variance
-        for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t b = 0; b < effective_batch; ++b) {
             for (size_t i = 0; i < spatial_size; ++i) {
                 size_t idx = b * channels * spatial_size + c * spatial_size + i;
                 float diff = input[idx] - mean;
                 var += diff * diff;
             }
         }
-        var /= (batch_size * spatial_size);
+        var /= (effective_batch * spatial_size);
 
         // Update exponential moving averages
         layer.properties.bn_running_mean[c] = (1 - momentum) * layer.properties.bn_running_mean[c] + momentum * mean;
@@ -1050,31 +1236,6 @@ void SDRInferenceEngine::cleanupMemoryPool() {
 }
 
 /**
- * @brief Allocate tensor from memory pool
- * @param size Number of floats to allocate
- * @return Vector view into memory pool
- */
-std::vector<float> SDRInferenceEngine::allocateFromPool(size_t size) {
-    std::lock_guard<std::mutex> lock(memory_pool_mutex_);
-    
-    if (memory_pool_offset_ + size > memory_pool_.size()) {
-        // Pool exhausted, fall back to regular allocation
-        return std::vector<float>(size, 0.0f);
-    }
-    
-    size_t start_offset = memory_pool_offset_;
-    memory_pool_offset_ += size;
-    
-    // Return a view into the memory pool
-    return std::vector<float>(memory_pool_.begin() + start_offset, 
-                             memory_pool_.begin() + start_offset + size);
-}
-
-/**
- * @brief Return memory to pool (simplified - just tracks usage)
- * @param size Number of floats to deallocate
- */
-/**
  * @brief Deallocate memory from pool by marking block as free
  * @param ptr Pointer to memory block to deallocate
  * 
@@ -1123,6 +1284,7 @@ void SDRInferenceEngine::deallocateFromPool(size_t size) {
  */
 void SDRInferenceEngine::enableAggressiveMemoryManagement(bool enable) {
     aggressive_memory_management_ = enable;
+    std::cout << "[SDRInferenceEngine] Aggressive memory management "
               << (enable ? "enabled" : "disabled") << std::endl;
 }
 
@@ -1274,19 +1436,36 @@ std::vector<float> SDRInferenceEngine::executeAttentionOperation(const LayerInfo
 std::vector<float> SDRInferenceEngine::executeNormalizationOperation(const LayerInfo& layer, const std::vector<float>& input) {
     // Check if this is LayerNorm vs BatchNorm
     std::string lower_type = layer.layer_type;
-    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), ::tolower);
+    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
     
     if (lower_type.find("layer_norm") != std::string::npos ||
-        lower_type.find("layernorm") != std::string::npos) {
+        lower_type.find("layernorm") != std::string::npos ||
+        lower_type == "norm") {
         // Use SIMD-optimized LayerNorm
         std::vector<float>& output = getNextPingPongBuffer(input.size());
-        
-        if (!layer.properties.bn_weights.empty() && !layer.properties.bn_biases.empty()) {
+
+        const std::vector<float>& norm_weights =
+            !layer.properties.bn_weights.empty() ? layer.properties.bn_weights : layer.weights;
+        const std::vector<float>& norm_biases =
+            !layer.properties.bn_biases.empty() ? layer.properties.bn_biases : layer.biases;
+
+        if (!norm_weights.empty()) {
+            std::vector<float> zero_biases;
+            const float* bias_ptr = nullptr;
+            if (!norm_biases.empty()) {
+                bias_ptr = norm_biases.data();
+            } else {
+                zero_biases.assign(norm_weights.size(), 0.0f);
+                bias_ptr = zero_biases.data();
+            }
+
             CortexAICompression::Kernels::layer_norm(
                 input.data(),
                 output.data(),
-                layer.properties.bn_weights.data(),
-                layer.properties.bn_biases.data(),
+                norm_weights.data(),
+                bias_ptr,
                 input.size(),
                 1e-5f
             );
@@ -1456,55 +1635,47 @@ std::vector<float> SDRInferenceEngine::runLayer(const LayerInfo& layer, const st
  * sorting to handle common naming conventions (e.g., transformer blocks).
  */
 std::vector<std::string> SDRInferenceEngine::getExecutionOrder(const std::vector<CompressedSegmentHeader>& segments) {
-    std::vector<std::string> layer_names;
-    std::set<std::string> unique_layers;
-    
-    // Extract actual weight segment names directly
+    std::vector<CompressedSegmentHeader> ordered_candidates;
+    ordered_candidates.reserve(segments.size());
+
     for (const auto& seg : segments) {
-        if (seg.original_type == SegmentType::WEIGHTS_FP32 ||
-            seg.original_type == SegmentType::WEIGHTS_FP16 ||
-            seg.original_type == SegmentType::WEIGHTS_INT8) {
-            
-            // Use the actual segment name, not a derived base name
-            unique_layers.insert(seg.name);
+        if (isWeightLikeSegmentType(seg.original_type)) {
+            ordered_candidates.push_back(seg);
         }
     }
-    
-    // Convert set to vector for consistent ordering
-    for (const auto& layer_name : unique_layers) {
-        layer_names.push_back(layer_name);
-    }
-    
-    // Intelligent sorting for neural network layer names
-    std::sort(layer_names.begin(), layer_names.end(), [](const std::string& a, const std::string& b) {
-        auto extract_numbers = [](const std::string& str) -> std::vector<int> {
-            std::vector<int> numbers;
-            std::regex number_regex(R"(\d+)");
-            std::sregex_iterator iter(str.begin(), str.end(), number_regex);
-            std::sregex_iterator end;
-            
-            for (; iter != end; ++iter) {
-                numbers.push_back(std::stoi(iter->str()));
-            }
-            return numbers;
-        };
-        
-        auto nums_a = extract_numbers(a);
-        auto nums_b = extract_numbers(b);
-        
-        if (!nums_a.empty() && !nums_b.empty()) {
-            for (size_t i = 0; i < std::min(nums_a.size(), nums_b.size()); ++i) {
-                if (nums_a[i] != nums_b[i]) {
-                    return nums_a[i] < nums_b[i];
-                }
-            }
-            return nums_a.size() < nums_b.size();
+
+    std::sort(ordered_candidates.begin(), ordered_candidates.end(), [](const CompressedSegmentHeader& a, const CompressedSegmentHeader& b) {
+        const bool a_has_order = !a.layer_name.empty();
+        const bool b_has_order = !b.layer_name.empty();
+        if (a_has_order != b_has_order) {
+            return a_has_order > b_has_order;
         }
-        
-        return a < b;
+        if (a_has_order && b_has_order) {
+            if (a.layer_index != b.layer_index) {
+                return a.layer_index < b.layer_index;
+            }
+            if (a.layer_name != b.layer_name) {
+                return a.layer_name < b.layer_name;
+            }
+        }
+        return a.name < b.name;
     });
-    
+
+    std::vector<std::string> layer_names;
+    layer_names.reserve(ordered_candidates.size());
+    std::unordered_set<std::string> seen;
+    for (const auto& seg : ordered_candidates) {
+        const std::string exec_name = deriveExecutionName(seg);
+        if (!exec_name.empty() && seen.insert(exec_name).second) {
+            layer_names.push_back(exec_name);
+        }
+    }
+
     return layer_names;
+}
+
+std::vector<float> SDRInferenceEngine::runLayers(const std::vector<std::string>& layer_names, const std::vector<float>& input) {
+    return runLayersOnDemand(layer_names, input);
 }
 
 /**
@@ -1622,8 +1793,12 @@ std::vector<float> SDRInferenceEngine::executeDynamicLayer(const LayerInfo& laye
     // Case-insensitive operation detection
     std::string lower_name = layer.name;
     std::string lower_type = layer.layer_type;
-    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), ::tolower);
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
     
     std::string operation = "unknown";
     
@@ -1644,6 +1819,12 @@ std::vector<float> SDRInferenceEngine::executeDynamicLayer(const LayerInfo& laye
              lower_type.find("attention") != std::string::npos ||
              lower_type.find("multihead") != std::string::npos) {
         operation = "attention";
+    }
+    else if (lower_type.find("embedding") != std::string::npos ||
+             lower_name.find("token_embd") != std::string::npos ||
+             lower_name.find("tok_embeddings") != std::string::npos ||
+             lower_name.find("embedding") != std::string::npos) {
+        operation = "linear";
     }
     else if (lower_name.find("ln") != std::string::npos ||
              lower_name.find("norm") != std::string::npos ||
@@ -2122,4 +2303,4 @@ void SDRInferenceEngine::compactFreeList() {
     }
 }
 
-} // namespace CortexAICompression 
+} // namespace CortexAICompression

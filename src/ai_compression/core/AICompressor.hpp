@@ -52,6 +52,7 @@ struct CompressedSegmentHeader {
     uint8_t compression_strategy_id;
     uint64_t original_size;
     uint64_t compressed_size;
+    uint64_t data_offset = 0;
     std::string name;
     std::optional<TensorMetadata> tensor_metadata;
     std::string layer_name;

@@ -191,6 +191,7 @@ private:
     std::vector<LayerInfo> layers; // legacy: all layers loaded
     std::unordered_map<std::string, LayerInfo> layer_map_; // For fast lookup by name
     mutable std::unordered_map<std::string, std::shared_future<LayerInfo>> layer_cache_;
+    mutable std::mutex layer_cache_mutex_;
     std::unique_ptr<AIDecompressor> decompressor_;
     void loadFromArchive(const std::string& archive_path);
     void parseLayerMetadata(const std::string& metadata, LayerInfo& layer);
@@ -248,8 +249,11 @@ public:
     const RunStats& getLastRunStats() const { return last_run_stats_; }
     
     /**
-     * @brief Set batch size for inference operations
-     * @param size Number of samples to process simultaneously
+     * @brief Set optional runtime batch hint for inference operations.
+     * @param size Preferred runtime batch size.
+     *
+     * @details The engine resolves effective batch from runtime input shape first.
+     * This value is only a fallback hint when shapes are ambiguous.
      */
     void setBatchSize(size_t size);
     
@@ -288,9 +292,12 @@ public:
     std::vector<float> runLayers(const std::vector<std::string>& layer_names, const std::vector<float>& input);
     
     /**
-     * @brief Infer an execution order from segment metadata.
+     * @brief Infer execution order from segment metadata, not archive layout.
      * @param segments Model segment headers.
      * @return Ordered list of layer names.
+     *
+     * @details Uses layer index metadata when present and falls back to
+     * deterministic lexical ordering only when metadata is missing.
      */
     std::vector<std::string> getExecutionOrder(const std::vector<CompressedSegmentHeader>& segments);
     

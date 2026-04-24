@@ -73,6 +73,14 @@ ai_compression/
 
 `SparseInferenceEngine` and `SDRModelLoader` enable Ollama-style on-demand layer loading from `.sdr` archives to reduce peak memory usage.
 
+### Execution Order and Batch Semantics
+
+- `.sdr` segment storage order is treated as a storage detail, not execution truth.
+- Inference execution order is derived from segment metadata (`layer_index`, `layer_name`) when available.
+- If metadata is missing, the engine falls back to deterministic lexical ordering as a compatibility path.
+- Runtime batch is resolved from input tensor shape first; configured `setBatchSize()` acts only as a fallback hint.
+- If runtime tensor size is incompatible with layer feature/channel dimensions, inference fails fast with explicit errors.
+
 ## Dependencies
 
 This module requires several external libraries that are not included in the repository due to their size. You need to download and extract them before building the project:

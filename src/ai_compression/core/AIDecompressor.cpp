@@ -10,7 +10,6 @@
  * - Multi-strategy decompression (SDR, RLE, Gzip, Quantization)
  * - On-demand segment loading for memory efficiency
  * - Stream-based decompression for large models  
- * - SHA-256 integrity verification
  * - Header-only reading for metadata access
  * - Parallel decompression support for performance
  */
@@ -22,7 +21,6 @@
 #include <iostream>
 #include <cstring>
 #include <fstream>
-#include "../utils/sha256.h"
 
 namespace CortexAICompression {
 
@@ -139,8 +137,7 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
         {
              throw CompressionError("Failed to read segment header information from index (offset).");
         }
-        // Note: The 'offset' read here is part of the header in the file,
-        // but CompressedSegmentHeader struct itself doesn't store it as it's implicit in sequential read.
+        header.data_offset = offset;
 
         // Read layer_name
         if (!readString(stream, header.layer_name)) {
@@ -260,12 +257,6 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
     if (!stream) {
         throw CompressionError("Failed to read compressed data for segment: " + header.name);
     }
-    // Read stored SHA256 checksum (32 bytes)
-    std::vector<uint8_t> storedChecksum(32);
-    stream.read(reinterpret_cast<char*>(storedChecksum.data()), 32);
-    if (!stream) {
-        throw CompressionError("Failed to read stored checksum for segment: " + header.name);
-    }
 
     // 2. Select Decompression Strategy
     std::vector<std::byte> decompressedData;
@@ -318,17 +309,6 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
     segment.input_shape = header.input_shape;         // Copy input shape
     segment.output_shape = header.output_shape;       // Copy output shape
 
-    // 6. Validate checksum of decompressed data
-    CortexAICompression::SHA256 hasher;
-    hasher.update(segment.data);
-    auto computed = hasher.digest();
-    bool match = (computed == storedChecksum);
-    if (match) {
-        std::cerr << "[Checksum OK] Segment '" << segment.name << "' matches SHA256." << std::endl;
-    } else {
-        std::cerr << "[Checksum FAIL] Segment '" << segment.name << "' does NOT match SHA256!" << std::endl;
-    }
-
     return segment;
 }
 
@@ -338,20 +318,16 @@ void AIDecompressor::decompressModelStream(std::istream& inputArchiveStream, ISe
         throw std::runtime_error("AIDecompressor: Input stream is invalid.");
     }
 
-    // Store the starting position to calculate data offsets relative to it
-    std::streampos indexStartPos = inputArchiveStream.tellg();
-
     // 1. Read Index
     std::vector<CompressedSegmentHeader> headers = readArchiveIndex(inputArchiveStream);
 
-    // The index reading finished here. The stream position is now at the start of the first data block.
-    std::streampos dataStartPos = inputArchiveStream.tellg();
-
     // 2. Process Segments Sequentially
     for (const auto& header : headers) {
-        // Note: The archive format defined in AICompressor writes data sequentially *after* the index.
-        // So, we just read the next block of compressed_size bytes.
-        // If the format stored absolute offsets, we would use inputArchiveStream.seekg() here.
+        inputArchiveStream.clear();
+        inputArchiveStream.seekg(static_cast<std::streamoff>(header.data_offset), std::ios::beg);
+        if (!inputArchiveStream) {
+            throw CompressionError("Failed to seek to segment payload for: " + header.name);
+        }
 
         ModelSegment segment = readAndDecompressSegment(inputArchiveStream, header);
 
