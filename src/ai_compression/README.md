@@ -121,19 +121,6 @@ wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-de
 unzip libtorch-cxx11-abi-shared-with-deps-2.7.0+cpu.zip -d libtorch/
 ```
 
-## Model Conversion
-
-The module includes a model converter tool that can convert models from various formats (TensorFlow, PyTorch) to ONNX format. After building the project, you can use the `cortexsdr_model_converter` tool:
-
-```bash
-./build/cortexsdr_model_converter <input_model> <output_model.onnx> <input_format>
-```
-
-Supported formats:
-- `pytorch`: PyTorch models (.pt, .pth)
-- `tensorflow`: TensorFlow models (SavedModel directory)
-- `onnx`: ONNX models (already in ONNX format, will be copied)
-
 ## Compression Tuning
 
 You can control the fraction of active bits in the SDR encoding using the `--sparsity` or `-s` parameter with the CLI tool (default is 2%). This helps tune compression and achieve higher compression ratios.

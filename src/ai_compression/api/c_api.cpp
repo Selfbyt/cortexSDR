@@ -10,7 +10,6 @@
 #include "../parsers/ONNXModelParser.hpp"
 #include "../parsers/GGUFModelParser.hpp"
 #include "../parsers/ModelParserFactory.hpp"
-#include "../utils/ModelConverter.hpp"
 #include "../streaming/StreamingCompressor.hpp"
 #include <chrono>
 #include <cstring>
@@ -90,17 +89,7 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         
         // Check if the format is supported by our parsers
         if (!ModelParserFactory::isFormatSupported(format)) {
-            // Fallback to ONNX conversion for unsupported formats
-            try {
-                actualModelPath = ModelConverter::convertToONNX(model_path, format);
-                actualFormat = "onnx";
-            } catch (const ModelConversionError& e) {
-                std::cerr << "Warning: " << e.what() << std::endl;
-                std::cerr << "Please convert your model to a supported format manually..." << std::endl;
-                return {str_to_c("Failed to convert model: " + std::string(e.what())), 1};
-            } catch (const std::exception& e) {
-                 return {str_to_c("Error during model conversion: " + std::string(e.what())), 1};
-            }
+            return {str_to_c("Unsupported model format: " + std::string(format)), 1};
         }
         // Use the factory to create the appropriate parser
         std::unique_ptr<IAIModelParser> parser;

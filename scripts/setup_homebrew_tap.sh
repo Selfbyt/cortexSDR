@@ -38,7 +38,6 @@ class Cortexsdr < Formula
     # Install binaries
     bin.install "sdk_release/bin/cortexsdr_ai_compression_cli" => "cortexsdr"
     bin.install "sdk_release/bin/cortexsdr_cli" => "cortexsdr-cli"
-    bin.install "sdk_release/bin/cortexsdr_model_converter" => "cortexsdr-converter"
     
     # Install libraries
     lib.install Dir["sdk_release/lib/*"]

@@ -18,7 +18,6 @@ set(SDK_SOURCES
     ${CMAKE_SOURCE_DIR}/src/ai_compression/AIDecompressor.cpp
     ${CMAKE_SOURCE_DIR}/src/ai_compression/ArchiveConstants.cpp
     ${CMAKE_SOURCE_DIR}/src/ai_compression/StreamingCompressor.cpp
-    ${CMAKE_SOURCE_DIR}/src/ai_compression/ModelConverter.cpp
     ${CMAKE_SOURCE_DIR}/src/ai_compression/SparseInferenceEngine.cpp
     ${CMAKE_SOURCE_DIR}/src/ai_compression/SDRModelLoader.cpp
     ${CMAKE_SOURCE_DIR}/src/ai_compression/NumericalRLE.cpp

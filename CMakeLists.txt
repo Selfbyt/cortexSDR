@@ -55,7 +55,6 @@ set(COMMON_SOURCES
     src/ai_compression/parsers/PyTorchModelParser.cpp
     src/ai_compression/parsers/HDF5ModelParser.cpp
     src/ai_compression/parsers/ModelParserFactory.cpp
-    src/ai_compression/utils/ModelConverter.cpp
     src/ai_compression/utils/sha256.cpp
     src/ai_compression/api/c_api.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
@@ -94,8 +93,8 @@ endif()
 # To enable, configure with: -DENABLE_TENSORFLOW=ON and set TENSORFLOW_SOURCE_DIR to your TF source path.
 option(ENABLE_GGUF "Enable GGUF model support" ON)
 option(ENABLE_ONNX "Enable ONNX model support" ON)
-option(ENABLE_TENSORFLOW "Enable TensorFlow model conversion support" OFF)
-option(ENABLE_PYTORCH "Enable PyTorch model conversion support" ON)
+option(ENABLE_TENSORFLOW "Enable TensorFlow model parsing support" OFF)
+option(ENABLE_PYTORCH "Enable PyTorch model parsing support" ON)
 option(ENABLE_HDF5 "Enable HDF5/Keras model support" ON)
 
 # Performance optimization options
@@ -307,7 +306,7 @@ if(ENABLE_TENSORFLOW)
     else()
         message(WARNING "TensorFlow source directory not found at ${TENSORFLOW_SOURCE_DIR}")
         message(WARNING "Set TENSORFLOW_SOURCE_DIR environment variable or CMake variable to point to your TensorFlow source directory")
-        message(WARNING "TensorFlow model conversion support will be disabled.")
+        message(WARNING "TensorFlow model parsing support will be disabled.")
         set(ENABLE_TENSORFLOW OFF)
     endif()
 endif()
@@ -326,11 +325,11 @@ if(ENABLE_PYTORCH)
             list(APPEND EXTRA_INCLUDES ${TORCH_INCLUDE_DIRS})
             message(STATUS "Using local PyTorch installation at ${TORCH_ROOT}")
         else()
-            message(WARNING "Failed to find PyTorch at ${TORCH_ROOT}. PyTorch model conversion support will be disabled.")
+            message(WARNING "Failed to find PyTorch at ${TORCH_ROOT}. PyTorch model parsing support will be disabled.")
             set(ENABLE_PYTORCH OFF)
         endif()
     else()
-        message(WARNING "Local PyTorch not found at ${TORCH_ROOT}. PyTorch model conversion support will be disabled.")
+        message(WARNING "Local PyTorch not found at ${TORCH_ROOT}. PyTorch model parsing support will be disabled.")
         set(ENABLE_PYTORCH OFF)
     endif()
 endif()
@@ -350,7 +349,6 @@ set(SDK_SOURCES
     src/ai_compression/core/AICompressor.cpp
     src/ai_compression/core/ArchiveConstants.cpp
     src/ai_compression/streaming/StreamingCompressor.cpp
-    src/ai_compression/utils/ModelConverter.cpp
     src/ai_compression/strategies/NumericalRLE.cpp
     src/ai_compression/strategies/GzipStrategy.cpp
     src/ai_compression/utils/sha256.cpp
@@ -422,15 +420,6 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 # CLI Tool executable removed (moved to sdr_core)
-
-# Model Converter CLI Tool
-add_executable(cortexsdr_model_converter src/model_converter_cli.cpp)
-target_link_libraries(cortexsdr_model_converter PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
-
-# Add ONNX Runtime include directories to the model converter
-if(ENABLE_ONNX)
-    target_include_directories(cortexsdr_model_converter PRIVATE ${ONNXRuntime_INCLUDE_DIRS})
-endif()
 
 # C API Test Tool removed
 

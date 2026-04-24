@@ -92,10 +92,10 @@ To fully support AI model compression, we're developing the following components
 - ⏳ Activation functions for SDR representations
 - ⏳ Backpropagation support for training
 
-### Phase 3: Model Conversion (Planned)
+### Phase 3: Model Format Support (Planned)
 
-- 🔲 PyTorch model converter
-- 🔲 TensorFlow model converter
+- 🔲 PyTorch parser enhancements
+- 🔲 TensorFlow parser enhancements
 - 🔲 ONNX model support
 - 🔲 Quantization techniques for SDR
 
@@ -187,7 +187,7 @@ We welcome contributions to this project! Areas where help is especially valuabl
 
 - Implementing new compression strategies
 - Optimizing existing strategies
-- Creating model conversion tools
+- Improving model parser coverage
 - Optimizing for specific hardware targets
 - Benchmarking against existing compression methods
 

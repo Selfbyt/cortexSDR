@@ -225,7 +225,6 @@ jobs:
           # Copy CLI tools
           cp build/cortexsdr_ai_compression_cli sdk_release/bin/ || echo "AI compression CLI not found"
           cp build/cortexsdr_cli sdk_release/bin/ || echo "Main CLI not found"
-          cp build/cortexsdr_model_converter sdk_release/bin/ || echo "Model converter not found"
           
           # Copy examples
           cp -r examples/ sdk_release/examples/ || echo "Examples not found"
@@ -444,7 +443,6 @@ jobs:
               # Install binaries
               bin.install "sdk_release/bin/cortexsdr_ai_compression_cli" => "cortexsdr"
               bin.install "sdk_release/bin/cortexsdr_cli" => "cortexsdr-cli"
-              bin.install "sdk_release/bin/cortexsdr_model_converter" => "cortexsdr-converter"
               
               # Install libraries
               lib.install Dir["sdk_release/lib/*"]

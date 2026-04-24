@@ -37,7 +37,6 @@ fi
 echo -e "${GREEN}Build complete!${NC}"
 echo -e "${GREEN}Executables are in the build directory:${NC}"
 echo -e "  - ${YELLOW}cortexsdr_cli${NC}: Main CLI tool"
-echo -e "  - ${YELLOW}cortexsdr_model_converter${NC}: Tool to convert models to ONNX format"
 
 # Remind about sparsity parameter
 echo -e "\n${GREEN}Remember:${NC} You can use the ${YELLOW}--sparsity${NC} or ${YELLOW}-s${NC} parameter with cortexsdr_cli to control the fraction of active bits in the SDR encoding (default 2%)."
