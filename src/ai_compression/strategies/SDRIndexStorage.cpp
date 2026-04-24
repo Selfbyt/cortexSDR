@@ -141,15 +141,34 @@ std::vector<std::byte> SDRIndexStorageStrategy::compressIndicesWithValues(const 
         lastIndex = pair.first;
     }
     
-    // Encode values using quantized representation
-    // Use 16-bit quantization to balance precision and compression
+    // Compute min/max for proper quantization range
+    float min_val = std::numeric_limits<float>::max();
+    float max_val = std::numeric_limits<float>::lowest();
     for (const auto& pair : sortedPairs) {
-        // Quantize float to 16-bit signed integer
-        // Scale factor: 32767.0f to preserve most of the precision
-        float scaled = pair.second * 32767.0f;
-        int16_t quantized = static_cast<int16_t>(std::max(-32768.0f, std::min(32767.0f, scaled)));
+        min_val = std::min(min_val, pair.second);
+        max_val = std::max(max_val, pair.second);
+    }
+    
+    // Store min/max as float32 (8 bytes total)
+    uint32_t min_bits, max_bits;
+    std::memcpy(&min_bits, &min_val, sizeof(float));
+    std::memcpy(&max_bits, &max_val, sizeof(float));
+    
+    for (int i = 0; i < 4; ++i) {
+        compressedOutput.push_back(static_cast<std::byte>((min_bits >> (i * 8)) & 0xFF));
+    }
+    for (int i = 0; i < 4; ++i) {
+        compressedOutput.push_back(static_cast<std::byte>((max_bits >> (i * 8)) & 0xFF));
+    }
+    
+    // 16-bit quantization with proper scaling
+    float scale = (max_val - min_val) / 65535.0f;
+    if (scale == 0.0f) scale = 1.0f;
+    
+    for (const auto& pair : sortedPairs) {
+        float normalized = (pair.second - min_val) / scale;
+        uint16_t quantized = static_cast<uint16_t>(std::max(0.0f, std::min(65535.0f, normalized)));
         
-        // Store as little-endian 16-bit value
         compressedOutput.push_back(static_cast<std::byte>(quantized & 0xFF));
         compressedOutput.push_back(static_cast<std::byte>((quantized >> 8) & 0xFF));
     }
@@ -194,7 +213,31 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
             indices.push_back(lastIndex);
         }
         
-        // Read quantized values and dequantize them
+        // Read min/max values for proper dequantization
+        if (offset + 7 >= compressedData.size()) {
+            throw CompressionError("Compressed data truncated before min/max values");
+        }
+        
+        // Read min value (float32, little-endian)
+        uint32_t min_bits = 0;
+        for (int i = 0; i < 4; ++i) {
+            min_bits |= (static_cast<uint32_t>(compressedData[offset++]) << (i * 8));
+        }
+        float min_val;
+        std::memcpy(&min_val, &min_bits, sizeof(float));
+        
+        // Read max value (float32, little-endian)
+        uint32_t max_bits = 0;
+        for (int i = 0; i < 4; ++i) {
+            max_bits |= (static_cast<uint32_t>(compressedData[offset++]) << (i * 8));
+        }
+        float max_val;
+        std::memcpy(&max_val, &max_bits, sizeof(float));
+        
+        float scale = (max_val - min_val) / 65535.0f;
+        if (scale == 0.0f) scale = 1.0f;
+        
+        // Dequantize values
         std::vector<float> values;
         values.reserve(numPairs);
         
@@ -203,13 +246,11 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
                 throw CompressionError("Compressed data truncated during value reading");
             }
             
-            // Read 16-bit little-endian value
             uint8_t lowByte = static_cast<uint8_t>(compressedData[offset++]);
             uint8_t highByte = static_cast<uint8_t>(compressedData[offset++]);
-            int16_t quantized = static_cast<int16_t>((static_cast<uint16_t>(highByte) << 8) | lowByte);
+            uint16_t quantized = static_cast<uint16_t>((static_cast<uint16_t>(highByte) << 8) | lowByte);
             
-            // Dequantize back to float
-            float value = static_cast<float>(quantized) / 32767.0f;
+            float value = (static_cast<float>(quantized) * scale) + min_val;
             values.push_back(value);
         }
         
@@ -329,25 +370,8 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
             }
         }
         
-        // Set non-zero values at the specified indices
-        // For now, we'll use a more realistic approach with small random values
-        // In a production system, you'd want to store actual weight values
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::normal_distribution<float> dist(0.0f, 0.1f); // Small normal distribution
-        
-        for (size_t index : indices) {
-            if (index * elementSize + elementSize <= originalSize) {
-                // Generate a small random value that preserves some weight characteristics
-                float value = dist(gen);
-                // Ensure non-zero values
-                if (std::abs(value) < 0.001f) {
-                    value = (value >= 0) ? 0.001f : -0.001f;
-                }
-                std::memcpy(reconstructedData.data() + index * elementSize, &value, elementSize);
-            }
-        }
-        
+        // For sparse representation, inactive positions remain zero
+        // Active positions are set by weight preservation format (0x95/0x96)
         return reconstructedData;
     } catch (const std::exception& e) {
         throw CompressionError(std::string("Failed to decompress tensor: ") + e.what());
@@ -400,61 +424,17 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
             throw CompressionError(std::string("Failed to extract indices: ") + e.what());
         }
     } else if (segment.type == SegmentType::METADATA_JSON) {
-        
-        
-        // Create a temporary ModelSegment with WEIGHTS_FP32 type to use extractSignificantIndices
-        ModelSegment tempSegment = segment;
-        tempSegment.type = SegmentType::WEIGHTS_FP32;
-        
-        // Use the current sparsity setting (from CLI parameter)
-        // No need to override sparsity - use what was set via setSparsity() from the CLI parameter
-        
-        try {
-            indices = extractSignificantIndices(tempSegment);
-            
-            if (indices.empty()) {
-                std::cerr << "  No indices extracted for metadata, compression will fail\n";
-                throw CompressionError("No indices extracted for metadata. Check sparsity or data validity.");
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "  Exception during metadata index extraction: " << e.what() << "\n";
-            throw CompressionError(std::string("Failed to extract indices from metadata: ") + e.what());
-        }
+        // Metadata is text/JSON data, not a weight tensor
+        throw CompressionError(
+            "METADATA_JSON cannot use SDRIndexStorage. "
+            "Use MetadataSDRStrategy or AdaptiveSDRStrategy instead."
+        );
     } else if (segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
-        
-        
-        // For graph structure, we need to preserve more information
-        // First, check if this is a valid ONNX model structure
-        bool validOnnxStructure = false;
-        for (size_t i = 0; i < std::min(segment.data.size(), size_t(100)); ++i) {
-            if (static_cast<uint8_t>(segment.data[i]) != 0) {
-                validOnnxStructure = true;
-                break;
-            }
-        }
-        
-        if (!validOnnxStructure) {
-            std::cerr << "  Warning: Graph structure appears to be all zeros or invalid\n";
-            throw CompressionError("Invalid graph structure data");
-        }
-        
-        // Process graph structure using the current sparsity setting
-        ModelSegment tempSegment = segment;
-        tempSegment.type = SegmentType::WEIGHTS_FP32;
-        
-        // No need to override sparsity - use what was set via setSparsity() from the CLI parameter
-        
-        try {
-            indices = extractSignificantIndices(tempSegment);
-            
-            if (indices.empty()) {
-                std::cerr << "  No indices extracted for metadata/graph, compression will fail\n";
-                throw CompressionError("No indices extracted for metadata/graph. Check data validity.");
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "  Exception during metadata/graph index extraction: " << e.what() << "\n";
-            throw CompressionError(std::string("Failed to extract indices from metadata/graph: ") + e.what());
-        }
+        // Graph structure is binary protobuf, not a float tensor
+        throw CompressionError(
+            "GRAPH_STRUCTURE_PROTO cannot use SDRIndexStorage. "
+            "Use GzipCompressionStrategy or ZstdCompressionStrategy instead."
+        );
     } else {
         std::cerr << "  Unsupported segment type: " << static_cast<int>(segment.type) << "\n";
         throw CompressionError("Unsupported segment type: " + std::to_string(static_cast<int>(segment.type)));
@@ -462,14 +442,9 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
     
     // Compress the indices (only if not already compressed with weight preservation)
     try {
-        // Compress the indices using delta encoding (for non-weight tensors)
+        // Compress the indices using delta encoding
         if (!indices.empty() && compressedOutput.empty()) {
             compressedOutput = compressIndicesWithDelta(indices);
-            
-            // For metadata, add additional logging
-            if (segment.type == SegmentType::METADATA_JSON) {
-                std::cerr << "  Metadata successfully compressed using SDR-based approach\n";
-            }
         } else if (indices.empty() && compressedOutput.empty()) {
             std::cerr << "  No indices to compress, returning empty output\n";
             std::cerr << "  Small segment, allowing up to 20% size increase\n";
@@ -595,40 +570,79 @@ void SDRIndexStorageStrategy::forEachIndexValue(const std::vector<std::byte>& co
                                                 const std::function<void(size_t, float)>& visitor) const {
     if (compressedData.empty()) return;
     size_t offset = 0;
-    // Expect 0x95/0x96 leading flag; if present, skip it
+    
+    // Skip format flag (0x95/0x96)
     uint8_t flag = static_cast<uint8_t>(compressedData[0]);
     if (flag == 0x95 || flag == 0x96) {
         offset = 1;
     }
-    // number of pairs
+    
+    // Read number of pairs
     size_t numPairs = 0;
-    try { numPairs = decodeVarint(compressedData, offset); } catch (...) { return; }
-    // encoding flag (0 = direct indices, 1 = delta)
+    try { 
+        numPairs = decodeVarint(compressedData, offset); 
+    } catch (...) { 
+        return; 
+    }
+    
+    // Read encoding flag (should be 2 for weight preservation)
     if (offset >= compressedData.size()) return;
     uint8_t encodingFlag = static_cast<uint8_t>(compressedData[offset++]);
-    // read scale (float32)
-    if (offset + 4 > compressedData.size()) return;
-    float scale = 1.0f;
-    std::memcpy(&scale, &compressedData[offset], 4);
-    offset += 4;
-    // iterate pairs
+    if (encodingFlag != 2) {
+        return; // Unsupported format
+    }
+    
+    // Read min/max for proper dequantization (matches decompressIndicesWithValues)
+    if (offset + 7 >= compressedData.size()) return;
+    
+    // Read min value (float32, little-endian)
+    uint32_t min_bits = 0;
+    for (int i = 0; i < 4; ++i) {
+        min_bits |= (static_cast<uint32_t>(compressedData[offset++]) << (i * 8));
+    }
+    float min_val;
+    std::memcpy(&min_val, &min_bits, sizeof(float));
+    
+    // Read max value (float32, little-endian)
+    uint32_t max_bits = 0;
+    for (int i = 0; i < 4; ++i) {
+        max_bits |= (static_cast<uint32_t>(compressedData[offset++]) << (i * 8));
+    }
+    float max_val;
+    std::memcpy(&max_val, &max_bits, sizeof(float));
+    
+    // Compute scale for dequantization
+    float scale = (max_val - min_val) / 65535.0f;
+    if (scale == 0.0f) scale = 1.0f;
+    
+    // Read indices with delta decoding
+    std::vector<size_t> indices;
+    indices.reserve(numPairs);
     size_t lastIndex = 0;
     for (size_t i = 0; i < numPairs; ++i) {
-        size_t indexVal = 0;
-        try { indexVal = decodeVarint(compressedData, offset); } catch (...) { break; }
-        size_t index = (encodingFlag ? (lastIndex + indexVal) : indexVal);
-        lastIndex = index;
-        if (offset >= compressedData.size()) break;
-        uint16_t qv = 0;
-        // read 2 bytes little-endian
-        uint8_t lo = static_cast<uint8_t>(compressedData[offset++]);
-        uint8_t hi = 0;
-        if (offset < compressedData.size()) {
-            hi = static_cast<uint8_t>(compressedData[offset++]);
+        size_t delta = 0;
+        try { 
+            delta = decodeVarint(compressedData, offset); 
+        } catch (...) { 
+            break; 
         }
-        qv = static_cast<uint16_t>(lo | (static_cast<uint16_t>(hi) << 8));
-        float value = static_cast<float>(qv) * scale;
-        visitor(index, value);
+        lastIndex += delta;
+        indices.push_back(lastIndex);
+    }
+    
+    // Read quantized values and call visitor with dequantized values
+    for (size_t i = 0; i < numPairs && i < indices.size(); ++i) {
+        if (offset + 1 >= compressedData.size()) break;
+        
+        // Read 16-bit little-endian quantized value
+        uint8_t lowByte = static_cast<uint8_t>(compressedData[offset++]);
+        uint8_t highByte = static_cast<uint8_t>(compressedData[offset++]);
+        uint16_t quantized = static_cast<uint16_t>((static_cast<uint16_t>(highByte) << 8) | lowByte);
+        
+        // Dequantize: value = quantized * scale + min_val
+        float value = (static_cast<float>(quantized) * scale) + min_val;
+        
+        visitor(indices[i], value);
     }
 }
 
