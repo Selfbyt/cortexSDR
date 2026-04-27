@@ -362,10 +362,15 @@ CortexError cortex_archive_get_tokenizer_info(
         for (const auto& seg : segments) {
             std::string n = seg.name;
             for (auto& ch : n) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
-            if (n.find("tokenizer.model") != std::string::npos || n.find("sentencepiece") != std::string::npos || n.find(".spm") != std::string::npos) {
+            if (n.find("tokenizer.model") != std::string::npos ||
+                n.find("sentencepiece") != std::string::npos ||
+                n.find(".spm") != std::string::npos ||
+                n.find("gguf_tokenizer_model") != std::string::npos) {
                 has_spm = true;
             }
-            if (n.find("vocab.json") != std::string::npos || n.find("vocab") != std::string::npos) {
+            if (n.find("vocab.json") != std::string::npos ||
+                n.find("vocab") != std::string::npos ||
+                n.find("gguf_tokenizer_vocab") != std::string::npos) {
                 has_vocab = true;
             }
             if (n.find("merges.txt") != std::string::npos || n.find("merges") != std::string::npos) {

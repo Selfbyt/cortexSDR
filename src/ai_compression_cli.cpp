@@ -12,6 +12,7 @@
 void printUsage(const char* programName);
 int compressModel(const char* model_path, const char* format, const char* output_path, float sparsity);
 int decompressModel(const char* compressed_path, const char* output_path, float sparsity);
+int extractArchive(const char* compressed_path, const char* output_dir, float sparsity);
 int runInference(const char* archive_path, const char* input_indices_file);
 std::vector<size_t> loadInputIndices(const char* input_path);
 
@@ -20,6 +21,7 @@ void printUsage(const char* programName) {
     std::cout << "Usage:\n";
     std::cout << "  " << programName << " -c <model_path> <format> <output_path> [sparsity]   (Compress)\n";
     std::cout << "  " << programName << " -d <compressed_path> <output_path> [sparsity]       (Decompress)\n";
+    std::cout << "  " << programName << " -x <compressed_path> <output_dir> [sparsity]        (Extract archive)\n";
     std::cout << "  " << programName << " -i <archive_path> <input_indices_file>              (Inference)\n";
     std::cout << "\nSupported formats:\n";
     std::cout << "  - onnx: ONNX models (direct support)\n";
@@ -34,6 +36,7 @@ void printUsage(const char* programName) {
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr 0.01\n";
     std::cout << "  " << programName << " -d compressed_model.sdr decompressed_model.onnx\n";
+    std::cout << "  " << programName << " -x compressed_model.sdr extracted_segments\n";
     std::cout << "  " << programName << " -i compressed_model.sdr input_indices.txt\n";
 }
 
@@ -90,6 +93,18 @@ int main(int argc, char** argv) {
         const char* archive_path = argv[2];
         const char* input_indices_file = argv[3];
         return runInference(archive_path, input_indices_file);
+    } else if (mode == "-x") {
+        if (argc < 4) {
+            printUsage(argv[0]);
+            return 1;
+        }
+        const char* compressed_path = argv[2];
+        const char* output_dir = argv[3];
+        float sparsity = 0.02f;
+        if (argc > 4) {
+            sparsity = std::stof(argv[4]);
+        }
+        return extractArchive(compressed_path, output_dir, sparsity);
     } else {
         printUsage(argv[0]);
         return 1;
@@ -176,6 +191,21 @@ int decompressModel(const char* compressed_path, const char* output_path, float 
 
     cortex_decompressor_free(handle);
     std::cout << "Decompression complete." << std::endl;
+    return 0;
+}
+
+int extractArchive(const char* compressed_path, const char* output_dir, float sparsity) {
+    std::cout << "Extracting archive from: " << compressed_path << " to directory: " << output_dir << std::endl;
+    std::cout << "Using sparsity: " << sparsity << " (" << (sparsity * 100) << "%)" << std::endl;
+
+    CortexError error = cortex_archive_extract(compressed_path, output_dir, sparsity);
+    if (error.code != 0) {
+        std::cerr << "Error extracting archive: " << error.message << " (code: " << error.code << ")\n";
+        cortex_error_free(&error);
+        return 1;
+    }
+
+    std::cout << "Archive extraction complete." << std::endl;
     return 0;
 }
 

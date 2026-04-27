@@ -84,6 +84,13 @@ CORTEXSDR_API CortexError cortex_decompressor_decompress(
     const char* output_path
 );
 
+// Extract archive segments to a directory bundle
+CORTEXSDR_API CortexError cortex_archive_extract(
+    const char* compressed_path,
+    const char* output_dir,
+    float sparsity
+);
+
 // Free a decompressor instance
 CORTEXSDR_API CortexError cortex_decompressor_free(CortexDecompressorHandle handle);
 

@@ -10,6 +10,7 @@
 #include <memory>
 #include <map>
 #include <functional>
+#include <vector>
 
 namespace CortexAICompression {
 
@@ -25,6 +26,14 @@ public:
      * @throws ParsingError if no suitable parser is found
      */
     static std::unique_ptr<IAIModelParser> createParser(const std::string& modelPath);
+
+    /**
+     * @brief Create a parser for an explicit format name.
+     * @param format Format identifier (e.g., "onnx", "gguf")
+     * @return Unique pointer to the requested parser
+     * @throws ParsingError if format is unsupported
+     */
+    static std::unique_ptr<IAIModelParser> createParserForFormat(const std::string& format);
     
     /**
      * @brief Detect the model format from file extension and content

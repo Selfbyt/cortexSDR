@@ -36,6 +36,24 @@ std::unique_ptr<IAIModelParser> ModelParserFactory::createParser(const std::stri
     throw ParsingError("No parser available for format: " + format + " (file: " + modelPath + ")");
 }
 
+std::unique_ptr<IAIModelParser> ModelParserFactory::createParserForFormat(const std::string& format) {
+    if (parserRegistry.empty()) {
+        initializeRegistry();
+    }
+
+    std::string normalized = format;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    auto it = parserRegistry.find(normalized);
+    if (it != parserRegistry.end()) {
+        return it->second();
+    }
+
+    throw ParsingError("No parser available for format: " + format);
+}
+
 std::string ModelParserFactory::detectFormat(const std::string& modelPath) {
     // First try to detect from file extension
     std::string format = detectFromExtension(modelPath);

@@ -273,15 +273,31 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     const std::string lower_layer_type = toLowerCopy(layer.layer_type);
     const bool norm_like = lower_layer_type.find("norm") != std::string::npos;
 
-    // Calculate element count based on data type
     size_t num_elements = 0;
-    size_t element_size = 4; // Default: float32
-
-    if(model_segment.type == SegmentType::WEIGHTS_FP16) element_size = 2;
-    if(model_segment.type == SegmentType::WEIGHTS_INT8) element_size = 1;
-
-    if (model_segment.original_size > 0) {
-        num_elements = model_segment.original_size / element_size;
+    if (model_segment.tensor_metadata && !model_segment.tensor_metadata->dimensions.empty()) {
+        num_elements = 1;
+        for (size_t dim : model_segment.tensor_metadata->dimensions) {
+            if (dim == 0 || num_elements > (std::numeric_limits<size_t>::max() / dim)) {
+                num_elements = 0;
+                break;
+            }
+            num_elements *= dim;
+        }
+    }
+    if (num_elements == 0) {
+        size_t element_size = sizeof(float);
+        if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+            element_size = sizeof(uint16_t);
+        } else if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+            element_size = sizeof(int8_t);
+        } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+            element_size = 0; // Packed 4-bit path handled separately below.
+        }
+        if (element_size > 0 && model_segment.original_size > 0) {
+            num_elements = model_segment.original_size / element_size;
+        } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+            num_elements = model_segment.original_size * 2;
+        }
     }
 
     // Distinguish between weights and biases by name convention
@@ -291,11 +307,30 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
              if (model_segment.type == SegmentType::WEIGHTS_FP16) {
                 // Convert FP16 to FP32
                 const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
-                for (size_t i = 0; i < num_elements; ++i) {
+                const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
+                for (size_t i = 0; i < max_elements; ++i) {
                     layer.biases[i] = fp16_to_fp32(fp16_data[i]);
                 }
+            } else if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+                const int8_t* int8_data = reinterpret_cast<const int8_t*>(source_data.data());
+                const size_t max_elements = std::min(num_elements, source_data.size());
+                for (size_t i = 0; i < max_elements; ++i) {
+                    layer.biases[i] = static_cast<float>(int8_data[i]);
+                }
+            } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+                size_t out_index = 0;
+                for (size_t i = 0; i < source_data.size() && out_index < num_elements; ++i) {
+                    const uint8_t packed = static_cast<uint8_t>(source_data[i]);
+                    const int8_t low = static_cast<int8_t>((packed & 0x0F) - 8);
+                    layer.biases[out_index++] = static_cast<float>(low);
+                    if (out_index < num_elements) {
+                        const int8_t high = static_cast<int8_t>(((packed >> 4) & 0x0F) - 8);
+                        layer.biases[out_index++] = static_cast<float>(high);
+                    }
+                }
             } else {
-                std::memcpy(layer.biases.data(), source_data.data(), std::min(source_data.size(), layer.biases.size() * sizeof(float)));
+                const size_t byte_count = std::min(source_data.size(), layer.biases.size() * sizeof(float));
+                std::memcpy(layer.biases.data(), source_data.data(), byte_count);
             }
             if (norm_like) {
                 layer.properties.bn_biases = layer.biases;
@@ -307,11 +342,30 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
             if (model_segment.type == SegmentType::WEIGHTS_FP16) {
                 // Convert FP16 to FP32
                 const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
-                for (size_t i = 0; i < num_elements; ++i) {
+                const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
+                for (size_t i = 0; i < max_elements; ++i) {
                     layer.weights[i] = fp16_to_fp32(fp16_data[i]);
                 }
+            } else if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+                const int8_t* int8_data = reinterpret_cast<const int8_t*>(source_data.data());
+                const size_t max_elements = std::min(num_elements, source_data.size());
+                for (size_t i = 0; i < max_elements; ++i) {
+                    layer.weights[i] = static_cast<float>(int8_data[i]);
+                }
+            } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+                size_t out_index = 0;
+                for (size_t i = 0; i < source_data.size() && out_index < num_elements; ++i) {
+                    const uint8_t packed = static_cast<uint8_t>(source_data[i]);
+                    const int8_t low = static_cast<int8_t>((packed & 0x0F) - 8);
+                    layer.weights[out_index++] = static_cast<float>(low);
+                    if (out_index < num_elements) {
+                        const int8_t high = static_cast<int8_t>(((packed >> 4) & 0x0F) - 8);
+                        layer.weights[out_index++] = static_cast<float>(high);
+                    }
+                }
             } else {
-                std::memcpy(layer.weights.data(), source_data.data(), std::min(source_data.size(), layer.weights.size() * sizeof(float)));
+                const size_t byte_count = std::min(source_data.size(), layer.weights.size() * sizeof(float));
+                std::memcpy(layer.weights.data(), source_data.data(), byte_count);
             }
             if (norm_like) {
                 layer.properties.bn_weights = layer.weights;
@@ -405,6 +459,7 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
         LayerInfo layer;
         layer.name = name;
         bool have_primary_compressed_weights = false;
+        constexpr uint8_t SDR_STRATEGY_ID = 1;
 
         for (const auto* seg_ptr : matched_segments) {
             const auto& seg_info = *seg_ptr;
@@ -438,7 +493,10 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
                 layer.output_shape = seg_info.output_shape;
             }
 
-            if (weight_like && !bias_segment && !have_primary_compressed_weights) {
+            if (weight_like &&
+                !bias_segment &&
+                !have_primary_compressed_weights &&
+                seg_info.compression_strategy_id == SDR_STRATEGY_ID) {
                 layer.raw_data = decompressor_->readCompressedBytes(archive_path_, seg_info, seg_info.data_offset);
                 have_primary_compressed_weights = true;
                 continue;

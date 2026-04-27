@@ -249,6 +249,16 @@ CORTEXSDR_API CortexError cortex_archive_get_tokenizer_info(
     char** out_tokenizer_type
 );
 
+/**
+ * Extract all segments from an archive into an output directory.
+ * For GGUF-origin archives, writes GGUF-friendly filenames.
+ */
+CORTEXSDR_API CortexError cortex_archive_extract(
+    const char* compressed_path,
+    const char* output_dir,
+    float sparsity
+);
+
 #ifdef __cplusplus
 }
 #endif
