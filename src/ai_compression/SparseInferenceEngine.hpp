@@ -29,8 +29,12 @@
 #include <cstring>
 #include <future>
 #include "core/ModelSegment.hpp"
+#include "utils/execution_graph.hpp"
+#include "utils/kv_cache.hpp"
 #include <optional>
+#ifdef ENABLE_ONNX_PROTOBUF
 #include "onnx_proto/onnx.pb.h"
+#endif
 #include "core/AIDecompressor.hpp"
 #include <functional>
 #include <unordered_set>

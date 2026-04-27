@@ -23,9 +23,12 @@
 #include "kernels/fused_kernels.hpp"
 #include "kernels/quantized_kernels.hpp"
 #include "kernels/attention_kernels.hpp"
+#include "kernels/flash_attention.hpp"
 #include "kernels/sparse_kernels.hpp"
+#include "utils/execution_graph.hpp"
 #include "utils/fp16_convert.hpp"
 #include "utils/kv_cache.hpp"
+#include "utils/tensor_validator.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -1147,7 +1150,7 @@ std::vector<float> SDRInferenceEngine::reshapeTensor(const std::vector<float>& i
     }
     
     if (total_elements != input.size()) {
-        // Shape mismatch in reshape. Input size: " 
+        std::cerr << "[SDRInferenceEngine] Shape mismatch in reshape. Input size: "
                   << input.size() << ", Target size: " << total_elements << std::endl;
         return input;
     }

@@ -3,7 +3,9 @@
 
 // Define export macros for different platforms
 #if defined(_WIN32) || defined(_WIN64)
-    #ifdef CORTEXSDR_BUILDING_SHARED_LIBRARY
+    #if defined(CORTEXSDR_STATIC)
+        #define CORTEXSDR_API
+    #elif defined(CORTEXSDR_BUILDING_SHARED_LIBRARY)
         #define CORTEXSDR_API __declspec(dllexport)
     #else
         #define CORTEXSDR_API __declspec(dllimport)

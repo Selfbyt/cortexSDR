@@ -719,9 +719,15 @@ int main(int argc, char* argv[]) {
 
         // If token provided, set env vars for this process so SDK picks it up
         if (!hf_token.empty()) {
+#ifdef _WIN32
+            _putenv_s("HUGGING_FACE_HUB_TOKEN", hf_token.c_str());
+            _putenv_s("HUGGINGFACE_TOKEN", hf_token.c_str());
+            _putenv_s("HF_TOKEN", hf_token.c_str());
+#else
             setenv("HUGGING_FACE_HUB_TOKEN", hf_token.c_str(), 1);
             setenv("HUGGINGFACE_TOKEN", hf_token.c_str(), 1);
             setenv("HF_TOKEN", hf_token.c_str(), 1);
+#endif
         }
 
         std::cout << "Downloading and compressing..." << std::endl;

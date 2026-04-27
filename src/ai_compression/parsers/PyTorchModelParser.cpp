@@ -14,8 +14,6 @@
 // Add libzip for handling ZIP archives
 #include <zip.h>
 
-// c10 optional utilities for unpickle API
-#include <c10/util/Optional.h>
 // (no additional includes required for pointer+size unpickle overload)
 
 #ifdef ENABLE_PYTORCH
