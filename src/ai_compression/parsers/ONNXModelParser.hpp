@@ -51,23 +51,21 @@ private:
 
     ModelSegment createSegmentFromTensor(const std::string& name, const Ort::Value& tensor) const;
     SegmentType determineSegmentType(const std::string& tensorName, const Ort::Value& tensor) const;
-    // Overload matching the definition in the .cpp file (likely needs refactoring)
-    SegmentType determineSegmentType(const std::string& tensorName) const;
     TensorMetadata extractTensorMetadata(const Ort::Value& tensor) const;
-    std::string extractLayerName(const std::string& tensorName) const;
-    size_t extractLayerIndex(const std::string& tensorName) const;
     std::vector<std::byte> tensorToBytes(const Ort::Value& tensor) const;
-    
-#ifdef ENABLE_ONNX_PROTOBUF
-    // Helper matching the definition in the .cpp file (likely needs refactoring)
-    TensorMetadata extractTensorMetadataProto(const onnx::TensorProto& tensor) const;
-    SegmentType onnxTensorTypeToSegmentType(int32_t onnx_type) const; // Added declaration
-    // Helper matching the definition in the .cpp file (likely needs refactoring)
-    std::vector<std::byte> tensorProtoToBytes(const onnx::TensorProto& tensor) const;
-#endif
 #endif
 
+    // Used by both runtime-backed and protobuf-backed ONNX parsing flows.
+    SegmentType determineSegmentType(const std::string& tensorName) const;
+    std::string extractLayerName(const std::string& tensorName) const;
+    size_t extractLayerIndex(const std::string& tensorName) const;
+
 #ifdef ENABLE_ONNX_PROTOBUF
+    // Helpers for protobuf-backed parsing.
+    TensorMetadata extractTensorMetadataProto(const onnx::TensorProto& tensor) const;
+    SegmentType onnxTensorTypeToSegmentType(int32_t onnx_type) const;
+    std::vector<std::byte> tensorProtoToBytes(const onnx::TensorProto& tensor) const;
+
     // New optimized parsing methods
     void processMetadata(const onnx::ModelProto& model_proto, std::vector<ModelSegment>& segments) const;
     void processGraphStructure(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const;

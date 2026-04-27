@@ -492,6 +492,35 @@ std::vector<std::byte> ONNXModelParser::tensorToBytes(const Ort::Value& tensor) 
 }
 #endif
 
+#ifndef ENABLE_ONNX
+SegmentType ONNXModelParser::determineSegmentType(const std::string& tensorName) const {
+    std::string lower_name = tensorName;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    if (lower_name.find("embed") != std::string::npos ||
+        lower_name.find("wte") != std::string::npos ||
+        lower_name.find("embedding") != std::string::npos) {
+        return SegmentType::EMBEDDING_WEIGHTS;
+    }
+    if (lower_name.find("attn") != std::string::npos ||
+        lower_name.find("attention") != std::string::npos) {
+        return SegmentType::ATTENTION_WEIGHTS;
+    }
+    if (lower_name.find("mlp") != std::string::npos ||
+        lower_name.find("ffn") != std::string::npos ||
+        lower_name.find("feed_forward") != std::string::npos) {
+        return SegmentType::FEED_FORWARD_WEIGHTS;
+    }
+    if (lower_name.find("norm") != std::string::npos ||
+        lower_name.find("ln") != std::string::npos) {
+        return SegmentType::LAYER_NORM_WEIGHTS;
+    }
+    return SegmentType::WEIGHTS_FP32;
+}
+#endif
+
 std::string ONNXModelParser::extractLayerName(const std::string& tensorName) const {
     static const std::array<std::regex, 5> indexed_patterns = {
         std::regex(R"((?:^|\.|/)(?:layers|layer|blocks|block|h)\.(\d+)(?:\.|/|$))"),

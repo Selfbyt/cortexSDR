@@ -67,6 +67,7 @@ set(COMMON_SOURCES
     src/ai_compression/kernels/quantized_kernels.cpp
     src/ai_compression/kernels/attention_kernels.cpp
     src/ai_compression/kernels/sparse_kernels.cpp
+    src/ai_compression/kernels/flash_attention.cpp
 )
 
 # Remove desktop UI and application sources
@@ -75,11 +76,42 @@ set(COMMON_SOURCES
 find_package(ZLIB REQUIRED)
 find_package(Protobuf REQUIRED) # Protobuf is often a dependency for ONNX
 find_package(nlohmann_json REQUIRED)
+if(MSVC)
+    # Normalize protobuf link inputs to import libraries (.lib) on Windows.
+    # Some package configurations may expose runtime DLL paths, which the linker cannot consume directly.
+    set(_PROTOBUF_LIBS_FIXED "")
+    foreach(_plib ${Protobuf_LIBRARIES})
+        if(_plib MATCHES ".*/debug/bin/.*\\.dll$")
+            string(REPLACE "/debug/bin/" "/debug/lib/" _plib_lib "${_plib}")
+            string(REGEX REPLACE "\\.dll$" ".lib" _plib_lib "${_plib_lib}")
+            list(APPEND _PROTOBUF_LIBS_FIXED "${_plib_lib}")
+        elseif(_plib MATCHES ".*/bin/.*\\.dll$")
+            string(REPLACE "/bin/" "/lib/" _plib_lib "${_plib}")
+            string(REGEX REPLACE "\\.dll$" ".lib" _plib_lib "${_plib_lib}")
+            list(APPEND _PROTOBUF_LIBS_FIXED "${_plib_lib}")
+        else()
+            list(APPEND _PROTOBUF_LIBS_FIXED "${_plib}")
+        endif()
+    endforeach()
+    set(Protobuf_LIBRARIES ${_PROTOBUF_LIBS_FIXED})
+endif()
+set(PROTOBUF_LINK_LIBS ${Protobuf_LIBRARIES})
+if(TARGET protobuf::libprotobuf)
+    set(PROTOBUF_LINK_LIBS protobuf::libprotobuf)
+elseif(TARGET Protobuf::libprotobuf)
+    set(PROTOBUF_LINK_LIBS Protobuf::libprotobuf)
+endif()
 
 # libzip (for reading ZIP-based PyTorch checkpoints like consolidated.xx.pth)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBZIP REQUIRED libzip)
 if(LIBZIP_FOUND)
+    if(LIBZIP_LIBRARY_DIRS)
+        link_directories(${LIBZIP_LIBRARY_DIRS})
+        if(EXISTS "${LIBZIP_LIBRARY_DIRS}/../debug/lib")
+            link_directories("${LIBZIP_LIBRARY_DIRS}/../debug/lib")
+        endif()
+    endif()
     list(APPEND EXTRA_LIBS ${LIBZIP_LIBRARIES})
     list(APPEND EXTRA_INCLUDES ${LIBZIP_INCLUDE_DIRS})
     message(STATUS "Found libzip: ${LIBZIP_LIBRARIES}")
@@ -107,7 +139,9 @@ option(ENABLE_SIMD "Enable SIMD optimizations (SSE/AVX)" ON)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # --- ONNX Configuration ---
-set(ENABLE_ONNX_PROTOBUF OFF) # Default to OFF, enable if ONNX found
+# ONNX protobuf support is required in this project.
+set(ENABLE_ONNX_PROTOBUF ON)
+add_definitions(-DENABLE_ONNX_PROTOBUF)
 if(ENABLE_ONNX)
     # 1. Find ONNX Protobuf library (for model building/manipulation)
     find_package(ONNX) # Standard CMake find module for ONNX protobuf library
@@ -116,10 +150,8 @@ if(ENABLE_ONNX)
         message(STATUS "ONNX Protobuf includes: ${ONNX_INCLUDE_DIRS}")
         list(APPEND EXTRA_LIBS ${ONNX_LIBRARIES})
         list(APPEND EXTRA_INCLUDES ${ONNX_INCLUDE_DIRS})
-        add_definitions(-DENABLE_ONNX_PROTOBUF) # Define if ONNX Protobuf is found
-        set(ENABLE_ONNX_PROTOBUF ON)
     else()
-        message(WARNING "ONNX Protobuf library not found. ONNX model reconstruction will not be possible.")
+        message(WARNING "ONNX CMake package not found. Continuing with bundled ONNX protobuf sources.")
     endif()
 
     # 2. Find ONNX Runtime library (for inference/parsing)
@@ -339,6 +371,7 @@ set(SDK_SOURCES
     src/ai_compression/api/cortex_sdk.cpp
     src/ai_compression/api/c_api.cpp
     src/ai_compression/SparseInferenceEngine.cpp
+    src/ai_compression/parsers/GGUFModelParser.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp
     src/ai_compression/parsers/TensorFlowModelParser.cpp
     src/ai_compression/parsers/PyTorchModelParser.cpp
@@ -356,6 +389,14 @@ set(SDK_SOURCES
     src/ai_compression/strategies/MetadataSDRStrategy.cpp
     src/ai_compression/strategies/QuantizedTensorStrategy.cpp
     src/ai_compression/strategies/SDRIndexStorage.cpp
+    src/ai_compression/kernels/blas_kernels.cpp
+    src/ai_compression/kernels/simd_kernels.cpp
+    src/ai_compression/kernels/conv_kernels.cpp
+    src/ai_compression/kernels/fused_kernels.cpp
+    src/ai_compression/kernels/quantized_kernels.cpp
+    src/ai_compression/kernels/attention_kernels.cpp
+    src/ai_compression/kernels/sparse_kernels.cpp
+    src/ai_compression/kernels/flash_attention.cpp
 )
 
 # Add main library target
@@ -374,6 +415,8 @@ set_target_properties(${PROJECT_NAME}_sdk_shared PROPERTIES
 
 # Add compiler definition for shared library
 target_compile_definitions(${PROJECT_NAME}_sdk_shared PRIVATE CORTEXSDR_BUILDING_SHARED_LIBRARY=1)
+target_compile_definitions(${PROJECT_NAME} PUBLIC CORTEXSDR_STATIC=1)
+target_compile_definitions(${PROJECT_NAME}_sdk PUBLIC CORTEXSDR_STATIC=1)
 
 # Add include directories for SDK targets
 foreach(target ${PROJECT_NAME}_sdk ${PROJECT_NAME}_sdk_shared)
@@ -394,7 +437,7 @@ foreach(target ${PROJECT_NAME}_sdk ${PROJECT_NAME}_sdk_shared)
     target_link_libraries(${target}
         PRIVATE
             ZLIB::ZLIB
-            ${Protobuf_LIBRARIES}
+            ${PROTOBUF_LINK_LIBS}
             ${EXTRA_LIBS}
     )
 endforeach()
@@ -415,7 +458,7 @@ target_include_directories(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
     PRIVATE
         ZLIB::ZLIB
-        ${Protobuf_LIBRARIES}
+        ${PROTOBUF_LINK_LIBS}
         ${EXTRA_LIBS}
 )
 
@@ -426,10 +469,12 @@ target_link_libraries(${PROJECT_NAME}
 # AI Compression CLI Tool
 add_executable(cortexsdr_ai_compression_cli src/ai_compression_cli.cpp)
 target_link_libraries(cortexsdr_ai_compression_cli PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(cortexsdr_ai_compression_cli PRIVATE CORTEXSDR_STATIC=1)
 
 # Text Generation CLI Tool (Ollama-like)
 add_executable(cortexsdr_text_cli src/cortexsdr_cli.cpp)
 target_link_libraries(cortexsdr_text_cli PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
+target_compile_definitions(cortexsdr_text_cli PRIVATE CORTEXSDR_STATIC=1)
 
 # Desktop application target removed
 
