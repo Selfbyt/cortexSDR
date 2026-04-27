@@ -27,6 +27,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <future>
@@ -90,6 +91,113 @@ std::string stripTensorSuffix(std::string tensor_name) {
     }
     return tensor_name;
 }
+
+#ifdef ENABLE_ONNX_PROTOBUF
+std::string serializeNodeMetadata(const onnx::NodeProto& node) {
+    std::ostringstream metadata;
+    metadata << "op_type " << node.op_type() << " ";
+    for (const auto& attr : node.attribute()) {
+        metadata << attr.name() << " ";
+        switch (attr.type()) {
+            case onnx::AttributeProto::INT:
+                metadata << attr.i() << " ";
+                break;
+            case onnx::AttributeProto::FLOAT:
+                metadata << attr.f() << " ";
+                break;
+            case onnx::AttributeProto::STRING:
+                metadata << attr.s() << " ";
+                break;
+            case onnx::AttributeProto::INTS:
+                for (int index = 0; index < attr.ints_size(); ++index) {
+                    metadata << attr.ints(index);
+                    if (index + 1 < attr.ints_size()) {
+                        metadata << ",";
+                    }
+                }
+                metadata << " ";
+                break;
+            case onnx::AttributeProto::FLOATS:
+                for (int index = 0; index < attr.floats_size(); ++index) {
+                    metadata << attr.floats(index);
+                    if (index + 1 < attr.floats_size()) {
+                        metadata << ",";
+                    }
+                }
+                metadata << " ";
+                break;
+            case onnx::AttributeProto::STRINGS:
+                for (int index = 0; index < attr.strings_size(); ++index) {
+                    metadata << attr.strings(index);
+                    if (index + 1 < attr.strings_size()) {
+                        metadata << ",";
+                    }
+                }
+                metadata << " ";
+                break;
+            default:
+                break;
+        }
+    }
+    return metadata.str();
+}
+
+std::vector<size_t> extractShapeFromValueInfo(const onnx::ValueInfoProto& value_info) {
+    std::vector<size_t> shape;
+    if (value_info.has_type() && value_info.type().has_tensor_type() &&
+        value_info.type().tensor_type().has_shape()) {
+        const auto& shape_proto = value_info.type().tensor_type().shape();
+        for (const auto& dim : shape_proto.dim()) {
+            if (dim.has_dim_value()) {
+                shape.push_back(static_cast<size_t>(dim.dim_value()));
+            }
+        }
+    }
+    return shape;
+}
+
+std::unordered_map<std::string, std::string> buildTensorMetadataMap(const onnx::GraphProto& graph_proto) {
+    std::unordered_map<std::string, std::string> tensor_to_metadata;
+    tensor_to_metadata.reserve(static_cast<size_t>(graph_proto.node_size()));
+    for (const auto& node : graph_proto.node()) {
+        const std::string metadata = serializeNodeMetadata(node);
+        for (const auto& output_name : node.output()) {
+            tensor_to_metadata[output_name] = metadata;
+        }
+    }
+    return tensor_to_metadata;
+}
+
+std::unordered_map<std::string, std::vector<size_t>> buildTensorShapeMap(const onnx::GraphProto& graph_proto) {
+    std::unordered_map<std::string, std::vector<size_t>> tensor_shapes;
+    tensor_shapes.reserve(static_cast<size_t>(graph_proto.value_info_size() + graph_proto.input_size() + graph_proto.output_size()));
+
+    for (const auto& value_info : graph_proto.value_info()) {
+        tensor_shapes[value_info.name()] = extractShapeFromValueInfo(value_info);
+    }
+    for (const auto& input : graph_proto.input()) {
+        tensor_shapes[input.name()] = extractShapeFromValueInfo(input);
+    }
+    for (const auto& output : graph_proto.output()) {
+        tensor_shapes[output.name()] = extractShapeFromValueInfo(output);
+    }
+
+    return tensor_shapes;
+}
+
+std::unordered_map<std::string, const onnx::NodeProto*> buildInitializerNodeMap(const onnx::GraphProto& graph_proto) {
+    std::unordered_map<std::string, const onnx::NodeProto*> tensor_to_node;
+    for (const auto& node : graph_proto.node()) {
+        for (const auto& input_name : node.input()) {
+            auto existing = tensor_to_node.find(input_name);
+            if (existing == tensor_to_node.end() || (existing->second != nullptr && existing->second->name().empty() && !node.name().empty())) {
+                tensor_to_node[input_name] = &node;
+            }
+        }
+    }
+    return tensor_to_node;
+}
+#endif
 
 } // namespace
 
@@ -490,6 +598,33 @@ std::vector<std::byte> ONNXModelParser::tensorToBytes(const Ort::Value& tensor) 
     
     return data;
 }
+
+ModelSegment ONNXModelParser::createSegmentFromTensor(const std::string& name, const Ort::Value& tensor) const {
+    ModelSegment segment;
+    segment.name = name;
+    segment.type = determineSegmentType(name, tensor);
+    segment.data = tensorToBytes(tensor);
+    segment.original_size = segment.data.size();
+    segment.tensor_metadata = extractTensorMetadata(tensor);
+    segment.layer_name = extractLayerName(name);
+    segment.layer_index = extractLayerIndex(name);
+    segment.data_format = "ONNX_RUNTIME";
+
+    const std::string lower_name = [&name]() {
+        std::string normalized = name;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return normalized;
+    }();
+    if (lower_name.find("bias") != std::string::npos) {
+        segment.layer_type = "BIAS";
+    } else {
+        segment.layer_type = "WEIGHTS";
+    }
+
+    return segment;
+}
 #endif
 
 #ifndef ENABLE_ONNX
@@ -567,213 +702,134 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
     std::vector<ModelSegment> segments;
     
 #ifdef ENABLE_ONNX_PROTOBUF
-    // Use a simpler approach for parsing ONNX models, similar to your onnx_cpp_serializer project
     onnx::ModelProto model_proto;
-    
-    // Open and read the model file
     std::ifstream model_file(modelPath, std::ios::binary);
     if (!model_file) {
         throw std::runtime_error("Failed to open model file: " + modelPath);
     }
-    
-    // Parse the model using Protobuf's ParseFromIstream
+
     if (!model_proto.ParseFromIstream(&model_file)) {
         throw std::runtime_error("Failed to parse model file using Protobuf");
     }
-    
-    if (!model_proto.producer_name().empty()) {
+    processMetadata(model_proto, segments);
+    processGraphStructure(model_proto.graph(), segments);
+    processInitializersParallel(model_proto.graph(), segments);
+
+    return segments;
+#else
+    throw std::runtime_error("ONNX model support is disabled. Please enable ENABLE_ONNX_PROTOBUF to use this feature.");
+#endif
+}
+
+
+std::vector<ModelSegment> ONNXModelParser::parseWithChunking(const std::string& modelPath) const {
+    auto segments = parse(modelPath);
+
+    std::map<size_t, std::vector<ModelSegment*>> layer_groups;
+    for (auto& segment : segments) {
+        layer_groups[segment.layer_index].push_back(&segment);
     }
-    
-    // Process model metadata with ultra-aggressive compression
+
+    for (auto& [layer_index, group] : layer_groups) {
+        (void)layer_index;
+        std::sort(group.begin(), group.end(), [](const ModelSegment* lhs, const ModelSegment* rhs) {
+            if (lhs->type == rhs->type) {
+                return lhs->name < rhs->name;
+            }
+            return static_cast<int>(lhs->type) < static_cast<int>(rhs->type);
+        });
+    }
+
+    std::vector<ModelSegment> reordered_segments;
+    reordered_segments.reserve(segments.size());
+
+    for (const auto& segment : segments) {
+        if (segment.layer_index == 0 && segment.layer_name.empty()) {
+            reordered_segments.push_back(segment);
+        }
+    }
+
+    for (const auto& [layer_index, group] : layer_groups) {
+        (void)layer_index;
+        for (const auto* segment : group) {
+            if (segment->layer_index == 0 && segment->layer_name.empty()) {
+                continue;
+            }
+            reordered_segments.push_back(*segment);
+        }
+    }
+
+    return reordered_segments;
+}
+
+#ifdef ENABLE_ONNX_PROTOBUF
+void ONNXModelParser::processMetadata(const onnx::ModelProto& model_proto, std::vector<ModelSegment>& segments) const {
     ModelSegment meta_segment;
     meta_segment.name = "model_metadata";
     meta_segment.type = SegmentType::METADATA_JSON;
-    
-    // Set an extremely high sparsity ratio for the metadata
-    TensorMetadata metaData;
-    metaData.sparsity_ratio = 0.0000001f; // Ultra-aggressive sparsity (0.00001%)
-    meta_segment.tensor_metadata = metaData;
-    
-    std::ostringstream metadata_ss;
-    metadata_ss << "Producer: " << (model_proto.has_producer_name() ? model_proto.producer_name() : "N/A") << "\n";
-    metadata_ss << "Domain: " << (model_proto.has_domain() ? model_proto.domain() : "N/A") << "\n";
-    metadata_ss << "IRVersion: " << model_proto.ir_version() << "\n";
-    
+
+    TensorMetadata metadata;
+    metadata.sparsity_ratio = 0.0f;
+    metadata.is_sorted = true;
+    meta_segment.tensor_metadata = metadata;
+
+    std::ostringstream metadata_stream;
+    metadata_stream << "Producer: " << (model_proto.has_producer_name() ? model_proto.producer_name() : "N/A") << "\n";
+    metadata_stream << "Domain: " << (model_proto.has_domain() ? model_proto.domain() : "N/A") << "\n";
+    metadata_stream << "IRVersion: " << model_proto.ir_version() << "\n";
     if (model_proto.opset_import_size() > 0) {
-        metadata_ss << "OpsetVersion: " << model_proto.opset_import(0).version() << "\n";
+        metadata_stream << "OpsetVersion: " << model_proto.opset_import(0).version() << "\n";
     }
-    
-    std::string metadata_str = metadata_ss.str();
-    if (!metadata_str.empty()) {
-        meta_segment.data.assign(
-            reinterpret_cast<const std::byte*>(metadata_str.data()),
-            reinterpret_cast<const std::byte*>(metadata_str.data() + metadata_str.size())
-        );
-        meta_segment.original_size = meta_segment.data.size();
-        segments.push_back(std::move(meta_segment));
+
+    const std::string metadata_payload = metadata_stream.str();
+    if (metadata_payload.empty()) {
+        return;
     }
-    
-    // Process graph structure
-    const auto& graph_proto = model_proto.graph();
-    
-    // Create a segment for the entire model structure (not just graph)
+
+    meta_segment.data.assign(
+        reinterpret_cast<const std::byte*>(metadata_payload.data()),
+        reinterpret_cast<const std::byte*>(metadata_payload.data() + metadata_payload.size())
+    );
+    meta_segment.original_size = meta_segment.data.size();
+    segments.push_back(std::move(meta_segment));
+}
+
+void ONNXModelParser::processGraphStructure(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const {
     ModelSegment graph_segment;
     graph_segment.name = "model_structure";
     graph_segment.type = SegmentType::GRAPH_STRUCTURE_PROTO;
-    
-    // Convert the model structure to a binary format more suitable for SDR compression
-    // First, set tensor metadata to help the SDR strategy
-    TensorMetadata structMetadata;
-    structMetadata.dimensions = {1, 13, 2581, 332}; // Add dimensions to help the SDR strategy
-    structMetadata.sparsity_ratio = 0.1f; // Higher sparsity (10%) for model structure
-    graph_segment.tensor_metadata = structMetadata;
-    
-    // Create a new ModelProto with minimal required fields
-    onnx::ModelProto minimal_model;
-    minimal_model.set_ir_version(model_proto.ir_version());
-    minimal_model.set_producer_name(model_proto.producer_name());
-    minimal_model.set_producer_version(model_proto.producer_version());
-    minimal_model.set_domain(model_proto.domain());
-    minimal_model.set_model_version(model_proto.model_version());
-    minimal_model.set_doc_string(model_proto.doc_string());
 
-    // Copy graph
-    *minimal_model.mutable_graph() = model_proto.graph();
+    TensorMetadata metadata;
+    metadata.dimensions = {
+        static_cast<size_t>(graph_proto.node_size()),
+        static_cast<size_t>(graph_proto.initializer_size()),
+        static_cast<size_t>(graph_proto.input_size()),
+        static_cast<size_t>(graph_proto.output_size())
+    };
+    metadata.sparsity_ratio = 0.0f;
+    metadata.is_sorted = true;
+    graph_segment.tensor_metadata = metadata;
 
-    // Copy opset imports
-    for (const auto& opset : model_proto.opset_import()) {
-        *minimal_model.add_opset_import() = opset;
+    std::string serialized_graph;
+    if (!graph_proto.SerializeToString(&serialized_graph) || serialized_graph.empty()) {
+        std::cerr << "Warning: Failed to serialize ONNX graph structure." << std::endl;
+        return;
     }
 
-    // Add metadata properties
-    auto* props = minimal_model.mutable_metadata_props();
-    for (const auto& prop : model_proto.metadata_props()) {
-        auto* new_prop = props->Add();
-        new_prop->set_key(prop.key());
-        new_prop->set_value(prop.value());
-        }
-
-    // Debug output
-    if (minimal_model.has_graph()) {
-        const auto& graph = minimal_model.graph();
-    }
-    
-    // Try to serialize the minimal model using SerializeToString first
-    std::string serialized_data;
-    bool success = false;
-    try {
-        if (minimal_model.SerializeToString(&serialized_data)) {
-            success = true;
-        } else {
-            std::cerr << "SerializeToString on ModelProto failed. Trying GraphProto..." << std::endl;
-            // Try serializing just the graph
-            serialized_data.clear();
-            if (minimal_model.has_graph() && minimal_model.graph().SerializeToString(&serialized_data)) {
-                success = true;
-            } else {
-                std::cerr << "SerializeToString on GraphProto also failed." << std::endl;
-            }
-        }
-
-        if (success && !serialized_data.empty()) {
-            // Add model structure segment
     graph_segment.data.assign(
-        reinterpret_cast<const std::byte*>(serialized_data.data()),
-        reinterpret_cast<const std::byte*>(serialized_data.data() + serialized_data.size())
+        reinterpret_cast<const std::byte*>(serialized_graph.data()),
+        reinterpret_cast<const std::byte*>(serialized_graph.data() + serialized_graph.size())
     );
     graph_segment.original_size = graph_segment.data.size();
     segments.push_back(std::move(graph_segment));
-        } else {
-            std::cerr << "Model structure serialization failed: produced empty data." << std::endl;
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Exception during model structure serialization: " << e.what() << std::endl;
-    }
-    
-    // Map tensor names to their producing node's op_type and attributes
-    std::unordered_map<std::string, std::string> tensor_to_metadata;
-    for (const auto& node : graph_proto.node()) {
-        for (const auto& output_name : node.output()) {
-            // Serialize all attributes for this node
-            std::ostringstream meta;
-            meta << "op_type " << node.op_type() << " ";
-            for (const auto& attr : node.attribute()) {
-                meta << attr.name() << " ";
-                switch (attr.type()) {
-                    case onnx::AttributeProto::INT:
-                        meta << attr.i() << " ";
-                        break;
-                    case onnx::AttributeProto::FLOAT:
-                        meta << attr.f() << " ";
-                        break;
-                    case onnx::AttributeProto::STRING:
-                        meta << attr.s() << " ";
-                        break;
-                    case onnx::AttributeProto::INTS:
-                        for (int i = 0; i < attr.ints_size(); ++i) {
-                            meta << attr.ints(i);
-                            if (i + 1 < attr.ints_size()) meta << ",";
-                        }
-                        meta << " ";
-                        break;
-                    case onnx::AttributeProto::FLOATS:
-                        for (int i = 0; i < attr.floats_size(); ++i) {
-                            meta << attr.floats(i);
-                            if (i + 1 < attr.floats_size()) meta << ",";
-                        }
-                        meta << " ";
-                        break;
-                    case onnx::AttributeProto::STRINGS:
-                        for (int i = 0; i < attr.strings_size(); ++i) {
-                            meta << attr.strings(i);
-                            if (i + 1 < attr.strings_size()) meta << ",";
-                        }
-                        meta << " ";
-                        break;
-                    default:
-                        break;
-                }
-            }
-            tensor_to_metadata[output_name] = meta.str();
-        }
-    }
+}
 
-    // Build a map from tensor name to its shape from ValueInfoProto
-    std::unordered_map<std::string, std::vector<size_t>> tensor_shapes;
-    for (const auto& value_info : graph_proto.value_info()) {
-        std::vector<size_t> shape;
-        if (value_info.has_type() && value_info.type().has_tensor_type() && value_info.type().tensor_type().has_shape()) {
-            const auto& shape_proto = value_info.type().tensor_type().shape();
-            for (const auto& dim : shape_proto.dim()) {
-                if (dim.has_dim_value()) shape.push_back(static_cast<size_t>(dim.dim_value()));
-            }
-        }
-        tensor_shapes[value_info.name()] = shape;
-    }
-    // Also add input/output shapes from graph inputs/outputs
-    for (const auto& input : graph_proto.input()) {
-        std::vector<size_t> shape;
-        if (input.has_type() && input.type().has_tensor_type() && input.type().tensor_type().has_shape()) {
-            const auto& shape_proto = input.type().tensor_type().shape();
-            for (const auto& dim : shape_proto.dim()) {
-                if (dim.has_dim_value()) shape.push_back(static_cast<size_t>(dim.dim_value()));
-            }
-        }
-        tensor_shapes[input.name()] = shape;
-    }
-    for (const auto& output : graph_proto.output()) {
-        std::vector<size_t> shape;
-        if (output.has_type() && output.type().has_tensor_type() && output.type().tensor_type().has_shape()) {
-            const auto& shape_proto = output.type().tensor_type().shape();
-            for (const auto& dim : shape_proto.dim()) {
-                if (dim.has_dim_value()) shape.push_back(static_cast<size_t>(dim.dim_value()));
-            }
-        }
-        tensor_shapes[output.name()] = shape;
-        }
-        
-    // Process initializers (weights, biases)
-    for (const auto& tensor_proto : graph_proto.initializer()) {
+void ONNXModelParser::processInitializers(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const {
+    const auto tensor_to_metadata = buildTensorMetadataMap(graph_proto);
+    const auto tensor_shapes = buildTensorShapeMap(graph_proto);
+    const auto tensor_to_node = buildInitializerNodeMap(graph_proto);
+
+    auto make_segment = [&](const onnx::TensorProto& tensor_proto) {
         ModelSegment segment;
         segment.name = tensor_proto.name();
         segment.type = onnxTensorTypeToSegmentType(tensor_proto.data_type());
@@ -790,80 +846,156 @@ std::vector<ModelSegment> ONNXModelParser::parse(const std::string& modelPath) c
         segment.layer_index = extractLayerIndex(tensor_proto.name());
         segment.data_format = "ONNX";
 
-        const onnx::NodeProto* matched_node = nullptr;
-        for (const auto& node : graph_proto.node()) {
-            for (const auto& input_name : node.input()) {
-                if (input_name == tensor_proto.name()) {
-                    matched_node = &node;
-                    if (!node.name().empty()) {
-                        break;
-                    }
-                }
-            }
-            if (matched_node != nullptr && !matched_node->name().empty()) {
-                break;
-            }
-        }
-
-        if (matched_node != nullptr) {
+        const auto node_it = tensor_to_node.find(tensor_proto.name());
+        if (node_it != tensor_to_node.end() && node_it->second != nullptr) {
+            const onnx::NodeProto& node = *node_it->second;
             if (segment.layer_name.empty() || segment.layer_name == segment.name) {
-                if (!matched_node->name().empty()) {
-                    segment.layer_name = matched_node->name();
-                } else if (!matched_node->output().empty()) {
-                    segment.layer_name = extractLayerName(matched_node->output(0));
+                if (!node.name().empty()) {
+                    segment.layer_name = node.name();
+                } else if (!node.output().empty()) {
+                    segment.layer_name = extractLayerName(node.output(0));
                 }
             }
             if (segment.layer_index == 0 && !segment.layer_name.empty()) {
                 segment.layer_index = extractLayerIndex(segment.layer_name);
             }
 
-            segment.layer_type = matched_node->op_type();
+            segment.layer_type = node.op_type();
             if (segment.type == SegmentType::WEIGHTS_FP32) {
                 const std::string& type_hint_name = !segment.layer_name.empty() ? segment.layer_name : segment.name;
                 segment.type = determineSegmentType(type_hint_name);
             }
 
-            if (!matched_node->output().empty() && tensor_to_metadata.count(matched_node->output(0))) {
-                segment.data_format = tensor_to_metadata[matched_node->output(0)];
+            if (!node.output().empty()) {
+                const auto metadata_it = tensor_to_metadata.find(node.output(0));
+                if (metadata_it != tensor_to_metadata.end()) {
+                    segment.data_format = metadata_it->second;
+                }
+                const auto output_shape_it = tensor_shapes.find(node.output(0));
+                if (output_shape_it != tensor_shapes.end()) {
+                    segment.output_shape = output_shape_it->second;
+                }
             }
-            if (!matched_node->input().empty() && tensor_shapes.count(matched_node->input(0))) {
-                segment.input_shape = tensor_shapes[matched_node->input(0)];
-            }
-            if (!matched_node->output().empty() && tensor_shapes.count(matched_node->output(0))) {
-                segment.output_shape = tensor_shapes[matched_node->output(0)];
+            if (!node.input().empty()) {
+                const auto input_shape_it = tensor_shapes.find(node.input(0));
+                if (input_shape_it != tensor_shapes.end()) {
+                    segment.input_shape = input_shape_it->second;
+                }
             }
         }
 
-        segments.push_back(segment);
+        return segment;
+    };
+
+    segments.reserve(segments.size() + static_cast<size_t>(graph_proto.initializer_size()));
+    for (const auto& tensor_proto : graph_proto.initializer()) {
+        segments.push_back(make_segment(tensor_proto));
     }
-    
-    return segments;
-#else
-    throw std::runtime_error("ONNX model support is disabled. Please enable ENABLE_ONNX_PROTOBUF to use this feature.");
-#endif
-}
-
-
-std::vector<ModelSegment> ONNXModelParser::parseWithChunking(const std::string& modelPath) const {
-    // For simplicity, just call the regular parse method
-    return parse(modelPath);
-}
-
-#ifdef ENABLE_ONNX_PROTOBUF
-void ONNXModelParser::processMetadata(const onnx::ModelProto& model_proto, std::vector<ModelSegment>& segments) const {
-    // This is now handled directly in the parse method
-}
-
-void ONNXModelParser::processGraphStructure(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const {
-    // This is now handled directly in the parse method
-}
-
-void ONNXModelParser::processInitializers(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const {
-    // This is now handled directly in the parse method
 }
 
 void ONNXModelParser::processInitializersParallel(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const {
-    // This is now handled directly in the parse method
+    const int initializer_count = graph_proto.initializer_size();
+    if (initializer_count <= 0) {
+        return;
+    }
+    if (initializer_count < 8 || std::thread::hardware_concurrency() <= 1U) {
+        processInitializers(graph_proto, segments);
+        return;
+    }
+
+    const auto tensor_to_metadata = buildTensorMetadataMap(graph_proto);
+    const auto tensor_shapes = buildTensorShapeMap(graph_proto);
+    const auto tensor_to_node = buildInitializerNodeMap(graph_proto);
+
+    auto make_segment = [&](const onnx::TensorProto& tensor_proto) {
+        ModelSegment segment;
+        segment.name = tensor_proto.name();
+        segment.type = onnxTensorTypeToSegmentType(tensor_proto.data_type());
+        if (segment.type == SegmentType::WEIGHTS_FP32) {
+            const SegmentType name_based_type = determineSegmentType(tensor_proto.name());
+            if (name_based_type != SegmentType::WEIGHTS_FP32) {
+                segment.type = name_based_type;
+            }
+        }
+        segment.data = tensorProtoToBytes(tensor_proto);
+        segment.original_size = segment.data.size();
+        segment.tensor_metadata = extractTensorMetadataProto(tensor_proto);
+        segment.layer_name = extractLayerName(tensor_proto.name());
+        segment.layer_index = extractLayerIndex(tensor_proto.name());
+        segment.data_format = "ONNX";
+
+        const auto node_it = tensor_to_node.find(tensor_proto.name());
+        if (node_it != tensor_to_node.end() && node_it->second != nullptr) {
+            const onnx::NodeProto& node = *node_it->second;
+            if (segment.layer_name.empty() || segment.layer_name == segment.name) {
+                if (!node.name().empty()) {
+                    segment.layer_name = node.name();
+                } else if (!node.output().empty()) {
+                    segment.layer_name = extractLayerName(node.output(0));
+                }
+            }
+            if (segment.layer_index == 0 && !segment.layer_name.empty()) {
+                segment.layer_index = extractLayerIndex(segment.layer_name);
+            }
+
+            segment.layer_type = node.op_type();
+            if (segment.type == SegmentType::WEIGHTS_FP32) {
+                const std::string& type_hint_name = !segment.layer_name.empty() ? segment.layer_name : segment.name;
+                segment.type = determineSegmentType(type_hint_name);
+            }
+
+            if (!node.output().empty()) {
+                const auto metadata_it = tensor_to_metadata.find(node.output(0));
+                if (metadata_it != tensor_to_metadata.end()) {
+                    segment.data_format = metadata_it->second;
+                }
+                const auto output_shape_it = tensor_shapes.find(node.output(0));
+                if (output_shape_it != tensor_shapes.end()) {
+                    segment.output_shape = output_shape_it->second;
+                }
+            }
+            if (!node.input().empty()) {
+                const auto input_shape_it = tensor_shapes.find(node.input(0));
+                if (input_shape_it != tensor_shapes.end()) {
+                    segment.input_shape = input_shape_it->second;
+                }
+            }
+        }
+
+        return segment;
+    };
+
+    const size_t max_workers = std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t worker_count = std::min(max_workers, static_cast<size_t>(initializer_count));
+    const size_t chunk_size = (static_cast<size_t>(initializer_count) + worker_count - 1) / worker_count;
+
+    std::vector<std::future<std::vector<ModelSegment>>> futures;
+    futures.reserve(worker_count);
+
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        const size_t start_index = worker * chunk_size;
+        const size_t end_index = std::min(start_index + chunk_size, static_cast<size_t>(initializer_count));
+        if (start_index >= end_index) {
+            continue;
+        }
+
+        futures.push_back(std::async(std::launch::async, [&, start_index, end_index]() {
+            std::vector<ModelSegment> local_segments;
+            local_segments.reserve(end_index - start_index);
+            for (size_t index = start_index; index < end_index; ++index) {
+                local_segments.push_back(make_segment(graph_proto.initializer(static_cast<int>(index))));
+            }
+            return local_segments;
+        }));
+    }
+
+    segments.reserve(segments.size() + static_cast<size_t>(initializer_count));
+    for (auto& future : futures) {
+        std::vector<ModelSegment> local_segments = future.get();
+        for (auto& segment : local_segments) {
+            segments.push_back(std::move(segment));
+        }
+    }
 }
 #endif
 

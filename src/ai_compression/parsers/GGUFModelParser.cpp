@@ -200,8 +200,17 @@ uint64_t computeTensorByteSize(const std::vector<size_t>& dimensions, uint32_t g
 }
 
 bool isQuantizedGGUFType(const std::string& data_type) {
-    return !data_type.empty() &&
-           (data_type[0] == 'Q' || data_type[0] == 'I' || data_type[0] == 'T');
+    if (data_type.empty()) {
+        return false;
+    }
+
+    std::string lower_type = data_type;
+    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lower_type.rfind("q", 0) == 0 ||
+           lower_type.rfind("iq", 0) == 0 ||
+           lower_type.rfind("tq", 0) == 0;
 }
 
 std::string stripTensorSuffix(std::string tensor_name) {
