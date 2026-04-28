@@ -9,7 +9,7 @@
  * Key Features:
  * - Complete ONNX protobuf model parsing
  * - Layer-by-layer weight and bias extraction
- * - Metadata preservation for reconstruction
+ * - Metadata preservation for inference and extraction
  * - Multi-threading for large model processing
  * - Memory-efficient streaming parsing
  * - Support for quantized and specialized layer types
@@ -822,6 +822,217 @@ void ONNXModelParser::processGraphStructure(const onnx::GraphProto& graph_proto,
     );
     graph_segment.original_size = graph_segment.data.size();
     segments.push_back(std::move(graph_segment));
+
+    const auto tensor_shapes = buildTensorShapeMap(graph_proto);
+    size_t node_index = 0;
+    for (const auto& node : graph_proto.node()) {
+        ++node_index;
+        std::string op_type = node.op_type();
+        std::string lower_op = op_type;
+        std::transform(lower_op.begin(), lower_op.end(), lower_op.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        bool supported_op = true;
+        std::string metadata_type_value = lower_op;
+        if (lower_op == "add") {
+            op_type = "Add";
+        } else if (lower_op == "sub") {
+            op_type = "Sub";
+        } else if (lower_op == "mul") {
+            op_type = "Mul";
+        } else if (lower_op == "div") {
+            op_type = "Div";
+        } else if (lower_op == "relu") {
+            op_type = "Relu";
+        } else if (lower_op == "sigmoid") {
+            op_type = "Sigmoid";
+        } else if (lower_op == "hardsigmoid") {
+            op_type = "Sigmoid";
+            metadata_type_value = "hardsigmoid";
+        } else if (lower_op == "tanh") {
+            op_type = "Tanh";
+        } else if (lower_op == "softmax") {
+            op_type = "Softmax";
+        } else if (lower_op == "gelu") {
+            op_type = "Gelu";
+        } else if (lower_op == "leakyrelu") {
+            op_type = "LeakyRelu";
+        } else if (lower_op == "elu") {
+            op_type = "Elu";
+        } else if (lower_op == "silu" || lower_op == "swish") {
+            op_type = "Silu";
+        } else if (lower_op == "reshape") {
+            op_type = "Reshape";
+        } else if (lower_op == "transpose") {
+            op_type = "Transpose";
+        } else if (lower_op == "flatten") {
+            op_type = "Flatten";
+        } else if (lower_op == "concat") {
+            op_type = "Concat";
+        } else if (lower_op == "slice") {
+            op_type = "Slice";
+        } else if (lower_op == "gather") {
+            op_type = "Gather";
+        } else if (lower_op == "matmul") {
+            op_type = "MatMul";
+        } else if (lower_op == "gemm") {
+            op_type = "Gemm";
+        } else if (lower_op == "conv") {
+            op_type = "Conv";
+            metadata_type_value = "conv";
+        } else if (lower_op == "convtranspose") {
+            op_type = "ConvTranspose";
+            metadata_type_value = "conv";
+        } else if (lower_op == "batchnormalization") {
+            op_type = "BatchNormalization";
+            metadata_type_value = "batchnormalization";
+        } else if (lower_op == "layernormalization" ||
+                   lower_op == "skiplayernormalization" ||
+                   lower_op == "simplifiedlayernormalization") {
+            op_type = "LayerNormalization";
+            metadata_type_value = "layernormalization";
+        } else if (lower_op == "maxpool") {
+            op_type = "MaxPool";
+            metadata_type_value = "maxpool";
+        } else if (lower_op == "averagepool" || lower_op == "avgpool") {
+            op_type = "AveragePool";
+            metadata_type_value = "averagepool";
+        } else if (lower_op == "globalaveragepool") {
+            op_type = "GlobalAveragePool";
+            metadata_type_value = "averagepool";
+        } else if (lower_op == "attention") {
+            op_type = "ATTENTION";
+            metadata_type_value = "attention";
+        } else {
+            supported_op = false;
+        }
+
+        if (!supported_op) {
+            continue;
+        }
+
+        ModelSegment op_segment;
+        op_segment.type = SegmentType::METADATA_JSON;
+        op_segment.layer_type = op_type;
+        op_segment.layer_index = node_index;
+        op_segment.layer_name = !node.name().empty() ? node.name() : ("node_" + std::to_string(node_index) + "_" + op_type);
+        op_segment.name = "op." + op_segment.layer_name;
+        op_segment.data_format = "ONNX_OP";
+
+        if (!node.input().empty()) {
+            const auto input_it = tensor_shapes.find(node.input(0));
+            if (input_it != tensor_shapes.end()) {
+                op_segment.input_shape = input_it->second;
+            }
+        }
+        if (!node.output().empty()) {
+            const auto output_it = tensor_shapes.find(node.output(0));
+            if (output_it != tensor_shapes.end()) {
+                op_segment.output_shape = output_it->second;
+            }
+        }
+
+        TensorMetadata op_metadata;
+        op_metadata.is_sorted = true;
+        op_metadata.sparsity_ratio = 0.0f;
+        if (!op_segment.output_shape.empty()) {
+            op_metadata.dimensions = op_segment.output_shape;
+        } else if (!op_segment.input_shape.empty()) {
+            op_metadata.dimensions = op_segment.input_shape;
+        }
+        op_segment.tensor_metadata = op_metadata;
+
+        std::ostringstream meta_stream;
+        meta_stream << "type " << metadata_type_value << " ";
+        meta_stream << "op_type " << op_type << " ";
+        if (op_type == "Relu") {
+            meta_stream << "activation relu ";
+        } else if (op_type == "Sigmoid") {
+            meta_stream << "activation sigmoid ";
+        } else if (op_type == "Tanh") {
+            meta_stream << "activation tanh ";
+        } else if (op_type == "Softmax") {
+            meta_stream << "activation softmax ";
+        } else if (op_type == "Gelu") {
+            meta_stream << "activation gelu ";
+        } else if (op_type == "LeakyRelu") {
+            meta_stream << "activation leaky_relu ";
+        } else if (op_type == "Elu") {
+            meta_stream << "activation elu ";
+        } else if (op_type == "Silu") {
+            meta_stream << "activation silu ";
+        } else if (op_type == "MaxPool") {
+            meta_stream << "activation max ";
+        } else if (op_type == "AveragePool" || op_type == "GlobalAveragePool") {
+            meta_stream << "activation avg ";
+        }
+
+        for (const auto& attr : node.attribute()) {
+            if (attr.type() == onnx::AttributeProto::INT) {
+                if (attr.name() == "axis") {
+                    meta_stream << "axis " << attr.i() << " ";
+                }
+            } else if (attr.type() == onnx::AttributeProto::FLOAT) {
+                if (attr.name() == "alpha") {
+                    meta_stream << "alpha " << attr.f() << " ";
+                } else if (attr.name() == "beta") {
+                    meta_stream << "beta " << attr.f() << " ";
+                } else if (attr.name() == "epsilon") {
+                    meta_stream << "epsilon " << attr.f() << " ";
+                }
+            }
+
+            if (attr.type() == onnx::AttributeProto::INTS && attr.ints_size() > 0) {
+                if (attr.name() == "kernel_shape" || attr.name() == "strides") {
+                    meta_stream << attr.name() << " ";
+                    for (int index = 0; index < attr.ints_size(); ++index) {
+                        if (index > 0) {
+                            meta_stream << ",";
+                        }
+                        meta_stream << attr.ints(index);
+                    }
+                    meta_stream << " ";
+                } else if (attr.name() == "perm") {
+                    meta_stream << "perm ";
+                    for (int index = 0; index < attr.ints_size(); ++index) {
+                        if (index > 0) {
+                            meta_stream << ",";
+                        }
+                        meta_stream << attr.ints(index);
+                    }
+                    meta_stream << " ";
+                } else if (attr.name() == "starts" || attr.name() == "ends" || attr.name() == "axes") {
+                    meta_stream << attr.name() << " ";
+                    for (int index = 0; index < attr.ints_size(); ++index) {
+                        if (index > 0) {
+                            meta_stream << ",";
+                        }
+                        meta_stream << attr.ints(index);
+                    }
+                    meta_stream << " ";
+                } else if (attr.name() == "pads") {
+                    meta_stream << "padding ";
+                    const int pad_count = std::min(2, attr.ints_size());
+                    for (int index = 0; index < pad_count; ++index) {
+                        if (index > 0) {
+                            meta_stream << ",";
+                        }
+                        meta_stream << attr.ints(index);
+                    }
+                    meta_stream << " ";
+                }
+            }
+        }
+
+        const std::string payload = meta_stream.str();
+        op_segment.data.assign(
+            reinterpret_cast<const std::byte*>(payload.data()),
+            reinterpret_cast<const std::byte*>(payload.data() + payload.size())
+        );
+        op_segment.original_size = op_segment.data.size();
+        segments.push_back(std::move(op_segment));
+    }
 }
 
 void ONNXModelParser::processInitializers(const onnx::GraphProto& graph_proto, std::vector<ModelSegment>& segments) const {

@@ -30,7 +30,7 @@ namespace CortexAICompression {
  * @brief Enumeration of supported neural network segment data types
  * 
  * Identifies the type of data contained within a model segment for
- * appropriate processing, compression, and reconstruction handling.
+ * appropriate processing, compression, and decompression handling.
  */
 enum class SegmentType {
     UNKNOWN,                    ///< Unknown or unidentified segment type

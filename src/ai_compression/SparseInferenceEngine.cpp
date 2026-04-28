@@ -97,10 +97,343 @@ static bool isWeightLikeSegmentType(SegmentType type) {
            type == SegmentType::LAYER_NORM_WEIGHTS;
 }
 
+static bool isExecutableOpLayerType(const std::string& layer_type) {
+    if (layer_type.empty()) {
+        return false;
+    }
+    std::string lower = layer_type;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lower == "add" ||
+           lower == "sub" ||
+           lower == "mul" ||
+           lower == "div" ||
+           lower == "relu" ||
+           lower == "sigmoid" ||
+           lower == "tanh" ||
+           lower == "softmax" ||
+           lower == "gelu" ||
+           lower == "leakyrelu" ||
+           lower == "elu" ||
+           lower == "silu" ||
+           lower == "swish" ||
+           lower == "reshape" ||
+           lower == "transpose" ||
+           lower == "flatten" ||
+           lower == "concat" ||
+           lower == "slice" ||
+           lower == "gather" ||
+           lower == "matmul" ||
+           lower == "gemm" ||
+           lower == "conv" ||
+           lower == "convtranspose" ||
+           lower == "batchnormalization" ||
+           lower == "layernormalization" ||
+           lower == "maxpool" ||
+           lower == "averagepool" ||
+           lower == "avgpool" ||
+           lower == "globalaveragepool" ||
+           lower == "attention";
+}
+
 static bool isBiasLikeSegmentName(const std::string& segment_name) {
     return segment_name.find(".bias") != std::string::npos ||
            segment_name.find("/bias") != std::string::npos ||
            segment_name.find("_bias") != std::string::npos;
+}
+
+enum class TensorDecodeKind {
+    FP32,
+    FP16,
+    BF16,
+    INT8,
+    INT4
+};
+
+static std::string toLowerCopy(std::string value);
+
+static bool startsWith(const std::string& value, const std::string& prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+static inline float bf16_to_fp32(uint16_t h) {
+    const uint32_t bits = static_cast<uint32_t>(h) << 16;
+    return *reinterpret_cast<const float*>(&bits);
+}
+
+static bool isGGUFQuantizedFormat(const std::string& format_lower) {
+    return startsWith(format_lower, "q") || startsWith(format_lower, "iq") || startsWith(format_lower, "tq");
+}
+
+static size_t ggufBlockBytesForFormat(const std::string& format_lower) {
+    if (format_lower == "q4_0") return 18;
+    if (format_lower == "q4_1") return 20;
+    if (format_lower == "q5_0") return 22;
+    if (format_lower == "q5_1") return 24;
+    if (format_lower == "q8_0") return 34;
+    if (format_lower == "q8_1") return 40;
+    if (format_lower == "q2_k") return 84;
+    if (format_lower == "q3_k") return 110;
+    if (format_lower == "q4_k") return 144;
+    if (format_lower == "q5_k") return 176;
+    if (format_lower == "q6_k") return 210;
+    if (format_lower == "q8_k") return 292;
+    if (format_lower == "iq2_xxs") return 66;
+    if (format_lower == "iq2_xs") return 74;
+    if (format_lower == "iq3_xxs") return 98;
+    if (format_lower == "iq1_s") return 50;
+    if (format_lower == "iq4_nl") return 18;
+    if (format_lower == "iq3_s") return 110;
+    if (format_lower == "iq2_s") return 82;
+    if (format_lower == "iq4_xs") return 136;
+    if (format_lower == "iq1_m") return 56;
+    if (format_lower == "q4_0_4_4") return 72;
+    if (format_lower == "q4_0_4_8") return 144;
+    if (format_lower == "q4_0_8_8") return 144;
+    if (format_lower == "tq1_0") return 54;
+    if (format_lower == "tq2_0") return 66;
+    return 0;
+}
+
+static size_t ggufBlockElementsForFormat(const std::string& format_lower) {
+    if (format_lower == "q4_0" || format_lower == "q4_1" ||
+        format_lower == "q5_0" || format_lower == "q5_1" ||
+        format_lower == "q8_0" || format_lower == "q8_1" ||
+        format_lower == "iq4_nl") {
+        return 32;
+    }
+    if (format_lower == "q4_0_4_4") {
+        return 128;
+    }
+    if (format_lower == "q2_k" || format_lower == "q3_k" || format_lower == "q4_k" || format_lower == "q5_k" ||
+        format_lower == "q6_k" || format_lower == "q8_k" ||
+        format_lower == "iq2_xxs" || format_lower == "iq2_xs" || format_lower == "iq3_xxs" ||
+        format_lower == "iq1_s" || format_lower == "iq3_s" || format_lower == "iq2_s" ||
+        format_lower == "iq4_xs" || format_lower == "iq1_m" ||
+        format_lower == "q4_0_4_8" || format_lower == "q4_0_8_8" ||
+        format_lower == "tq1_0" || format_lower == "tq2_0") {
+        return 256;
+    }
+    return 0;
+}
+
+static size_t ggufQuantBitsForFormat(const std::string& format_lower) {
+    if (format_lower == "q2_k" || format_lower == "iq2_xxs" || format_lower == "iq2_xs" || format_lower == "iq2_s" ||
+        format_lower == "tq2_0") {
+        return 2;
+    }
+    if (format_lower == "q3_k" || format_lower == "iq3_xxs" || format_lower == "iq3_s") {
+        return 3;
+    }
+    if (format_lower == "q4_k" || format_lower == "q4_0_4_4" || format_lower == "q4_0_4_8" || format_lower == "q4_0_8_8" ||
+        format_lower == "iq4_nl" || format_lower == "iq4_xs") {
+        return 4;
+    }
+    if (format_lower == "q5_k") {
+        return 5;
+    }
+    if (format_lower == "iq1_s" || format_lower == "iq1_m" || format_lower == "tq1_0") {
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t readPackedBitsLSB(const uint8_t* bytes, size_t bit_offset, size_t bit_count) {
+    uint32_t value = 0;
+    for (size_t bit = 0; bit < bit_count; ++bit) {
+        const size_t absolute_bit = bit_offset + bit;
+        const size_t byte_index = absolute_bit / 8;
+        const size_t bit_index = absolute_bit % 8;
+        const uint8_t bit_value = static_cast<uint8_t>((bytes[byte_index] >> bit_index) & 0x01U);
+        value |= static_cast<uint32_t>(bit_value) << bit;
+    }
+    return value;
+}
+
+static bool decodeSupportedGGUFQuantized(
+    const std::vector<std::byte>& source_data,
+    const std::string& format_lower,
+    size_t num_elements,
+    std::vector<float>& output
+) {
+    if (num_elements == 0 || source_data.empty()) {
+        output.clear();
+        return true;
+    }
+
+    const size_t block_bytes = ggufBlockBytesForFormat(format_lower);
+    if (block_bytes == 0 || source_data.size() < block_bytes) {
+        return false;
+    }
+
+    const size_t block_elems = ggufBlockElementsForFormat(format_lower);
+    if (block_elems == 0) {
+        return false;
+    }
+
+    const size_t available_blocks = source_data.size() / block_bytes;
+    const size_t available_elements = available_blocks * block_elems;
+    if (available_elements == 0) {
+        output.clear();
+        return true;
+    }
+    const size_t decode_count = std::min(num_elements, available_elements);
+    output.assign(decode_count, 0.0f);
+
+    size_t out_index = 0;
+    for (size_t block_index = 0; block_index < available_blocks && out_index < decode_count; ++block_index) {
+        const uint8_t* block = reinterpret_cast<const uint8_t*>(source_data.data()) + (block_index * block_bytes);
+
+        if (format_lower == "q8_0") {
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
+            for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                output[out_index++] = static_cast<float>(qs[i]) * d;
+            }
+            continue;
+        }
+
+        if (format_lower == "q8_1") {
+            float d = 0.0f;
+            std::memcpy(&d, block, sizeof(float));
+            const int8_t* qs = reinterpret_cast<const int8_t*>(block + 8);
+            for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                output[out_index++] = static_cast<float>(qs[i]) * d;
+            }
+            continue;
+        }
+
+        if (format_lower == "q6_k") {
+            // q6_k block layout (210 bytes): ql[128], qh[64], scales[16], d(fp16)
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 208));
+            for (size_t i = 0; i < 256 && out_index < decode_count; ++i) {
+                const uint8_t low4 = (i & 1U) == 0U ? (ql[i / 2] & 0x0F) : (ql[i / 2] >> 4);
+                const uint8_t high2 = static_cast<uint8_t>((qh[i / 4] >> (2 * (i % 4))) & 0x03U);
+                const int q = static_cast<int>(low4 | (high2 << 4)) - 32;
+                const int scale = static_cast<int>(scales[i / 16]);
+                output[out_index++] = static_cast<float>(q * scale) * d;
+            }
+            continue;
+        }
+
+        if (format_lower == "q8_k") {
+            // q8_k block layout (292 bytes): d(fp16), dmin(fp16), qs[256], bsums[16]int16
+            // For inference decoding we decode the primary qs stream scaled by d.
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const int8_t* qs = reinterpret_cast<const int8_t*>(block + 4);
+            for (size_t i = 0; i < 256 && out_index < decode_count; ++i) {
+                output[out_index++] = static_cast<float>(qs[i]) * d;
+            }
+            continue;
+        }
+
+        if (format_lower == "q4_0") {
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const uint8_t* qs = block + 2;
+            for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                const uint8_t nibble = (i & 1U) == 0U ? (qs[i / 2] & 0x0F) : (qs[i / 2] >> 4);
+                output[out_index++] = (static_cast<float>(nibble) - 8.0f) * d;
+            }
+            continue;
+        }
+
+        if (format_lower == "q4_1") {
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 2));
+            const uint8_t* qs = block + 4;
+            for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                const uint8_t nibble = (i & 1U) == 0U ? (qs[i / 2] & 0x0F) : (qs[i / 2] >> 4);
+                output[out_index++] = static_cast<float>(nibble) * d + m;
+            }
+            continue;
+        }
+
+        if (format_lower == "q5_0" || format_lower == "q5_1") {
+            const bool has_m = format_lower == "q5_1";
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const float m = has_m ? fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 2)) : 0.0f;
+            const uint8_t* qh = block + (has_m ? 4 : 2);
+            const uint8_t* qs = block + (has_m ? 8 : 6);
+            const uint32_t high_bits =
+                static_cast<uint32_t>(qh[0]) |
+                (static_cast<uint32_t>(qh[1]) << 8) |
+                (static_cast<uint32_t>(qh[2]) << 16) |
+                (static_cast<uint32_t>(qh[3]) << 24);
+            for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                uint8_t q = (i & 1U) == 0U ? (qs[i / 2] & 0x0F) : (qs[i / 2] >> 4);
+                q |= static_cast<uint8_t>(((high_bits >> i) & 0x01U) << 4);
+                output[out_index++] = has_m ? (static_cast<float>(q) * d + m)
+                                            : ((static_cast<float>(q) - 16.0f) * d);
+            }
+            continue;
+        }
+
+        // Generic fallback for remaining GGUF block formats where exact
+        // sub-block scale/min tables differ per variant.
+        const size_t bits = ggufQuantBitsForFormat(format_lower);
+        if (bits == 0) {
+            return false;
+        }
+        const size_t packed_bytes = (block_elems * bits + 7) / 8;
+        if (packed_bytes == 0 || packed_bytes > block_bytes) {
+            return false;
+        }
+        const size_t data_offset = block_bytes - packed_bytes;
+        const uint8_t* packed = block + data_offset;
+
+        float d = 1.0f;
+        if (block_bytes >= 2) {
+            d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            if (!std::isfinite(d) || std::abs(d) < 1e-12f) {
+                d = 1.0f;
+            }
+        }
+
+        const int32_t centered_offset = static_cast<int32_t>(1U << (bits - 1));
+        for (size_t i = 0; i < block_elems && out_index < decode_count; ++i) {
+            const uint32_t q = readPackedBitsLSB(packed, i * bits, bits);
+            const int32_t signed_q = static_cast<int32_t>(q) - centered_offset;
+            output[out_index++] = static_cast<float>(signed_q) * d;
+        }
+        continue;
+    }
+
+    return out_index == decode_count;
+}
+
+static TensorDecodeKind detectTensorDecodeKind(const ModelSegment& model_segment) {
+    const std::string format = toLowerCopy(model_segment.data_format);
+    if (format == "f16" || format == "fp16") {
+        return TensorDecodeKind::FP16;
+    }
+    if (format == "bf16") {
+        return TensorDecodeKind::BF16;
+    }
+    if (isGGUFQuantizedFormat(format)) {
+        return TensorDecodeKind::FP32; // Decode via GGUF block path.
+    }
+    if (format == "i8" || format == "int8") {
+        return TensorDecodeKind::INT8;
+    }
+    if (startsWith(format, "int4")) {
+        return TensorDecodeKind::INT4;
+    }
+
+    if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+        return TensorDecodeKind::FP16;
+    }
+    if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+        return TensorDecodeKind::INT8;
+    }
+    if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+        return TensorDecodeKind::INT4;
+    }
+
+    return TensorDecodeKind::FP32;
 }
 
 static std::string toLowerCopy(std::string value) {
@@ -108,6 +441,26 @@ static std::string toLowerCopy(std::string value) {
         return static_cast<char>(std::tolower(ch));
     });
     return value;
+}
+
+static size_t productFromShape(const std::vector<size_t>& shape, bool drop_batch_dim_if_present) {
+    if (shape.empty()) {
+        return 0;
+    }
+    size_t start = 0;
+    if (drop_batch_dim_if_present && shape.size() >= 2) {
+        start = 1;
+    }
+
+    size_t product = 1;
+    for (size_t index = start; index < shape.size(); ++index) {
+        const size_t dim = shape[index];
+        if (dim == 0 || product > (std::numeric_limits<size_t>::max() / dim)) {
+            return 0;
+        }
+        product *= dim;
+    }
+    return product;
 }
 
 static std::string deriveExecutionName(const CompressedSegmentHeader& seg) {
@@ -130,6 +483,15 @@ static std::string deriveExecutionName(const CompressedSegmentHeader& seg) {
     return name;
 }
 
+static bool supportsSparseStreamingCompute(const std::vector<std::byte>& compressed_bytes) {
+    if (compressed_bytes.empty()) {
+        return false;
+    }
+    const uint8_t flag = static_cast<uint8_t>(compressed_bytes[0]);
+    // SDRIndexStorageStrategy::forEachIndexValue currently supports these formats.
+    return flag == 0x95 || flag == 0x96;
+}
+
 /**
  * @brief Decode varint-encoded indices from SDR compressed data.
  * @param data Raw compressed byte buffer containing varint-encoded indices.
@@ -137,7 +499,7 @@ static std::string deriveExecutionName(const CompressedSegmentHeader& seg) {
  *
  * @details Decodes a sequence of unsigned varints packed consecutively.
  * Each varint uses the MSB as a continuation bit. This routine is used to
- * reconstruct sparse position lists for compressed tensors.
+ * rebuild sparse position lists for compressed tensors.
  *
  * @complexity O(N) where N is the number of decoded indices.
  */
@@ -169,16 +531,73 @@ std::vector<size_t> SDRModelLoader::decode_varint_indices(const std::vector<std:
  * @note This parser is tolerant and best-effort; validation occurs later during
  * execution. Invalid numeric conversions may throw std::invalid_argument.
  */
-void SDRModelLoader::parseLayerMetadata(const std::string& metadata, LayerInfo& layer) {
+static void parseLayerMetadataPayload(const std::string& metadata, LayerInfo& layer) {
     std::istringstream iss(metadata);
     std::string key, value;
     
     while (iss >> key >> value) {
         if (key == "type") {
-            if (value == "conv")
+            std::string lower_value = toLowerCopy(value);
+            if (lower_value == "conv")
                 layer.layer_type = "CONV2D";
-            else
+            else if (lower_value == "linear" || lower_value == "gemm" || lower_value == "matmul" || lower_value == "dense")
                 layer.layer_type = "LINEAR";
+            else if (lower_value == "attention")
+                layer.layer_type = "ATTENTION";
+            else if (lower_value == "norm" || lower_value == "layer_norm")
+                layer.layer_type = "NORM";
+            else if (lower_value == "batchnormalization")
+                layer.layer_type = "BatchNormalization";
+            else if (lower_value == "layernormalization")
+                layer.layer_type = "LayerNormalization";
+            else if (lower_value == "pool")
+                layer.layer_type = "POOLING";
+            else if (lower_value == "activation")
+                layer.layer_type = "ACTIVATION";
+            else if (lower_value == "add")
+                layer.layer_type = "Add";
+            else if (lower_value == "relu")
+                layer.layer_type = "Relu";
+            else if (lower_value == "sigmoid")
+                layer.layer_type = "Sigmoid";
+            else if (lower_value == "tanh")
+                layer.layer_type = "Tanh";
+            else if (lower_value == "softmax")
+                layer.layer_type = "Softmax";
+            else if (lower_value == "gelu")
+                layer.layer_type = "Gelu";
+            else if (lower_value == "leakyrelu" || lower_value == "leaky_relu")
+                layer.layer_type = "LeakyRelu";
+            else if (lower_value == "elu")
+                layer.layer_type = "Elu";
+            else if (lower_value == "silu" || lower_value == "swish")
+                layer.layer_type = "Silu";
+            else if (lower_value == "reshape")
+                layer.layer_type = "Reshape";
+            else if (lower_value == "transpose")
+                layer.layer_type = "Transpose";
+            else if (lower_value == "flatten")
+                layer.layer_type = "Flatten";
+            else if (lower_value == "concat")
+                layer.layer_type = "Concat";
+            else if (lower_value == "slice")
+                layer.layer_type = "Slice";
+            else if (lower_value == "gather")
+                layer.layer_type = "Gather";
+            else if (lower_value == "sub")
+                layer.layer_type = "Sub";
+            else if (lower_value == "mul")
+                layer.layer_type = "Mul";
+            else if (lower_value == "div")
+                layer.layer_type = "Div";
+            else if (lower_value == "maxpool")
+                layer.layer_type = "MaxPool";
+            else if (lower_value == "averagepool" || lower_value == "avgpool")
+                layer.layer_type = "AveragePool";
+            else if (lower_value == "globalaveragepool")
+                layer.layer_type = "GlobalAveragePool";
+            else
+                layer.layer_type = value;
         } else if (key == "kernel_shape") {
             std::istringstream value_stream(value);
             std::string dim;
@@ -203,8 +622,32 @@ void SDRModelLoader::parseLayerMetadata(const std::string& metadata, LayerInfo& 
             layer.properties.dropout_rate = std::stof(value);
         } else if (key == "batch_norm") {
             layer.properties.use_batch_norm = (value == "true");
+        } else if (key == "op_type") {
+            if (layer.layer_type.empty()) {
+                layer.layer_type = value;
+            }
+            const std::string lower_value = toLowerCopy(value);
+            if (lower_value == "matmul") {
+                layer.layer_type = "MatMul";
+            } else if (lower_value == "gemm") {
+                layer.layer_type = "Gemm";
+            } else if (lower_value == "conv") {
+                layer.layer_type = "Conv";
+            } else if (lower_value == "convtranspose") {
+                layer.layer_type = "ConvTranspose";
+            } else if (lower_value == "batchnormalization") {
+                layer.layer_type = "BatchNormalization";
+            } else if (lower_value == "layernormalization") {
+                layer.layer_type = "LayerNormalization";
+            } else if (lower_value == "globalaveragepool") {
+                layer.layer_type = "GlobalAveragePool";
+            }
         }
     }
+}
+
+void SDRModelLoader::parseLayerMetadata(const std::string& metadata, LayerInfo& layer) {
+    parseLayerMetadataPayload(metadata, layer);
 }
 
 /**
@@ -272,6 +715,26 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     const auto& source_data = model_segment.data;
     const std::string lower_layer_type = toLowerCopy(layer.layer_type);
     const bool norm_like = lower_layer_type.find("norm") != std::string::npos;
+    const bool weight_like_segment = isWeightLikeSegmentType(model_segment.type);
+
+    if (!weight_like_segment) {
+        if (!source_data.empty() &&
+            (model_segment.type == SegmentType::METADATA_JSON ||
+             model_segment.type == SegmentType::CONFIG ||
+             model_segment.type == SegmentType::METADATA_TOML)) {
+            const std::string metadata_text(
+                reinterpret_cast<const char*>(source_data.data()),
+                source_data.size()
+            );
+            parseLayerMetadataPayload(metadata_text, layer);
+        }
+        return;
+    }
+
+    const TensorDecodeKind decode_kind = detectTensorDecodeKind(model_segment);
+    const std::string format_lower = toLowerCopy(model_segment.data_format);
+    const bool is_gguf_quantized = isGGUFQuantizedFormat(format_lower);
+    const bool supports_direct_gguf_decode = ggufBlockBytesForFormat(format_lower) > 0;
 
     size_t num_elements = 0;
     if (model_segment.tensor_metadata && !model_segment.tensor_metadata->dimensions.empty()) {
@@ -286,17 +749,23 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     }
     if (num_elements == 0) {
         size_t element_size = sizeof(float);
-        if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+        if (decode_kind == TensorDecodeKind::FP16) {
             element_size = sizeof(uint16_t);
-        } else if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+        } else if (decode_kind == TensorDecodeKind::INT8) {
             element_size = sizeof(int8_t);
-        } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+        } else if (decode_kind == TensorDecodeKind::INT4) {
             element_size = 0; // Packed 4-bit path handled separately below.
         }
         if (element_size > 0 && model_segment.original_size > 0) {
             num_elements = model_segment.original_size / element_size;
-        } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+        } else if (decode_kind == TensorDecodeKind::INT4) {
             num_elements = model_segment.original_size * 2;
+        }
+        if (num_elements == 0 && supports_direct_gguf_decode) {
+            const size_t block_bytes = ggufBlockBytesForFormat(format_lower);
+            if (block_bytes > 0) {
+                num_elements = (source_data.size() / block_bytes) * 32;
+            }
         }
     }
 
@@ -304,20 +773,40 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     if (isBiasLikeSegmentName(model_segment.name)) {
         if (!source_data.empty()) {
             layer.biases.resize(num_elements);
-             if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+             if (is_gguf_quantized && supports_direct_gguf_decode) {
+                std::vector<float> decoded;
+                if (decodeSupportedGGUFQuantized(source_data, format_lower, num_elements, decoded)) {
+                    layer.biases = std::move(decoded);
+                } else {
+                    std::cerr << "[SDRInferenceEngine] WARNING: Failed decoding GGUF quantized biases format '"
+                              << model_segment.data_format << "' for segment " << model_segment.name << std::endl;
+                    layer.biases.clear();
+                }
+            } else if (is_gguf_quantized) {
+                std::cerr << "[SDRInferenceEngine] WARNING: Unsupported GGUF quantized format '" << model_segment.data_format
+                          << "' for layer segment " << model_segment.name
+                          << ". Clearing decoded bias tensor; layer may fall back to pass-through." << std::endl;
+                layer.biases.clear();
+            } else if (decode_kind == TensorDecodeKind::FP16) {
                 // Convert FP16 to FP32
                 const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.biases[i] = fp16_to_fp32(fp16_data[i]);
                 }
-            } else if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+            } else if (decode_kind == TensorDecodeKind::BF16) {
+                const uint16_t* bf16_data = reinterpret_cast<const uint16_t*>(source_data.data());
+                const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
+                for (size_t i = 0; i < max_elements; ++i) {
+                    layer.biases[i] = bf16_to_fp32(bf16_data[i]);
+                }
+            } else if (decode_kind == TensorDecodeKind::INT8) {
                 const int8_t* int8_data = reinterpret_cast<const int8_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size());
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.biases[i] = static_cast<float>(int8_data[i]);
                 }
-            } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+            } else if (decode_kind == TensorDecodeKind::INT4) {
                 size_t out_index = 0;
                 for (size_t i = 0; i < source_data.size() && out_index < num_elements; ++i) {
                     const uint8_t packed = static_cast<uint8_t>(source_data[i]);
@@ -339,20 +828,40 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     } else {
         if (!source_data.empty()) {
             layer.weights.resize(num_elements);
-            if (model_segment.type == SegmentType::WEIGHTS_FP16) {
+            if (is_gguf_quantized && supports_direct_gguf_decode) {
+                std::vector<float> decoded;
+                if (decodeSupportedGGUFQuantized(source_data, format_lower, num_elements, decoded)) {
+                    layer.weights = std::move(decoded);
+                } else {
+                    std::cerr << "[SDRInferenceEngine] WARNING: Failed decoding GGUF quantized weights format '"
+                              << model_segment.data_format << "' for segment " << model_segment.name << std::endl;
+                    layer.weights.clear();
+                }
+            } else if (is_gguf_quantized) {
+                std::cerr << "[SDRInferenceEngine] WARNING: Unsupported GGUF quantized format '" << model_segment.data_format
+                          << "' for layer segment " << model_segment.name
+                          << ". Clearing decoded weight tensor; layer may fall back to pass-through." << std::endl;
+                layer.weights.clear();
+            } else if (decode_kind == TensorDecodeKind::FP16) {
                 // Convert FP16 to FP32
                 const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.weights[i] = fp16_to_fp32(fp16_data[i]);
                 }
-            } else if (model_segment.type == SegmentType::WEIGHTS_INT8) {
+            } else if (decode_kind == TensorDecodeKind::BF16) {
+                const uint16_t* bf16_data = reinterpret_cast<const uint16_t*>(source_data.data());
+                const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
+                for (size_t i = 0; i < max_elements; ++i) {
+                    layer.weights[i] = bf16_to_fp32(bf16_data[i]);
+                }
+            } else if (decode_kind == TensorDecodeKind::INT8) {
                 const int8_t* int8_data = reinterpret_cast<const int8_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size());
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.weights[i] = static_cast<float>(int8_data[i]);
                 }
-            } else if (model_segment.type == SegmentType::WEIGHTS_INT4) {
+            } else if (decode_kind == TensorDecodeKind::INT4) {
                 size_t out_index = 0;
                 for (size_t i = 0; i < source_data.size() && out_index < num_elements; ++i) {
                     const uint8_t packed = static_cast<uint8_t>(source_data[i]);
@@ -400,6 +909,31 @@ void SDRModelLoader::loadFromArchive(const std::string& archive_path) {
 
         // Read only headers for on-demand loading efficiency
         segments_ = decompressor_->readArchiveHeaders(infile);
+#ifdef ENABLE_ONNX_PROTOBUF
+        loaded_model_proto_.reset();
+        const auto graph_it = std::find_if(segments_.begin(), segments_.end(), [](const CompressedSegmentHeader& seg) {
+            return seg.original_type == SegmentType::GRAPH_STRUCTURE_PROTO;
+        });
+        if (graph_it != segments_.end()) {
+            try {
+                ModelSegment graph_segment = decompressor_->decompressSegment(
+                    archive_path, *graph_it, graph_it->data_offset
+                );
+                if (!graph_segment.data.empty()) {
+                    onnx::GraphProto graph_proto;
+                    if (graph_proto.ParseFromArray(graph_segment.data.data(), static_cast<int>(graph_segment.data.size()))) {
+                        onnx::ModelProto model_proto;
+                        model_proto.mutable_graph()->CopyFrom(graph_proto);
+                        loaded_model_proto_ = std::move(model_proto);
+                    } else {
+                        std::cerr << "[SDRModelLoader] WARNING: Failed to parse GRAPH_STRUCTURE_PROTO payload as ONNX GraphProto" << std::endl;
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[SDRModelLoader] WARNING: Failed to load ONNX graph structure from archive: " << e.what() << std::endl;
+            }
+        }
+#endif
 
     } catch (const std::exception& e) {
         std::cerr << "Error loading compressed model headers: " << e.what() << std::endl;
@@ -497,9 +1031,13 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
                 !bias_segment &&
                 !have_primary_compressed_weights &&
                 seg_info.compression_strategy_id == SDR_STRATEGY_ID) {
-                layer.raw_data = decompressor_->readCompressedBytes(archive_path_, seg_info, seg_info.data_offset);
-                have_primary_compressed_weights = true;
-                continue;
+                std::vector<std::byte> compressed_bytes =
+                    decompressor_->readCompressedBytes(archive_path_, seg_info, seg_info.data_offset);
+                if (supportsSparseStreamingCompute(compressed_bytes)) {
+                    layer.raw_data = std::move(compressed_bytes);
+                    have_primary_compressed_weights = true;
+                    continue;
+                }
             }
 
             ModelSegment model_segment = decompressor_->decompressSegment(
@@ -576,6 +1114,12 @@ SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
     op_dispatch_["Conv"] = [this](const LayerInfo& l, const std::vector<float>& in) { 
         return applyConvolutionalLayer(l, in); 
     };
+    op_dispatch_["CONV2D"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return applyConvolutionalLayer(l, in);
+    };
+    op_dispatch_["ConvTranspose"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return applyConvolutionalLayer(l, in);
+    };
     op_dispatch_["MatMul"] = [this](const LayerInfo& l, const std::vector<float>& in) { 
         return applyLinearLayer(l, in); 
     };
@@ -603,8 +1147,80 @@ SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
     op_dispatch_["BATCH_NORM"] = [this](const LayerInfo& l, const std::vector<float>& in) { 
         return applyBatchNorm(l, in); 
     };
+    op_dispatch_["BatchNormalization"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeNormalizationOperation(l, in);
+    };
+    op_dispatch_["LayerNormalization"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeNormalizationOperation(l, in);
+    };
     op_dispatch_["ACTIVATION"] = [this](const LayerInfo& l, const std::vector<float>& in) { 
         return applyActivation(l.properties.activation_type, in); 
+    };
+    op_dispatch_["Relu"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Sigmoid"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Tanh"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Softmax"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Gelu"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["LeakyRelu"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Elu"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Silu"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["Swish"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeActivationOperation(l, in);
+    };
+    op_dispatch_["MaxPool"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executePoolingOperation(l, in);
+    };
+    op_dispatch_["AveragePool"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executePoolingOperation(l, in);
+    };
+    op_dispatch_["GlobalAveragePool"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executePoolingOperation(l, in);
+    };
+    op_dispatch_["Add"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Sub"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Mul"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Div"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Concat"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Reshape"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Transpose"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Flatten"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Slice"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
+    };
+    op_dispatch_["Gather"] = [this](const LayerInfo& l, const std::vector<float>& in) {
+        return executeElementwiseOperation(l, in);
     };
     
     // Default handler for unknown layer types
@@ -658,42 +1274,56 @@ void SDRInferenceEngine::setForceCompressedCompute(bool enable) {
  * @return Output tensor after linear transformation
  */
 std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input) {
-    if (layer.input_shape.empty() || layer.output_shape.empty()) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Missing input/output shape for linear layer: " << layer.name << std::endl;
-        return {};
-    }
+    size_t input_size = productFromShape(layer.input_shape, true);
+    size_t output_size = productFromShape(layer.output_shape, true);
 
-    size_t input_size = 1;
-    if (layer.input_shape.size() >= 2) {
-        for (size_t i = 1; i < layer.input_shape.size(); ++i) {
-            input_size *= layer.input_shape[i];
+    auto infer_from_weights = [&]() -> bool {
+        if (layer.weights.empty()) {
+            return false;
         }
-    } else {
-        for (size_t d : layer.input_shape) input_size *= d;
-    }
-    if (input_size == 0) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Invalid input feature size for linear layer: " << layer.name << std::endl;
-        return {};
-    }
 
-    size_t output_size = 1;
-    if (layer.output_shape.size() >= 2) {
-        for (size_t i = 1; i < layer.output_shape.size(); ++i) {
-            output_size *= layer.output_shape[i];
+        if (!layer.biases.empty() && layer.weights.size() % layer.biases.size() == 0) {
+            output_size = layer.biases.size();
+            input_size = layer.weights.size() / output_size;
+            return input_size > 0 && output_size > 0;
         }
-    } else {
-        for (size_t d : layer.output_shape) output_size *= d;
-    }
-    if (output_size == 0) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Invalid output feature size for linear layer: " << layer.name << std::endl;
-        return {};
+
+        if (!input.empty() && layer.weights.size() % input.size() == 0) {
+            input_size = input.size();
+            output_size = layer.weights.size() / input_size;
+            return input_size > 0 && output_size > 0;
+        }
+
+        if (input_size > 0 && layer.weights.size() % input_size == 0) {
+            output_size = layer.weights.size() / input_size;
+            return output_size > 0;
+        }
+
+        if (output_size > 0 && layer.weights.size() % output_size == 0) {
+            input_size = layer.weights.size() / output_size;
+            return input_size > 0;
+        }
+
+        return false;
+    };
+
+    if (input_size == 0 || output_size == 0) {
+        if (!infer_from_weights()) {
+            std::cerr << "[SDRInferenceEngine] ERROR: Missing/invalid linear dimensions for layer: " << layer.name << std::endl;
+            return {};
+        }
     }
 
     if (input.size() % input_size != 0) {
-        std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size()
-                  << " is not divisible by expected per-sample size " << input_size
-                  << " for linear layer: " << layer.name << std::endl;
-        return {};
+        if (!input.empty() && layer.weights.size() % input.size() == 0) {
+            input_size = input.size();
+            output_size = layer.weights.size() / input_size;
+        } else {
+            std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size()
+                      << " is not divisible by expected per-sample size " << input_size
+                      << " for linear layer: " << layer.name << std::endl;
+            return {};
+        }
     }
 
     const size_t effective_batch = input.size() / input_size;
@@ -993,6 +1623,11 @@ std::vector<float> SDRInferenceEngine::applyActivation(const std::string& type, 
         CortexAICompression::Kernels::sigmoid(input.data(), output.data(), input.size());
     } else if (type == "tanh") {
         CortexAICompression::Kernels::tanh_activation(input.data(), output.data(), input.size());
+    } else if (type == "elu") {
+        for (size_t index = 0; index < input.size(); ++index) {
+            const float value = input[index];
+            output[index] = value >= 0.0f ? value : (std::exp(value) - 1.0f);
+        }
     } else if (type == "softmax") {
         CortexAICompression::Kernels::softmax(input.data(), output.data(), input.size());
     } else {
@@ -1246,6 +1881,8 @@ std::vector<float> SDRInferenceEngine::flattenTensor(const std::vector<float>& i
 std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tensor) {
     auto run_start = std::chrono::high_resolution_clock::now();
     last_run_stats_ = RunStats{};
+    intermediate_tensors_.clear();
+    execution_graph_.reset();
     const auto& segments = loader_.getSegmentIndex();
     if (segments.empty()) {
         std::cerr << "[SDRInferenceEngine] No segments found in the model loader!" << std::endl;
@@ -1258,6 +1895,20 @@ std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tenso
     if (layer_names.empty()) {
         std::cerr << "[SDRInferenceEngine] No executable layers found!" << std::endl;
         return input_tensor;
+    }
+
+    if (!execution_graph_) {
+        try {
+            execution_graph_ = std::make_unique<Utils::ExecutionGraph>();
+            for (const auto& layer_name : layer_names) {
+                execution_graph_->add_node(Utils::GraphNode(layer_name, "layer"));
+            }
+            for (size_t index = 1; index < layer_names.size(); ++index) {
+                execution_graph_->add_edge(layer_names[index - 1], layer_names[index]);
+            }
+        } catch (...) {
+            execution_graph_.reset();
+        }
     }
 
 
@@ -1548,7 +2199,24 @@ std::vector<float> SDRInferenceEngine::executeActivationOperation(const LayerInf
     
     std::string activation_type = layer.properties.activation_type;
     if (activation_type.empty()) {
-        activation_type = "relu"; // Default activation
+        std::string lower_type = toLowerCopy(layer.layer_type);
+        if (lower_type.find("sigmoid") != std::string::npos) {
+            activation_type = "sigmoid";
+        } else if (lower_type.find("tanh") != std::string::npos) {
+            activation_type = "tanh";
+        } else if (lower_type.find("softmax") != std::string::npos) {
+            activation_type = "softmax";
+        } else if (lower_type.find("gelu") != std::string::npos) {
+            activation_type = "gelu";
+        } else if (lower_type.find("leakyrelu") != std::string::npos || lower_type.find("leaky_relu") != std::string::npos) {
+            activation_type = "leaky_relu";
+        } else if (lower_type.find("elu") != std::string::npos) {
+            activation_type = "elu";
+        } else if (lower_type.find("silu") != std::string::npos || lower_type.find("swish") != std::string::npos) {
+            activation_type = "silu";
+        } else {
+            activation_type = "relu";
+        }
     }
     
     return applyActivation(activation_type, input);
@@ -1562,8 +2230,13 @@ std::vector<float> SDRInferenceEngine::executeActivationOperation(const LayerInf
  */
 std::vector<float> SDRInferenceEngine::executePoolingOperation(const LayerInfo& layer, const std::vector<float>& input) {
     
-    // Use existing pooling implementations
-    if (layer.properties.activation_type == "max") {
+    if (layer.input_shape.size() < 4) {
+        return input;
+    }
+
+    const std::string lower_type = toLowerCopy(layer.layer_type);
+    const std::string lower_activation = toLowerCopy(layer.properties.activation_type);
+    if (lower_type.find("maxpool") != std::string::npos || lower_activation == "max") {
         return applyMaxPool(input, layer.input_shape);
     } else {
         return applyAvgPool(input, layer.input_shape);
@@ -1696,11 +2369,88 @@ std::vector<float> SDRInferenceEngine::runLayer(const LayerInfo& layer, const st
  * sorting to handle common naming conventions (e.g., transformer blocks).
  */
 std::vector<std::string> SDRInferenceEngine::getExecutionOrder(const std::vector<CompressedSegmentHeader>& segments) {
+#ifdef ENABLE_ONNX_PROTOBUF
+    const auto& model_proto_opt = loader_.getLoadedModelProto();
+    if (model_proto_opt && model_proto_opt->has_graph()) {
+        const onnx::GraphProto& graph_proto = model_proto_opt->graph();
+        std::unordered_set<std::string> available_layers;
+        for (const auto& seg : segments) {
+            if (isWeightLikeSegmentType(seg.original_type) || isExecutableOpLayerType(seg.layer_type)) {
+                const std::string exec_name = deriveExecutionName(seg);
+                if (!exec_name.empty()) {
+                    available_layers.insert(exec_name);
+                }
+            }
+        }
+
+        if (!available_layers.empty()) {
+            try {
+                auto graph = std::make_unique<Utils::ExecutionGraph>();
+                std::unordered_map<std::string, std::string> tensor_producers;
+                std::vector<std::string> graph_node_order;
+                graph_node_order.reserve(static_cast<size_t>(graph_proto.node_size()));
+
+                size_t node_index = 0;
+                for (const auto& node : graph_proto.node()) {
+                    ++node_index;
+                    std::string node_name = node.name();
+                    if (node_name.empty()) {
+                        if (!node.output().empty() && !node.output(0).empty()) {
+                            node_name = node.output(0);
+                        } else {
+                            node_name = "node_" + std::to_string(node_index) + "_" + node.op_type();
+                        }
+                    }
+
+                    if (available_layers.find(node_name) == available_layers.end()) {
+                        for (const auto& output : node.output()) {
+                            if (!output.empty() && available_layers.find(output) != available_layers.end()) {
+                                node_name = output;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (available_layers.find(node_name) == available_layers.end()) {
+                        continue;
+                    }
+
+                    graph->add_node(Utils::GraphNode(node_name, node.op_type()));
+                    graph_node_order.push_back(node_name);
+
+                    for (const auto& input : node.input()) {
+                        auto producer_it = tensor_producers.find(input);
+                        if (producer_it != tensor_producers.end()) {
+                            const std::string& producer = producer_it->second;
+                            if (!producer.empty() && producer != node_name) {
+                                graph->add_edge(producer, node_name);
+                            }
+                        }
+                    }
+                    for (const auto& output : node.output()) {
+                        if (!output.empty()) {
+                            tensor_producers[output] = node_name;
+                        }
+                    }
+                }
+
+                if (!graph_node_order.empty()) {
+                    execution_graph_ = std::move(graph);
+                    return execution_graph_->get_execution_order();
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[SDRInferenceEngine] WARNING: Failed to build ONNX execution graph from archive metadata: "
+                          << e.what() << std::endl;
+            }
+        }
+    }
+#endif
+
     std::vector<CompressedSegmentHeader> ordered_candidates;
     ordered_candidates.reserve(segments.size());
 
     for (const auto& seg : segments) {
-        if (isWeightLikeSegmentType(seg.original_type)) {
+        if (isWeightLikeSegmentType(seg.original_type) || isExecutableOpLayerType(seg.layer_type)) {
             ordered_candidates.push_back(seg);
         }
     }

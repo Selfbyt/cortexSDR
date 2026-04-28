@@ -106,6 +106,7 @@ void StreamingCompressor::finalizeArchive() {
 
         // Write segment header to the index
         writeStringLocal(outputFile_, header.name);
+        writeStringLocal(outputFile_, header.data_format);
         writeStringLocal(outputFile_, header.layer_type);
         writeBasicTypeLocal(outputFile_, static_cast<uint8_t>(header.original_type));
         writeBasicTypeLocal(outputFile_, header.compression_strategy_id);

@@ -119,6 +119,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
     for (const auto& segment : segments) {
         CompressedSegmentHeader header;
         header.name = segment.name;
+        header.data_format = segment.data_format;
         header.original_type = segment.type;
         header.original_size = static_cast<uint64_t>(segment.original_size);
         header.layer_type = segment.layer_type;
@@ -185,6 +186,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         const auto& header = headers[i];
 
         writeString(outputArchiveStream, header.name);
+        writeString(outputArchiveStream, header.data_format);
         writeString(outputArchiveStream, header.layer_type);
         writeBasicType(outputArchiveStream, static_cast<uint8_t>(header.original_type));
         writeBasicType(outputArchiveStream, header.compression_strategy_id);
@@ -257,6 +259,7 @@ std::pair<CompressedSegmentHeader, std::vector<std::byte>>
 AICompressor::compressSegment(const ModelSegment& segment) const {
     CompressedSegmentHeader header;
     header.name = segment.name;
+    header.data_format = segment.data_format;
     header.original_type = segment.type;
     header.original_size = static_cast<uint64_t>(segment.original_size);
     header.layer_type = segment.layer_type;
@@ -376,17 +379,34 @@ void AICompressor::compressModelStreaming(const std::string& modelPath, ICompres
         return;
     }
 
-    // Compress segments in parallel if multiple threads are configured
+    // Stream segments in bounded batches to avoid buffering the entire archive payload.
     if (numThreads_ > 1) {
-        auto compressedSegments = compressSegmentsParallel(segments);
-        for (auto& [header, data] : compressedSegments) {
-            stats_.originalSize += header.original_size;
-            stats_.compressedSize += header.compressed_size;
-            handler.handleCompressedSegment(header, data);
+        const size_t batch_size = std::max<size_t>(1, std::min<size_t>(numThreads_, 8));
+        for (size_t i = 0; i < segments.size(); i += batch_size) {
+            const size_t batch_end = std::min(i + batch_size, segments.size());
+            std::vector<std::future<std::pair<CompressedSegmentHeader, std::vector<std::byte>>>> batch_futures;
+            batch_futures.reserve(batch_end - i);
+
+            for (size_t j = i; j < batch_end; ++j) {
+                batch_futures.push_back(std::async(std::launch::async, [this, &segments, j]() {
+                    return this->compressSegment(segments[j]);
+                }));
+            }
+
+            for (size_t j = i; j < batch_end; ++j) {
+                auto [header, data] = batch_futures[j - i].get();
+                stats_.originalSize += header.original_size;
+                stats_.compressedSize += header.compressed_size;
+                handler.handleCompressedSegment(header, data);
+
+                // Release original segment payload eagerly after it is handled.
+                segments[j].data.clear();
+                segments[j].data.shrink_to_fit();
+            }
         }
     } else {
         // Single-threaded compression
-        for (const auto& segment : segments) {
+        for (auto& segment : segments) {
             auto [header, compressedData] = compressSegment(segment);
 
             // Update statistics
@@ -394,6 +414,10 @@ void AICompressor::compressModelStreaming(const std::string& modelPath, ICompres
             stats_.compressedSize += header.compressed_size;
             
             handler.handleCompressedSegment(header, compressedData);
+
+            // Release original segment payload eagerly after it is handled.
+            segment.data.clear();
+            segment.data.shrink_to_fit();
         }
     }
     

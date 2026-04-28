@@ -182,8 +182,8 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
         throw CompressionError("Empty compressed data");
     }
     
-    // Create buffer for reconstructed data
-    std::vector<std::byte> reconstructedData(originalSize, std::byte{0});
+    // Create buffer for decompressed data
+    std::vector<std::byte> decompressedData(originalSize, std::byte{0});
     
     size_t offset = 0;
     
@@ -264,12 +264,12 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
             
             // Verify the index is within bounds
             if (index < numElements) {
-                std::memcpy(reconstructedData.data() + index * elementSize, &value, elementSize);
+                std::memcpy(decompressedData.data() + index * elementSize, &value, elementSize);
             }
         }
         
         
-        return reconstructedData;
+        return decompressedData;
     } catch (const std::exception& e) {
         throw CompressionError(std::string("Failed to decompress weight preservation data: ") + e.what());
     }
@@ -308,14 +308,14 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
             // Only warn if truly unknown flag
             if (known_flags.count(firstByte) == 0) {
             }
-            // For now, return a reconstructable tensor for the unknown format
+            // For now, return a recoverable tensor for the unknown format
             // This is better than crashing but still needs proper implementation
             return createTensorWithPattern(originalSize, compressedData);
         }
     }
     
-    // Create buffer for reconstructed data
-    std::vector<std::byte> reconstructedData(originalSize, std::byte{0});
+    // Create buffer for decompressed data
+    std::vector<std::byte> decompressedData(originalSize, std::byte{0});
     
     // Extract indices from compressed data
     size_t offset = 0;
@@ -332,7 +332,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
         // Read encoding flag (1 = delta encoding, 0 = direct encoding)
         bool isDeltaEncoded = (static_cast<uint8_t>(compressedData[offset++]) != 0);
         
-        // Reconstruct indices
+        // Decode indices
         std::vector<size_t> indices;
         indices.reserve(numIndices);
         
@@ -354,7 +354,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
         // Determine element size based on original size and number of elements
         size_t elementSize = 4; // Default to 4 bytes (float)
         if (indices.empty()) {
-            return reconstructedData; // Return all zeros if no indices
+            return decompressedData; // Return all zeros if no indices
         }
         
         // Find the maximum index to validate against original size
@@ -372,7 +372,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
         
         // For sparse representation, inactive positions remain zero
         // Active positions are set by weight preservation format (0x95/0x96)
-        return reconstructedData;
+        return decompressedData;
     } catch (const std::exception& e) {
         throw CompressionError(std::string("Failed to decompress tensor: ") + e.what());
     }
@@ -1077,10 +1077,10 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToSparseIndices(const 
         throw CompressionError(std::string("Failed to decode indices: ") + e.what());
     }
     
-    // Reconstruct original data
-    std::vector<std::byte> reconstructedData(indices.size() * sizeof(size_t));
-    std::memcpy(reconstructedData.data(), indices.data(), reconstructedData.size());
-    return reconstructedData;
+    // Decode original data
+    std::vector<std::byte> decompressedData(indices.size() * sizeof(size_t));
+    std::memcpy(decompressedData.data(), indices.data(), decompressedData.size());
+    return decompressedData;
 }
 
 // Implementation of Format88 tensor decoder (used for large weight matrices)

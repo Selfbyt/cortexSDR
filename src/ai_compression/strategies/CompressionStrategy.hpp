@@ -65,7 +65,7 @@ public:
      * @return Decompressed data as byte vector
      * @throws CompressionError if decompression fails or validation errors occur
      * 
-     * Implementations must ensure bit-perfect reconstruction of original data
+     * Implementations must ensure bit-perfect recovery of original data
      * and validate output size and format consistency.
      */
     virtual std::vector<std::byte> decompress(const std::vector<std::byte>& compressedData, SegmentType originalType, size_t originalSize) const = 0;

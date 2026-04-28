@@ -84,9 +84,13 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
     }
 
     uint32_t version;
-    if (!readBasicType(stream, version) || version != ARCHIVE_VERSION) {
+    if (!readBasicType(stream, version)) {
+         throw CompressionError("Failed to read archive version.");
+    }
+    if (version == 0 || version > ARCHIVE_VERSION) {
          throw CompressionError("Unsupported archive version.");
     }
+    const bool has_data_format_field = version >= 2;
 
     // 2. Read Number of Segments
     uint64_t numSegments;
@@ -110,6 +114,14 @@ std::vector<CompressedSegmentHeader> AIDecompressor::readArchiveIndex(std::istre
 
         if (!readString(stream, header.name)) {
              throw CompressionError("Failed to read segment header information from index (name).");
+        }
+
+        if (has_data_format_field) {
+            if (!readString(stream, header.data_format)) {
+                throw CompressionError("Failed to read segment header information from index (data_format).");
+            }
+        } else {
+            header.data_format.clear();
         }
 
         if (!readString(stream, header.layer_type)) {
@@ -305,6 +317,7 @@ ModelSegment AIDecompressor::readAndDecompressSegment(std::istream& stream, cons
     segment.tensor_metadata = header.tensor_metadata; // Copy tensor metadata
     segment.layer_name = header.layer_name;           // Copy layer name
     segment.layer_index = header.layer_index;         // Copy layer index
+    segment.data_format = header.data_format;         // Copy persisted tensor format
     segment.layer_type = header.layer_type;           // Copy layer type
     segment.input_shape = header.input_shape;         // Copy input shape
     segment.output_shape = header.output_shape;       // Copy output shape
@@ -394,6 +407,7 @@ ModelSegment AIDecompressor::decompressSegment(const std::string& archivePath, c
     segment.tensor_metadata = segmentInfo.tensor_metadata;
     segment.layer_name = segmentInfo.layer_name;
     segment.layer_index = segmentInfo.layer_index;
+    segment.data_format = segmentInfo.data_format;
     segment.layer_type = segmentInfo.layer_type;
     segment.input_shape = segmentInfo.input_shape;
     segment.output_shape = segmentInfo.output_shape;

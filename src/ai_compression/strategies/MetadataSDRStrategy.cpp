@@ -204,7 +204,7 @@ std::vector<std::byte> MetadataSDRStrategy::decompress(
         bool isBinaryMode = modeFlag == 1;
         bool isDirectStorage = modeFlag == 2;
         
-        // For completely corrupted tensor segments, try to reconstruct based on name pattern
+        // For completely corrupted tensor segments, try to recover based on name pattern
         if (modeFlag > 2) {
             // If the segment name contains common tensor weight patterns, treat as binary
             // This is a special fallback for specific GPT-2 model segments that we know are problematic

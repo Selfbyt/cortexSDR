@@ -17,7 +17,7 @@ namespace CortexAICompression {
 /**
  * @brief SDR-based reversible encoding for metadata and binary blobs.
  * @details Encodes textual and binary metadata as sparse index sets enabling
- * exact reconstruction during decompression.
+ * exact recovery during decompression.
  */
 class MetadataSDRStrategy : public ICompressionStrategy {
 public:
