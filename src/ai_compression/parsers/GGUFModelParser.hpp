@@ -56,11 +56,12 @@ private:
         std::string data_type;
         uint64_t offset = 0;
         uint64_t size = 0;
+        size_t shard_index = 0;
     };
 
     // Helper methods
     GGUFHeaderInfo readHeader(std::ifstream& file) const;
-    std::vector<GGUFTensorInfo> readTensorInfo(std::ifstream& file, GGUFHeaderInfo& header) const;
+    std::vector<GGUFTensorInfo> readTensorInfo(std::ifstream& file, GGUFHeaderInfo& header, size_t shard_index = 0) const;
     ModelSegment readTensor(std::ifstream& file, const GGUFHeaderInfo& header, const GGUFTensorInfo& info) const;
     ModelSegment createMetadataSegment(const GGUFHeaderInfo& header) const;
     ModelSegment createConfigSegment(const GGUFHeaderInfo& header) const;

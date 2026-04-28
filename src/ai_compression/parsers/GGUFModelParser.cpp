@@ -12,6 +12,8 @@
 #include <sstream>
 #include <iomanip>
 #include <limits>
+#include <filesystem>
+#include <unordered_set>
 
 namespace CortexAICompression {
 
@@ -374,6 +376,52 @@ std::string summarizeStringArray(const std::vector<std::string>& values) {
     return stream.str();
 }
 
+std::vector<std::filesystem::path> discoverGGUFShards(const std::filesystem::path& model_path) {
+    std::vector<std::filesystem::path> shards;
+    const std::string filename = model_path.filename().string();
+    // Typical split naming: model-00001-of-00002.gguf
+    const std::regex shard_pattern(R"(^(.*-)(\d+)-of-(\d+)\.gguf$)", std::regex::icase);
+    std::smatch matches;
+    if (!std::regex_match(filename, matches, shard_pattern)) {
+        shards.push_back(model_path);
+        return shards;
+    }
+
+    const std::string prefix = matches[1].str();
+    const std::string shard_str = matches[2].str();
+    const std::string total_str = matches[3].str();
+    size_t total_parts = 0;
+    try {
+        total_parts = static_cast<size_t>(std::stoull(total_str));
+    } catch (const std::exception&) {
+        shards.push_back(model_path);
+        return shards;
+    }
+    if (total_parts == 0) {
+        shards.push_back(model_path);
+        return shards;
+    }
+
+    const size_t width = shard_str.size();
+    shards.reserve(total_parts);
+    for (size_t part = 1; part <= total_parts; ++part) {
+        std::ostringstream name;
+        name << prefix
+             << std::setw(static_cast<int>(width))
+             << std::setfill('0')
+             << part
+             << "-of-"
+             << total_str
+             << ".gguf";
+        const auto shard_path = model_path.parent_path() / name.str();
+        if (!std::filesystem::exists(shard_path)) {
+            throw ParsingError("Missing GGUF shard: " + shard_path.string());
+        }
+        shards.push_back(shard_path);
+    }
+    return shards;
+}
+
 } // namespace
 
 GGUFModelParser::GGUFModelParser() {}
@@ -430,7 +478,7 @@ GGUFModelParser::GGUFHeaderInfo GGUFModelParser::readHeader(std::ifstream& file)
     return header;
 }
 
-std::vector<GGUFModelParser::GGUFTensorInfo> GGUFModelParser::readTensorInfo(std::ifstream& file, GGUFHeaderInfo& header) const {
+std::vector<GGUFModelParser::GGUFTensorInfo> GGUFModelParser::readTensorInfo(std::ifstream& file, GGUFHeaderInfo& header, size_t shard_index) const {
     std::vector<GGUFTensorInfo> tensors;
     tensors.reserve(static_cast<size_t>(header.tensor_count));
 
@@ -452,6 +500,7 @@ std::vector<GGUFModelParser::GGUFTensorInfo> GGUFModelParser::readTensorInfo(std
         info.data_type = getGGMLTypeTraits(info.ggml_type).name;
         info.offset = readBinary<uint64_t>(file, "tensor.offset");
         info.size = computeTensorByteSize(info.dimensions, info.ggml_type);
+        info.shard_index = shard_index;
         tensors.push_back(std::move(info));
     }
 
@@ -679,27 +728,105 @@ ModelSegment GGUFModelParser::createTokenizerModelSegment(const GGUFHeaderInfo& 
 }
 
 std::vector<ModelSegment> GGUFModelParser::parse(const std::string& modelPath) const {
-    std::ifstream file(modelPath, std::ios::binary);
-    if (!file) {
-        throw ParsingError("Failed to open model file: " + modelPath);
+    const std::filesystem::path model_path(modelPath);
+    const auto shard_paths = discoverGGUFShards(model_path);
+
+    std::vector<std::ifstream> shard_files;
+    shard_files.reserve(shard_paths.size());
+    std::vector<GGUFHeaderInfo> shard_headers;
+    shard_headers.reserve(shard_paths.size());
+    std::vector<GGUFTensorInfo> tensor_infos;
+    tensor_infos.reserve(1024);
+    std::unordered_set<std::string> seen_tensor_names;
+    seen_tensor_names.reserve(2048);
+
+    for (size_t shard_index = 0; shard_index < shard_paths.size(); ++shard_index) {
+        shard_files.emplace_back(shard_paths[shard_index], std::ios::binary);
+        if (!shard_files.back()) {
+            throw ParsingError("Failed to open model shard: " + shard_paths[shard_index].string());
+        }
+        GGUFHeaderInfo header = readHeader(shard_files.back());
+        auto shard_tensors = readTensorInfo(shard_files.back(), header, shard_index);
+        for (auto& tensor : shard_tensors) {
+            // Avoid duplicate tensor descriptors across shards.
+            if (seen_tensor_names.insert(tensor.name).second) {
+                tensor_infos.push_back(std::move(tensor));
+            }
+        }
+        shard_headers.push_back(std::move(header));
     }
 
-    GGUFHeaderInfo header = readHeader(file);
-    const auto tensor_infos = readTensorInfo(file, header);
+    if (shard_headers.empty()) {
+        throw ParsingError("No GGUF header information found for: " + modelPath);
+    }
+    const GGUFHeaderInfo& primary_header = shard_headers.front();
+
+    std::vector<uint64_t> shard_data_sizes(shard_paths.size(), 0);
+    std::vector<uint64_t> shard_data_prefix(shard_paths.size(), 0);
+    uint64_t cumulative_data = 0;
+    for (size_t shard_index = 0; shard_index < shard_paths.size(); ++shard_index) {
+        const uint64_t file_size = static_cast<uint64_t>(std::filesystem::file_size(shard_paths[shard_index]));
+        const uint64_t data_start = shard_headers[shard_index].tensor_data_offset;
+        shard_data_prefix[shard_index] = cumulative_data;
+        if (file_size > data_start) {
+            shard_data_sizes[shard_index] = file_size - data_start;
+            cumulative_data += shard_data_sizes[shard_index];
+        } else {
+            shard_data_sizes[shard_index] = 0;
+        }
+    }
+
+    std::vector<GGUFTensorInfo> resolved_infos;
+    resolved_infos.reserve(tensor_infos.size());
+    const auto resolveTensorOffsetForShards =
+        [&shard_data_sizes, &shard_data_prefix](GGUFTensorInfo& info) -> bool {
+            if (info.shard_index < shard_data_sizes.size()) {
+                const uint64_t shard_cap = shard_data_sizes[info.shard_index];
+                if (info.offset <= shard_cap && info.size <= (shard_cap - info.offset)) {
+                    return true;
+                }
+            }
+
+            // Fallback: some split GGUF variants encode offsets on the concatenated data stream.
+            for (size_t shard = 0; shard < shard_data_sizes.size(); ++shard) {
+                const uint64_t prefix = shard_data_prefix[shard];
+                const uint64_t cap = shard_data_sizes[shard];
+                if (info.offset < prefix) {
+                    continue;
+                }
+                const uint64_t local = info.offset - prefix;
+                if (local <= cap && info.size <= (cap - local)) {
+                    info.shard_index = shard;
+                    info.offset = local;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+    for (auto info : tensor_infos) {
+        if (resolveTensorOffsetForShards(info)) {
+            resolved_infos.push_back(std::move(info));
+        }
+    }
 
     std::vector<ModelSegment> segments;
-    segments.reserve(tensor_infos.size() + 4);
-    segments.push_back(createMetadataSegment(header));
-    segments.push_back(createConfigSegment(header));
-    if (!header.tokenizer_model.empty()) {
-        segments.push_back(createTokenizerModelSegment(header));
+    segments.reserve(resolved_infos.size() + 4);
+    segments.push_back(createMetadataSegment(primary_header));
+    segments.push_back(createConfigSegment(primary_header));
+    if (!primary_header.tokenizer_model.empty()) {
+        segments.push_back(createTokenizerModelSegment(primary_header));
     }
-    if (!header.tokenizer_tokens.empty()) {
-        segments.push_back(createTokenizerVocabSegment(header));
+    if (!primary_header.tokenizer_tokens.empty()) {
+        segments.push_back(createTokenizerVocabSegment(primary_header));
     }
 
-    for (const auto& info : tensor_infos) {
-        segments.push_back(readTensor(file, header, info));
+    for (const auto& info : resolved_infos) {
+        const size_t shard_index = info.shard_index;
+        if (shard_index >= shard_files.size() || shard_index >= shard_headers.size()) {
+            throw ParsingError("Invalid GGUF tensor shard index for tensor: " + info.name);
+        }
+        segments.push_back(readTensor(shard_files[shard_index], shard_headers[shard_index], info));
     }
 
     return segments;
