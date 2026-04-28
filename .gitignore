@@ -83,6 +83,7 @@ Thumbs.db
 *.gz
 
 # Model files
+models/
 *.onnx
 *.sdr
 *.pb
