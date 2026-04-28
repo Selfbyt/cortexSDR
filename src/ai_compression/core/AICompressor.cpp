@@ -29,9 +29,40 @@
 #include <future>
 #include <list>
 #include <algorithm>
+#include <sstream>
 #include "../utils/sha256.h"
 
 namespace CortexAICompression {
+namespace {
+std::string shapeToString(const std::vector<size_t>& shape) {
+    if (shape.empty()) {
+        return "[]";
+    }
+    std::ostringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) ss << ", ";
+        ss << shape[i];
+    }
+    ss << "]";
+    return ss.str();
+}
+
+std::string segmentDiagnostics(const ModelSegment& segment) {
+    std::ostringstream ss;
+    ss << "name='" << segment.name << "'"
+       << ", type=" << static_cast<int>(segment.type)
+       << ", data_format='" << segment.data_format << "'"
+       << ", layer_type='" << segment.layer_type << "'"
+       << ", layer_name='" << segment.layer_name << "'"
+       << ", layer_index=" << segment.layer_index
+       << ", original_size=" << segment.original_size
+       << ", payload_bytes=" << segment.data.size()
+       << ", input_shape=" << shapeToString(segment.input_shape)
+       << ", output_shape=" << shapeToString(segment.output_shape);
+    return ss.str();
+}
+} // namespace
 
 /**
  * @brief Write binary data of basic types to output stream
@@ -146,6 +177,7 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
                               << "' with strategy ID " << static_cast<int>(stratInfo.id)
                               << " (Priority: " << stratInfo.priority << "): " << e.what()
                               << ". Trying next strategy..." << std::endl;
+                    std::cerr << "  Segment diagnostics: " << segmentDiagnostics(segment) << std::endl;
                     // Continue to the next strategy in the list
                 }
             }
@@ -285,7 +317,9 @@ AICompressor::compressSegment(const ModelSegment& segment) const {
             } catch (const CompressionError& e) {
                 // Log failure 
                 std::cerr << "Warning: Segment '" << segment.name << "', Strategy ID " 
-                          << static_cast<int>(stratInfo.id) << " failed: " << e.what() << std::endl;
+                          << static_cast<int>(stratInfo.id) << " (Priority: " << stratInfo.priority
+                          << ") failed: " << e.what() << std::endl;
+                std::cerr << "  Segment diagnostics: " << segmentDiagnostics(segment) << std::endl;
             }
         }
     }
