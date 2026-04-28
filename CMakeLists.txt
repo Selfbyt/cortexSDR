@@ -476,6 +476,11 @@ add_executable(cortexsdr_text_cli src/cortexsdr_cli.cpp)
 target_link_libraries(cortexsdr_text_cli PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
 target_compile_definitions(cortexsdr_text_cli PRIVATE CORTEXSDR_STATIC=1)
 
+# Benchmark CLI Tool
+add_executable(cortexsdr_bench src/cortexsdr_bench.cpp)
+target_link_libraries(cortexsdr_bench PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
+target_compile_definitions(cortexsdr_bench PRIVATE CORTEXSDR_STATIC=1)
+
 # Desktop application target removed
 
 # Tests removed

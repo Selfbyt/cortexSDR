@@ -96,6 +96,11 @@ onnxruntime/
 # Generated documentation
 docs/generated/
 
+# Benchmark outputs
+benchmarks/artifacts/
+benchmarks/results/
+benchmarks/tmp/
+
 # Images and binary data
 *.png
 *.jpg

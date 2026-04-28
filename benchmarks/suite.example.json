@@ -1,0 +1,36 @@
+{
+  "project_root": ".",
+  "repeats": 1,
+  "warmup_runs": 0,
+  "default_sparsity": 0.02,
+  "binaries": {
+    "ai_compression_cli": "build/Debug/cortexsdr_ai_compression_cli.exe",
+    "text_cli": "build/Debug/cortexsdr_text_cli.exe"
+  },
+  "tests": [
+    {
+      "name": "onnx_smoke",
+      "format": "onnx",
+      "model_path": "models/sample.onnx",
+      "sdr_path": "benchmarks/artifacts/onnx_smoke.sdr",
+      "extract_dir": "benchmarks/artifacts/onnx_smoke_extract",
+      "run_compress": true,
+      "run_extract": true,
+      "run_inference": false
+    },
+    {
+      "name": "gguf_llm_tpm",
+      "format": "gguf",
+      "model_path": "models/sample.gguf",
+      "sdr_path": "benchmarks/artifacts/gguf_llm_tpm.sdr",
+      "extract_dir": "benchmarks/artifacts/gguf_llm_tpm_extract",
+      "run_compress": true,
+      "run_extract": true,
+      "run_inference": true,
+      "warmup_runs": 1,
+      "inference_mode": "on-demand",
+      "prompt": "Write a short system health report.",
+      "max_length": 128
+    }
+  ]
+}
