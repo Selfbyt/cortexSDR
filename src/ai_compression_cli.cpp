@@ -20,7 +20,7 @@ void printUsage(const char* programName) {
     std::cout << "CortexSDR AI Model Compression CLI\n";
     std::cout << "Usage:\n";
     std::cout << "  " << programName << " -c <model_path> <format> <output_path> [sparsity]   (Compress)\n";
-    std::cout << "  " << programName << " -d <compressed_path> <output_path> [sparsity]       (Decompress)\n";
+    std::cout << "  " << programName << " -d <compressed_path> <output_dir> [sparsity]        (Extract bundle)\n";
     std::cout << "  " << programName << " -x <compressed_path> <output_dir> [sparsity]        (Extract archive)\n";
     std::cout << "  " << programName << " -i <archive_path> <input_indices_file>              (Inference)\n";
     std::cout << "\nSupported formats:\n";
@@ -35,7 +35,7 @@ void printUsage(const char* programName) {
     std::cout << "\nExamples:\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr 0.01\n";
-    std::cout << "  " << programName << " -d compressed_model.sdr decompressed_model.onnx\n";
+    std::cout << "  " << programName << " -d compressed_model.sdr extracted_segments\n";
     std::cout << "  " << programName << " -x compressed_model.sdr extracted_segments\n";
     std::cout << "  " << programName << " -i compressed_model.sdr input_indices.txt\n";
 }
@@ -170,7 +170,7 @@ int compressModel(const char* model_path, const char* format, const char* output
 }
 
 int decompressModel(const char* compressed_path, const char* output_path, float sparsity) {
-    std::cout << "Decompressing model from: " << compressed_path << " to: " << output_path << std::endl;
+    std::cout << "Extracting archive from: " << compressed_path << " to directory: " << output_path << std::endl;
     std::cout << "Using sparsity: " << sparsity << " (" << (sparsity * 100) << "%)" << std::endl;
 
     CortexDecompressorHandle handle;
@@ -190,7 +190,7 @@ int decompressModel(const char* compressed_path, const char* output_path, float 
     }
 
     cortex_decompressor_free(handle);
-    std::cout << "Decompression complete." << std::endl;
+    std::cout << "Archive extraction complete." << std::endl;
     return 0;
 }
 

@@ -89,7 +89,7 @@ CORTEXSDR_API CortexError cortex_decompressor_create(
 );
 
 /**
- * Decompress a model
+ * Extract archive contents to a directory bundle
  */
 CORTEXSDR_API CortexError cortex_decompressor_decompress(
     CortexDecompressorHandle handle,

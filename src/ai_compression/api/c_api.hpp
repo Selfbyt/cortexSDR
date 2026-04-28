@@ -77,7 +77,7 @@ CORTEXSDR_API CortexError cortex_decompressor_create(
     float sparsity
 );
 
-// Decompress a model
+// Extract archive contents to a directory bundle
 CORTEXSDR_API CortexError cortex_decompressor_decompress(
     CortexDecompressorHandle handle,
     const char* compressed_path,
