@@ -23,6 +23,15 @@
 #include <iomanip>
 
 namespace CortexAICompression {
+namespace {
+bool isMetadataLikeSegmentType(SegmentType type) {
+    return type == SegmentType::METADATA_JSON ||
+           type == SegmentType::GRAPH_STRUCTURE_PROTO ||
+           type == SegmentType::CONFIG ||
+           type == SegmentType::TOKENIZER_VOCAB ||
+           type == SegmentType::TOKENIZER_MODEL;
+}
+} // namespace
 
 /**
  * @brief Constructor for AdaptiveSDRStrategy with configurable parameters
@@ -103,8 +112,9 @@ std::vector<std::byte> AdaptiveSDRStrategy::compress(const ModelSegment& segment
         std::cerr << "Embedding tensor ('" << segment.name << "') using SDR compression for maximum compression ratio" << std::endl;
     }
 
-    // For larger segments, use the appropriate SDR-based strategy
-    if (segment.type == SegmentType::METADATA_JSON || segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
+    // For larger segments, use metadata-safe strategy for metadata-like content,
+    // and tensor SDR strategy for numerical tensors.
+    if (isMetadataLikeSegmentType(segment.type)) {
         return getMetadataStrategy()->compress(segment);
     } else {
         return getSDRStrategy()->compress(segment);
@@ -121,47 +131,19 @@ std::vector<std::byte> AdaptiveSDRStrategy::decompress(
         return std::vector<std::byte>();
     }
     
-    // Check the encoding flag (first byte)
+    // Check the envelope flag (first byte)
     uint8_t encodingFlag = static_cast<uint8_t>(compressedData[0]);
-    
     if (encodingFlag == DIRECT_STORAGE_FLAG) {
-        // Direct storage approach
         return decompressDirectStorage(compressedData);
-    } else if (encodingFlag == SDR_ENCODING_FLAG) {
-        // SDR-based encoding - use the appropriate strategy
-        // Skip the flag byte
-        std::vector<std::byte> sdrData(compressedData.begin() + 1, compressedData.end());
-        
-        if (originalType == SegmentType::METADATA_JSON || originalType == SegmentType::GRAPH_STRUCTURE_PROTO) {
-            return getMetadataStrategy()->decompress(sdrData, originalType, originalSize);
-        } else {
-            return getSDRStrategy()->decompress(sdrData, originalType, originalSize);
-        }
     }
-    // Invalid encoding flag - try to recover
-    std::cerr << "Warning: Invalid encoding flag 0x" << std::hex << static_cast<int>(encodingFlag)
-              << std::dec << " for data of type " << static_cast<int>(originalType)
-              << ", original size: " << originalSize << std::endl;
-    std::cerr << "First 16 bytes: ";
-    for (size_t i = 0; i < std::min<size_t>(16, compressedData.size()); ++i) {
-        std::cerr << std::hex << std::setw(2) << std::setfill('0')
-                  << static_cast<int>(static_cast<uint8_t>(compressedData[i])) << " ";
-    }
-    std::cerr << std::dec << std::endl;
-    
-    // For tensor weights, try passing to the appropriate strategy based on type
-    ModelSegment dummySegment;
-    dummySegment.type = originalType;
-    
-    if (dummySegment.isWeightTensor()) {
-        // For weight tensors, use the SDRStrategy
-        std::cerr << "Attempting to decompress weight tensor with SDRStrategy" << std::endl;
-        return getSDRStrategy()->decompress(compressedData, originalType, originalSize);
-    } else {
-        // For metadata and graph structure, use the MetadataStrategy
-        std::cerr << "Attempting to decompress with MetadataStrategy" << std::endl;
+
+    // Recalibrated routing:
+    // - metadata/graph payloads are decoded by MetadataSDRStrategy directly
+    // - all tensor payloads are decoded by SDRIndexStorageStrategy directly
+    if (isMetadataLikeSegmentType(originalType)) {
         return getMetadataStrategy()->decompress(compressedData, originalType, originalSize);
     }
+    return getSDRStrategy()->decompress(compressedData, originalType, originalSize);
 }
 
 std::vector<std::byte> AdaptiveSDRStrategy::compressWithDirectStorage(const ModelSegment& segment) const {

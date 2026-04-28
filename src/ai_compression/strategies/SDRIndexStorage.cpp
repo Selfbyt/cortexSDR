@@ -683,12 +683,8 @@ std::vector<size_t> SDRIndexStorageStrategy::extractSignificantIndices(const Mod
         return activeIndices;
     }
     
-    // Calculate target number of active bits based on sparsity
+    // Calculate target number of active bits based on configured sparsity.
     float sparsityRatio = sparsity_;
-    
-    // Use a consistent 2% sparsity for all segments by default
-    // This matches the CLI default and provides a good balance between compression and model preservation
-    sparsityRatio = 0.02f; // Default 2% sparsity
     
     // Override with tensor metadata if available
     if (segment.tensor_metadata.has_value() && segment.tensor_metadata.value().sparsity_ratio > 0) {
@@ -698,20 +694,20 @@ std::vector<size_t> SDRIndexStorageStrategy::extractSignificantIndices(const Mod
     size_t activeBitsCount = static_cast<size_t>(totalElements * sparsityRatio);
     activeBitsCount = std::max(size_t(1), activeBitsCount); // Ensure at least one active bit
     
-    // For very large tensors, cap the maximum number of active bits
-    // Use an extremely low cap to achieve much higher compression ratios
-    size_t MAX_ACTIVE_BITS;
-    
-    if (totalElements > 10000000) { // Extremely large tensors (>10M elements)
-        MAX_ACTIVE_BITS = 10000; // Higher cap for huge tensors
-    } else if (totalElements > 1000000) { // Large tensors (1M-10M elements)
-        MAX_ACTIVE_BITS = 5000; // Higher cap for large tensors
+    // Cap active bits with a sparsity-aware safety bound so changing sparsity
+    // still has visible effect while avoiding runaway memory/CPU usage.
+    size_t baseMaxActiveBits;
+    if (totalElements > 10000000) {
+        baseMaxActiveBits = 10000;
+    } else if (totalElements > 1000000) {
+        baseMaxActiveBits = 5000;
     } else {
-        MAX_ACTIVE_BITS = 2000; // Higher cap for medium tensors
+        baseMaxActiveBits = 2000;
     }
-    
-    if (activeBitsCount > MAX_ACTIVE_BITS) {
-        activeBitsCount = MAX_ACTIVE_BITS;
+    const float multiplier = std::max(0.25f, 1.0f + (sparsityRatio * 8.0f));
+    const size_t maxActiveBits = static_cast<size_t>(static_cast<float>(baseMaxActiveBits) * multiplier);
+    if (activeBitsCount > maxActiveBits) {
+        activeBitsCount = maxActiveBits;
         sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;
     }
     
@@ -863,11 +859,8 @@ std::vector<std::pair<size_t, float>> SDRIndexStorageStrategy::extractSignifican
         return activeIndexValuePairs;
     }
     
-    // Calculate target number of active bits based on sparsity
+    // Calculate target number of active bits based on configured sparsity.
     float sparsityRatio = sparsity_;
-    
-    // Use a consistent 2% sparsity for all segments by default
-    sparsityRatio = 0.02f; // Default 2% sparsity
     
     // Override with tensor metadata if available
     if (segment.tensor_metadata.has_value() && segment.tensor_metadata.value().sparsity_ratio > 0) {
@@ -877,19 +870,20 @@ std::vector<std::pair<size_t, float>> SDRIndexStorageStrategy::extractSignifican
     size_t activeBitsCount = static_cast<size_t>(totalElements * sparsityRatio);
     activeBitsCount = std::max(size_t(1), activeBitsCount); // Ensure at least one active bit
     
-    // For very large tensors, cap the maximum number of active bits
-    size_t MAX_ACTIVE_BITS;
-    
-    if (totalElements > 10000000) { // Extremely large tensors (>10M elements)
-        MAX_ACTIVE_BITS = 10000; // Higher cap for huge tensors
-    } else if (totalElements > 1000000) { // Large tensors (1M-10M elements)
-        MAX_ACTIVE_BITS = 5000; // Higher cap for large tensors
+    // Cap active bits with a sparsity-aware safety bound so changing sparsity
+    // still has visible effect while avoiding runaway memory/CPU usage.
+    size_t baseMaxActiveBits;
+    if (totalElements > 10000000) {
+        baseMaxActiveBits = 10000;
+    } else if (totalElements > 1000000) {
+        baseMaxActiveBits = 5000;
     } else {
-        MAX_ACTIVE_BITS = 2000; // Higher cap for medium tensors
+        baseMaxActiveBits = 2000;
     }
-    
-    if (activeBitsCount > MAX_ACTIVE_BITS) {
-        activeBitsCount = MAX_ACTIVE_BITS;
+    const float multiplier = std::max(0.25f, 1.0f + (sparsityRatio * 8.0f));
+    const size_t maxActiveBits = static_cast<size_t>(static_cast<float>(baseMaxActiveBits) * multiplier);
+    if (activeBitsCount > maxActiveBits) {
+        activeBitsCount = maxActiveBits;
         sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;
     }
     

@@ -14,6 +14,26 @@
 #include <set>
 
 namespace CortexAICompression {
+namespace {
+bool supportsMetadataSDRType(SegmentType type) {
+    return type == SegmentType::METADATA_JSON ||
+           type == SegmentType::GRAPH_STRUCTURE_PROTO ||
+           type == SegmentType::CONFIG ||
+           type == SegmentType::TOKENIZER_VOCAB ||
+           type == SegmentType::TOKENIZER_MODEL;
+}
+
+const char* metadataKindLabel(SegmentType type) {
+    switch (type) {
+        case SegmentType::METADATA_JSON: return "metadata";
+        case SegmentType::GRAPH_STRUCTURE_PROTO: return "graph structure";
+        case SegmentType::CONFIG: return "config";
+        case SegmentType::TOKENIZER_VOCAB: return "tokenizer vocab";
+        case SegmentType::TOKENIZER_MODEL: return "tokenizer model";
+        default: return "metadata-like";
+    }
+}
+} // namespace
 
 MetadataSDRStrategy::MetadataSDRStrategy(float sparsity, size_t sdrWidth)
     : sparsity_(sparsity), sdrWidth_(sdrWidth) {
@@ -27,12 +47,11 @@ MetadataSDRStrategy::MetadataSDRStrategy(float sparsity, size_t sdrWidth)
 }
 
 std::vector<std::byte> MetadataSDRStrategy::compress(const ModelSegment& segment) const {
-    // Support both metadata and graph structure segments
-    if (segment.type != SegmentType::METADATA_JSON && segment.type != SegmentType::GRAPH_STRUCTURE_PROTO) {
-        throw CompressionError("MetadataSDRStrategy only supports metadata and graph structure segments");
+    if (!supportsMetadataSDRType(segment.type)) {
+        throw CompressionError("MetadataSDRStrategy only supports metadata-like segments");
     }
     
-    std::cerr << "Compressing " << (segment.type == SegmentType::METADATA_JSON ? "metadata" : "graph structure") 
+    std::cerr << "Compressing " << metadataKindLabel(segment.type)
               << " with reversible SDR encoding\n";
     std::cerr << "  Using sparsity: " << sparsity_ << ", SDR width: " << sdrWidth_ << "\n";
     
@@ -145,13 +164,12 @@ std::vector<std::byte> MetadataSDRStrategy::decompress(
     SegmentType originalType,
     size_t originalSize) const {
     
-    // Support both metadata and graph structure segments
-    if (originalType != SegmentType::METADATA_JSON && originalType != SegmentType::GRAPH_STRUCTURE_PROTO) {
-        throw CompressionError("MetadataSDRStrategy only supports metadata and graph structure segments");
+    if (!supportsMetadataSDRType(originalType)) {
+        throw CompressionError("MetadataSDRStrategy only supports metadata-like segments");
     }
     
     try {
-        std::cerr << "Decompressing " << (originalType == SegmentType::METADATA_JSON ? "metadata" : "graph structure") 
+        std::cerr << "Decompressing " << metadataKindLabel(originalType)
                   << " with reversible SDR decoding\n";
         
         // EMERGENCY HANDLER: For graph structure specifically, which is known to have issues
@@ -461,8 +479,7 @@ std::vector<size_t> MetadataSDRStrategy::encodeBinaryData(const std::vector<std:
     
     // Memory optimization: For very large data, use chunking to reduce peak memory usage
     // and apply stricter sparsity controls
-    float effectiveSparsity = isSmallData ? sparsity_ * 0.5f : 
-                             (isLargeData ? std::min(sparsity_, 0.01f) : sparsity_);
+    float effectiveSparsity = isSmallData ? sparsity_ * 0.5f : sparsity_;
     
     // For large data, limit the absolute number of indices to avoid memory explosion
     size_t maxIndices = isLargeData ? 

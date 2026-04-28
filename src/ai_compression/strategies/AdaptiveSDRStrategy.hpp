@@ -69,9 +69,8 @@ private:
     size_t sdrWidth_;
     size_t smallDataThreshold_; // Threshold below which direct storage is used
     
-    // Encoding flags
-    static constexpr uint8_t DIRECT_STORAGE_FLAG = 0;
-    static constexpr uint8_t SDR_ENCODING_FLAG = 1;
+    // Direct-storage envelope marker (kept distinct from metadata/SDR payload flags).
+    static constexpr uint8_t DIRECT_STORAGE_FLAG = 0xA0;
     
     // Helper methods for direct storage approach
     std::vector<std::byte> compressWithDirectStorage(const ModelSegment& segment) const;
