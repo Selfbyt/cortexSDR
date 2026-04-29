@@ -700,14 +700,9 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
         layer.layer_type = model_segment.layer_type;
     }
 
-    // Extract tensor metadata if available
-    if (model_segment.tensor_metadata) {
-        const auto& meta = model_segment.tensor_metadata.value();
-        if (layer.input_shape.empty() && !meta.dimensions.empty()) {
-             layer.input_shape = meta.dimensions;
-        }
-        layer.output_shape = meta.dimensions;
-    }
+    // Extract tensor metadata if available (but don't use tensor dimensions as layer shapes)
+    // The actual layer input/output shapes come from model_segment.input_shape/output_shape
+    // which are set at the end of this function
 
     if (layer.raw_data.empty()) {
         layer.raw_data = model_segment.data;
@@ -1274,10 +1269,39 @@ void SDRInferenceEngine::setForceCompressedCompute(bool enable) {
  * @return Output tensor after linear transformation
  */
 std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input) {
+    // Debug: print shapes for first few layers BEFORE calculating
+    static int debug_count = 0;
+    if (debug_count < 5) {
+        std::cerr << "[DEBUG] Layer: " << layer.name << std::endl;
+        std::cerr << "  input_shape: [";
+        for (size_t i = 0; i < layer.input_shape.size(); ++i) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << layer.input_shape[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  output_shape: [";
+        for (size_t i = 0; i < layer.output_shape.size(); ++i) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << layer.output_shape[i];
+        }
+        std::cerr << "]" << std::endl;
+        std::cerr << "  biases.size()=" << layer.biases.size() << ", weights.size()=" << layer.weights.size() << std::endl;
+        debug_count++;
+    }
+    
     size_t input_size = productFromShape(layer.input_shape, true);
     size_t output_size = productFromShape(layer.output_shape, true);
+    
+    if (debug_count <= 5) {
+        std::cerr << "  Calculated: input_size=" << input_size << ", output_size=" << output_size << std::endl;
+    }
 
     auto infer_from_weights = [&]() -> bool {
+        // If we have valid shapes from metadata, trust them (especially for compressed models)
+        if (input_size > 0 && output_size > 0) {
+            return true;
+        }
+        
         if (layer.weights.empty()) {
             return false;
         }
@@ -1312,18 +1336,36 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
             std::cerr << "[SDRInferenceEngine] ERROR: Missing/invalid linear dimensions for layer: " << layer.name << std::endl;
             return {};
         }
+        if (debug_count <= 5) {
+            std::cerr << "  After infer_from_weights: input_size=" << input_size << ", output_size=" << output_size << std::endl;
+        }
     }
 
     if (input.size() % input_size != 0) {
-        if (!input.empty() && layer.weights.size() % input.size() == 0) {
+        if (debug_count <= 5) {
+            std::cerr << "  Input size mismatch: input.size()=" << input.size() << ", input_size=" << input_size << std::endl;
+        }
+        // For compressed models (empty weights), trust the stored dimensions
+        if (layer.weights.empty() && !layer.raw_data.empty()) {
+            std::cerr << "[SDRInferenceEngine] WARNING: Input size mismatch for compressed layer " << layer.name 
+                      << ", but trusting stored dimensions (input_size=" << input_size << ", output_size=" << output_size << ")" << std::endl;
+            // Don't recalculate - trust the metadata
+        } else if (!input.empty() && !layer.weights.empty() && layer.weights.size() % input.size() == 0) {
             input_size = input.size();
             output_size = layer.weights.size() / input_size;
+            if (debug_count <= 5) {
+                std::cerr << "  Recalculated from input: input_size=" << input_size << ", output_size=" << output_size << std::endl;
+            }
         } else {
             std::cerr << "[SDRInferenceEngine] ERROR: Input size " << input.size()
                       << " is not divisible by expected per-sample size " << input_size
                       << " for linear layer: " << layer.name << std::endl;
             return {};
         }
+    }
+    
+    if (debug_count <= 5) {
+        std::cerr << "  Before effective_batch calc: input_size=" << input_size << ", output_size=" << output_size << std::endl;
     }
 
     const size_t effective_batch = input.size() / input_size;
@@ -1384,6 +1426,9 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
         return {};
     }
     if (!layer.biases.empty() && layer.biases.size() != output_size) {
+        if (debug_count <= 5) {
+            std::cerr << "[DEBUG] Bias check: biases.size()=" << layer.biases.size() << ", output_size=" << output_size << ", input_size=" << input_size << std::endl;
+        }
         std::cerr << "[SDRInferenceEngine] ERROR: Biases size " << layer.biases.size() << " does not match output " << output_size << " for linear layer: " << layer.name << std::endl;
         return {};
     }
