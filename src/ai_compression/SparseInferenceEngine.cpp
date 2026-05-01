@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file SparseInferenceEngine.cpp
  * @brief Implementation of sparse neural network inference engine with on-demand layer loading
  * 
@@ -141,6 +141,16 @@ static bool isBiasLikeSegmentName(const std::string& segment_name) {
     return segment_name.find(".bias") != std::string::npos ||
            segment_name.find("/bias") != std::string::npos ||
            segment_name.find("_bias") != std::string::npos;
+}
+
+static bool isNormalizationLikeName(const std::string& value) {
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lower.find("norm") != std::string::npos ||
+           lower.find(".ln") != std::string::npos ||
+           lower.find("_ln") != std::string::npos;
 }
 
 enum class TensorDecodeKind {
@@ -699,6 +709,12 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     if (layer.layer_type.empty()) {
         layer.layer_type = model_segment.layer_type;
     }
+    if (isNormalizationLikeName(layer.name) || isNormalizationLikeName(model_segment.name)) {
+        const std::string lower_layer_type = toLowerCopy(layer.layer_type);
+        if (lower_layer_type.find("norm") == std::string::npos) {
+            layer.layer_type = "LayerNormalization";
+        }
+    }
 
     // Extract tensor metadata if available (but don't use tensor dimensions as layer shapes)
     // The actual layer input/output shapes come from model_segment.input_shape/output_shape
@@ -1026,9 +1042,15 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
                 !bias_segment &&
                 !have_primary_compressed_weights &&
                 seg_info.compression_strategy_id == SDR_STRATEGY_ID) {
+                // LayerNorm weights should always be fully decompressed (they're typically dense)
+                // Check both by type and by name pattern
+                const bool is_layer_norm = seg_info.original_type == SegmentType::LAYER_NORM_WEIGHTS ||
+                                          isNormalizationLikeName(seg_info.name) ||
+                                          isNormalizationLikeName(name);
+                
                 std::vector<std::byte> compressed_bytes =
                     decompressor_->readCompressedBytes(archive_path_, seg_info, seg_info.data_offset);
-                if (supportsSparseStreamingCompute(compressed_bytes)) {
+                if (!is_layer_norm && supportsSparseStreamingCompute(compressed_bytes)) {
                     layer.raw_data = std::move(compressed_bytes);
                     have_primary_compressed_weights = true;
                     continue;
@@ -2395,6 +2417,9 @@ const std::optional<onnx::ModelProto>& SDRModelLoader::getLoadedModelProto() con
  * dynamic layer detection via executeDynamicLayer.
  */
 std::vector<float> SDRInferenceEngine::runLayer(const LayerInfo& layer, const std::vector<float>& input) {
+    if (isNormalizationLikeName(layer.name) || isNormalizationLikeName(layer.layer_type)) {
+        return executeNormalizationOperation(layer, input);
+    }
     encountered_layer_types_.insert(layer.layer_type);
     auto it = op_dispatch_.find(layer.layer_type);
     if (it != op_dispatch_.end()) {

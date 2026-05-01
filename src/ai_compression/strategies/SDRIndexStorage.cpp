@@ -1,4 +1,4 @@
-#include "SDRIndexStorage.hpp"
+﻿#include "SDRIndexStorage.hpp"
 #include "../core/ModelSegment.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -1309,14 +1309,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormatBiasTensor(
         // Skip the format flag
         size_t offset = 1;
         
-        // Print format header for debugging
-        std::cerr << "Format header (first 8 bytes):" << std::endl;
-        for (size_t i = 0; i < std::min(size_t(8), compressedData.size()); i++) {
-            std::cerr << std::hex << std::setw(2) << std::setfill('0') 
-                      << static_cast<int>(compressedData[i]) << " ";
-        }
-        std::cerr << std::dec << std::endl;
-        
         if (formatFlag == 0x0F) {
             // 0x0F format for layer norm weights and biases
             // Enhanced format handling with better error detection
@@ -1436,9 +1428,6 @@ std::vector<std::byte> SDRIndexStorageStrategy::decodeFormatBiasTensor(
                 valueEntries.emplace_back(index, value);
             }
         }
-        
-        std::cerr << "Extracted " << valueEntries.size() << " entries from format 0x" 
-                  << std::hex << static_cast<int>(formatFlag) << std::dec << std::endl;
         
         // Set the values in the tensor
         size_t elementSize = 4; // Default to 4 bytes for float32
