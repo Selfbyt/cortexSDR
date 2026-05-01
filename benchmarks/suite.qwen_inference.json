@@ -1,0 +1,25 @@
+{
+  "project_root": ".",
+  "repeats": 1,
+  "warmup_runs": 1,
+  "default_sparsity": 0.02,
+  "binaries": {
+    "ai_compression_cli": "build/Debug/cortexsdr_ai_compression_cli.exe",
+    "text_cli": "build/Debug/cortexsdr_text_cli.exe"
+  },
+  "tests": [
+    {
+      "name": "qwen25_7b_q4km_on_demand_infer",
+      "format": "gguf",
+      "model_path": "models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+      "sdr_path": "benchmarks/artifacts/qwen2.5-7b-instruct-q4_k_m.sdr",
+      "extract_dir": "benchmarks/tmp/qwen_extract_unused",
+      "run_compress": false,
+      "run_extract": false,
+      "run_inference": true,
+      "inference_mode": "on-demand",
+      "prompt": "Say hello in one short sentence.",
+      "max_length": 64
+    }
+  ]
+}

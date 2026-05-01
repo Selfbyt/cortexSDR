@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file SparseInferenceEngine.cpp
  * @brief Implementation of sparse neural network inference engine with on-demand layer loading
  * 
@@ -961,6 +961,17 @@ LayerInfo SDRModelLoader::loadLayerByName(const std::string& name) const {
     return loadLayerByNameAsync(name).get();
 }
 
+ModelSegment SDRModelLoader::loadSegmentByName(const std::string& name) const {
+    auto seg_it = std::find_if(segments_.begin(), segments_.end(),
+        [&](const CompressedSegmentHeader& seg) {
+            return seg.name == name;
+        });
+    if (seg_it == segments_.end()) {
+        throw std::runtime_error("Segment not found: " + name);
+    }
+    return decompressor_->decompressSegment(archive_path_, *seg_it, seg_it->data_offset);
+}
+
 /**
  * @brief Load a single layer by name asynchronously.
  * @param name Layer name to load.
@@ -997,6 +1008,17 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
             }
         }
 
+        // Additional matching: try to find segments with name.weight or name.bias pattern
+        if (matched_segments.empty()) {
+            const std::string weight_name = name + ".weight";
+            const std::string bias_name = name + ".bias";
+            for (const auto& seg : segments_) {
+                if (seg.name == weight_name || seg.name == bias_name) {
+                    matched_segments.push_back(&seg);
+                }
+            }
+        }
+
         if (matched_segments.empty()) {
             throw std::runtime_error("Segment info not found for layer: " + name);
         }
@@ -1021,15 +1043,6 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
 
             if (layer.layer_type.empty() && !seg_info.layer_type.empty()) {
                 layer.layer_type = seg_info.layer_type;
-            }
-            if (seg_info.tensor_metadata) {
-                const auto& meta = seg_info.tensor_metadata.value();
-                if (layer.input_shape.empty() && !meta.dimensions.empty()) {
-                    layer.input_shape = meta.dimensions;
-                }
-                if (layer.output_shape.empty() && !meta.dimensions.empty()) {
-                    layer.output_shape = meta.dimensions;
-                }
             }
             if (!seg_info.input_shape.empty()) {
                 layer.input_shape = seg_info.input_shape;
@@ -1987,6 +2000,63 @@ std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tenso
     return result;
 }
 
+std::vector<float> SDRInferenceEngine::runPrefill(
+    const std::vector<float>& input_hidden,
+    const std::vector<std::string>& decoder_layer_names) {
+    return runLayersOnDemand(decoder_layer_names, input_hidden);
+}
+
+std::vector<float> SDRInferenceEngine::runDecodeStep(
+    const std::vector<float>& prev_hidden,
+    const std::vector<std::string>& decoder_layer_names) {
+    return runLayersOnDemand(decoder_layer_names, prev_hidden);
+}
+
+std::vector<float> SDRInferenceEngine::computeTokenLogitsFromEmbedding(
+    const std::vector<float>& hidden,
+    const LayerInfo& token_embedding) const {
+    if (hidden.empty()) {
+        throw std::runtime_error("computeTokenLogitsFromEmbedding: hidden vector is empty");
+    }
+    if (token_embedding.weights.empty()) {
+        throw std::runtime_error("computeTokenLogitsFromEmbedding: token embedding weights are empty");
+    }
+
+    size_t vocab_size = 0;
+    size_t embedding_dim = hidden.size();
+    if (token_embedding.input_shape.size() >= 2) {
+        vocab_size = token_embedding.input_shape[1];
+    }
+    if (token_embedding.output_shape.size() >= 2) {
+        embedding_dim = token_embedding.output_shape[1];
+    }
+
+    if (embedding_dim == 0) {
+        throw std::runtime_error("computeTokenLogitsFromEmbedding: invalid embedding_dim");
+    }
+    if (vocab_size == 0) {
+        vocab_size = token_embedding.weights.size() / embedding_dim;
+    }
+    if (hidden.size() != embedding_dim) {
+        throw std::runtime_error("computeTokenLogitsFromEmbedding: hidden size does not match embedding_dim");
+    }
+    if (token_embedding.weights.size() < vocab_size * embedding_dim) {
+        throw std::runtime_error("computeTokenLogitsFromEmbedding: embedding matrix is smaller than expected");
+    }
+
+    std::vector<float> logits(vocab_size, 0.0f);
+    const float* emb = token_embedding.weights.data();
+    for (size_t token = 0; token < vocab_size; ++token) {
+        const float* row = emb + (token * embedding_dim);
+        float score = 0.0f;
+        for (size_t i = 0; i < embedding_dim; ++i) {
+            score += row[i] * hidden[i];
+        }
+        logits[token] = score;
+    }
+    return logits;
+}
+
 // --- Memory Management for Large Models ---
 
 /**
@@ -2250,6 +2320,7 @@ std::vector<float> SDRInferenceEngine::executeNormalizationOperation(const Layer
             );
             return output;
         }
+        throw std::runtime_error("LayerNorm weights missing for layer: " + layer.name);
     }
     
     // Fall back to batch normalization
@@ -2547,6 +2618,12 @@ std::vector<std::string> SDRInferenceEngine::getExecutionOrder(const std::vector
     std::unordered_set<std::string> seen;
     for (const auto& seg : ordered_candidates) {
         const std::string exec_name = deriveExecutionName(seg);
+        const std::string lower_exec_name = toLowerCopy(exec_name);
+        if (lower_exec_name.find("token_embd") != std::string::npos ||
+            lower_exec_name.find("tok_embeddings") != std::string::npos ||
+            lower_exec_name.find("embed_tokens") != std::string::npos) {
+            continue;
+        }
         if (!exec_name.empty() && seen.insert(exec_name).second) {
             layer_names.push_back(exec_name);
         }
@@ -2598,7 +2675,6 @@ std::vector<float> SDRInferenceEngine::runLayersOnDemand(const std::vector<std::
         auto load_time = std::chrono::high_resolution_clock::now();
         auto load_duration = std::chrono::duration_cast<std::chrono::milliseconds>(load_time - start_time);
         
-        
         last_layer_used_compressed_ = false;
         std::vector<float> layer_output = runLayer(current_layer, current);
         
@@ -2607,6 +2683,15 @@ std::vector<float> SDRInferenceEngine::runLayersOnDemand(const std::vector<std::
         
         
         if (layer_output.empty() && !current.empty()) {
+            const std::string lower_name = toLowerCopy(layer_name);
+            const bool llm_critical =
+                lower_name.find("attn") != std::string::npos ||
+                lower_name.find("ffn") != std::string::npos ||
+                lower_name.find("norm") != std::string::npos ||
+                lower_name.find("mlp") != std::string::npos;
+            if (llm_critical) {
+                throw std::runtime_error("Critical layer produced empty output: " + layer_name);
+            }
             std::cerr << "[SDRInferenceEngine] WARNING: Layer '" << layer_name << "' produced empty output, using pass-through" << std::endl;
         } else {
             current = std::move(layer_output);

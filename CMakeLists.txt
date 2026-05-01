@@ -19,6 +19,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CPU-oriented performance defaults
+if(MSVC)
+    add_compile_options($<$<CONFIG:Release>:/O2> $<$<CONFIG:Release>:/Oi> $<$<CONFIG:Release>:/Ot> $<$<CONFIG:Release>:/GL> $<$<CONFIG:Release>:/fp:fast>)
+    add_compile_options($<$<CONFIG:RelWithDebInfo>:/O2> $<$<CONFIG:RelWithDebInfo>:/Oi> $<$<CONFIG:RelWithDebInfo>:/Ot> $<$<CONFIG:RelWithDebInfo>:/GL> $<$<CONFIG:RelWithDebInfo>:/fp:fast>)
+    add_link_options($<$<CONFIG:Release>:/LTCG> $<$<CONFIG:RelWithDebInfo>:/LTCG>)
+else()
+    add_compile_options(-O3 -ffast-math)
+endif()
+
 # Firmware specific settings
 if(BUILD_FIRMWARE)
     # Disable desktop dependencies
@@ -55,6 +64,7 @@ set(COMMON_SOURCES
     src/ai_compression/parsers/PyTorchModelParser.cpp
     src/ai_compression/parsers/HDF5ModelParser.cpp
     src/ai_compression/parsers/ModelParserFactory.cpp
+    src/ai_compression/LLMTokenizer.cpp
     src/ai_compression/utils/sha256.cpp
     src/ai_compression/api/c_api.cpp
     src/ai_compression/onnx_proto/onnx.pb.cc
@@ -134,6 +144,7 @@ option(ENABLE_BLAS "Enable BLAS acceleration for linear algebra" ON)
 option(USE_MKL "Use Intel MKL for BLAS (highest performance)" OFF)
 option(USE_OPENBLAS "Use OpenBLAS for BLAS" ON)
 option(ENABLE_SIMD "Enable SIMD optimizations (SSE/AVX)" ON)
+set(CORTEXSDR_SIMD_LEVEL "AUTO" CACHE STRING "SIMD target for CPU builds: AUTO, AVX2, SSE4_1, SSE2")
 
 # Set the module path to include our custom FindONNXRuntime.cmake module
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -211,6 +222,15 @@ endif()
 
 # --- BLAS Configuration for Performance ---
 if(ENABLE_BLAS)
+    if(MSVC)
+        # Help CMake find vcpkg-installed BLAS packages on Windows even when a
+        # Config package is not provided.
+        set(_VCPKG_X64_ROOT "C:/tools/vcpkg/installed/x64-windows")
+        if(EXISTS "${_VCPKG_X64_ROOT}/include")
+            list(APPEND CMAKE_PREFIX_PATH "${_VCPKG_X64_ROOT}")
+        endif()
+    endif()
+
     if(USE_MKL)
         # Intel MKL provides best performance
         find_package(MKL)
@@ -234,12 +254,37 @@ if(ENABLE_BLAS)
             # Try pkg-config
             pkg_check_modules(OpenBLAS openblas)
         endif()
+        if(NOT OpenBLAS_FOUND)
+            find_path(OpenBLAS_INCLUDE_DIRS
+                NAMES cblas.h
+                PATHS
+                    "C:/tools/vcpkg/installed/x64-windows/include"
+                    /usr/include
+                    /usr/local/include
+            )
+            find_library(OpenBLAS_LIBRARIES
+                NAMES openblas libopenblas
+                PATHS
+                    "C:/tools/vcpkg/installed/x64-windows/lib"
+                    "C:/tools/vcpkg/installed/x64-windows/debug/lib"
+                    /usr/lib
+                    /usr/lib64
+                    /usr/local/lib
+                    /usr/local/lib64
+            )
+            if(OpenBLAS_INCLUDE_DIRS AND OpenBLAS_LIBRARIES)
+                set(OpenBLAS_FOUND TRUE)
+                set(OpenBLAS_LIBRARY_DIRS "")
+            endif()
+        endif()
         
         if(OpenBLAS_FOUND)
             add_definitions(-DUSE_OPENBLAS -DENABLE_BLAS)
             list(APPEND EXTRA_LIBS ${OpenBLAS_LIBRARIES})
             list(APPEND EXTRA_INCLUDES ${OpenBLAS_INCLUDE_DIRS})
-            link_directories(${OpenBLAS_LIBRARY_DIRS})
+            if(OpenBLAS_LIBRARY_DIRS)
+                link_directories(${OpenBLAS_LIBRARY_DIRS})
+            endif()
             message(STATUS "Using OpenBLAS: ${OpenBLAS_LIBRARIES}")
             set(BLAS_FOUND TRUE)
         else()
@@ -263,6 +308,39 @@ if(ENABLE_BLAS)
     endif()
 endif()
 # --- End BLAS Configuration ---
+
+# --- SIMD Configuration ---
+if(ENABLE_SIMD)
+    if(MSVC)
+        if(CORTEXSDR_SIMD_LEVEL STREQUAL "AUTO" OR CORTEXSDR_SIMD_LEVEL STREQUAL "AVX2")
+            add_compile_options(/arch:AVX2)
+            add_compile_definitions(CORTEXSDR_SIMD_AVX2=1)
+            message(STATUS "SIMD target: AVX2")
+        elseif(CORTEXSDR_SIMD_LEVEL STREQUAL "SSE4_1")
+            add_compile_options(/arch:SSE2)
+            add_compile_definitions(CORTEXSDR_SIMD_SSE41=1)
+            message(STATUS "SIMD target: SSE4.1")
+        else()
+            add_compile_options(/arch:SSE2)
+            add_compile_definitions(CORTEXSDR_SIMD_SSE2=1)
+            message(STATUS "SIMD target: SSE2")
+        endif()
+    else()
+        if(CORTEXSDR_SIMD_LEVEL STREQUAL "AUTO" OR CORTEXSDR_SIMD_LEVEL STREQUAL "AVX2")
+            add_compile_options(-mavx2 -mfma)
+            add_compile_definitions(CORTEXSDR_SIMD_AVX2=1)
+            message(STATUS "SIMD target: AVX2")
+        elseif(CORTEXSDR_SIMD_LEVEL STREQUAL "SSE4_1")
+            add_compile_options(-msse4.1)
+            add_compile_definitions(CORTEXSDR_SIMD_SSE41=1)
+            message(STATUS "SIMD target: SSE4.1")
+        else()
+            add_compile_options(-msse2)
+            add_compile_definitions(CORTEXSDR_SIMD_SSE2=1)
+            message(STATUS "SIMD target: SSE2")
+        endif()
+    endif()
+endif()
 
 # Check for TensorFlow if enabled
 if(ENABLE_TENSORFLOW)

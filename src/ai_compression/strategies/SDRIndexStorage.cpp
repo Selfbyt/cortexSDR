@@ -1,4 +1,4 @@
-﻿#include "SDRIndexStorage.hpp"
+#include "SDRIndexStorage.hpp"
 #include "../core/ModelSegment.hpp"
 #include <algorithm>
 #include <stdexcept>

@@ -16,6 +16,12 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <thread>
+
+#if defined(CORTEXSDR_SIMD_AVX2) || defined(__AVX2__)
+    #include <immintrin.h>
+    #define CORTEXSDR_BLAS_FALLBACK_AVX2 1
+#endif
 
 // BLAS headers depending on what's available
 #if defined(USE_MKL)
@@ -47,6 +53,98 @@
 namespace CortexAICompression {
 namespace Kernels {
 
+#if !defined(ENABLE_BLAS)
+namespace {
+
+inline float dot_product_scalar(const float* a, const float* b, size_t n) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+#if defined(CORTEXSDR_BLAS_FALLBACK_AVX2)
+inline float hsum256_ps(__m256 v) {
+    const __m128 low = _mm256_castps256_ps128(v);
+    const __m128 high = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(low, high);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+
+inline float dot_product_avx2(const float* a, const float* b, size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+    }
+    float sum = hsum256_ps(acc);
+    for (; i < n; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+#endif
+
+inline float dot_product_fast(const float* a, const float* b, size_t n) {
+#if defined(CORTEXSDR_BLAS_FALLBACK_AVX2)
+    return dot_product_avx2(a, b, n);
+#else
+    return dot_product_scalar(a, b, n);
+#endif
+}
+
+void linear_forward_fallback_single_batch(
+    const float* input,
+    const float* weights,
+    const float* bias,
+    float* output,
+    size_t input_size,
+    size_t output_size) {
+    const size_t min_rows_per_thread = 64;
+    const size_t desired_threads = (std::max)(size_t(1), output_size / min_rows_per_thread);
+    const size_t worker_count = (std::min)(desired_threads, static_cast<size_t>((std::max)(1u, std::thread::hardware_concurrency())));
+
+    auto run_range = [&](size_t row_begin, size_t row_end) {
+        for (size_t row = row_begin; row < row_end; ++row) {
+            const float* weight_row = weights + row * input_size;
+            float value = dot_product_fast(input, weight_row, input_size);
+            if (bias != nullptr) {
+                value += bias[row];
+            }
+            output[row] = value;
+        }
+    };
+
+    if (worker_count <= 1 || output_size < min_rows_per_thread) {
+        run_range(0, output_size);
+        return;
+    }
+
+    const size_t chunk = (output_size + worker_count - 1) / worker_count;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count - 1);
+    for (size_t worker = 1; worker < worker_count; ++worker) {
+        const size_t begin = worker * chunk;
+        const size_t end = (std::min)(output_size, begin + chunk);
+        if (begin >= end) {
+            continue;
+        }
+        workers.emplace_back(run_range, begin, end);
+    }
+    run_range(0, (std::min)(output_size, chunk));
+    for (auto& worker : workers) {
+        worker.join();
+    }
+}
+
+} // namespace
+#endif
+
 const char* get_blas_implementation() {
     return BLAS_IMPL;
 }
@@ -74,10 +172,7 @@ void gemv(const float* A, const float* x, float* y,
     
     if (!transA) {
         for (size_t i = 0; i < M; ++i) {
-            float sum = 0.0f;
-            for (size_t j = 0; j < N; ++j) {
-                sum += A[i * N + j] * x[j];
-            }
+            const float sum = dot_product_fast(A + i * N, x, N);
             y[i] += alpha * sum;
         }
     } else {
@@ -168,6 +263,14 @@ void gemm_batched(size_t batch_size,
 
 void linear_forward(const float* input, const float* weights, const float* bias,
                    float* output, size_t batch_size, size_t input_size, size_t output_size) {
+#if !defined(ENABLE_BLAS)
+    if (batch_size == 1) {
+        linear_forward_fallback_single_batch(
+            input, weights, bias, output, input_size, output_size);
+        return;
+    }
+#endif
+
     // For linear layer: output = input * weights^T + bias
     // input: (batch_size x input_size)
     // weights: (output_size x input_size)

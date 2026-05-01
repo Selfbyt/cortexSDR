@@ -92,6 +92,14 @@ void AdaptiveSDRStrategy::setSDRWidth(size_t width) {
 }
 
 std::vector<std::byte> AdaptiveSDRStrategy::compress(const ModelSegment& segment) const {
+    // Tokenizer assets must be byte-exact for runtime tokenization.
+    if (segment.type == SegmentType::TOKENIZER_VOCAB ||
+        segment.type == SegmentType::TOKENIZER_MODEL) {
+        std::cerr << "Using direct storage for tokenizer segment '" << segment.name
+                  << "' (" << segment.data.size() << " bytes)\n";
+        return compressWithDirectStorage(segment);
+    }
+
     // For very small segments, use direct storage approach
     if (segment.data.size() <= smallDataThreshold_) {
         std::cerr << "Using direct storage for small segment '" << segment.name 

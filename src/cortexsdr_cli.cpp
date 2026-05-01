@@ -20,6 +20,7 @@
 
 #include "ai_compression/api/cortex_sdk.h"
 #include "ai_compression/SparseInferenceEngine.hpp"
+#include "ai_compression/LLMTokenizer.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -30,6 +31,11 @@
 #include <iomanip>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <sstream>
+#include <unordered_map>
 
 // Global state for inference engines and signal handling
 volatile bool g_running = true;
@@ -44,6 +50,17 @@ static size_t g_last_token_count = 0;
 static double g_last_tokens_per_sec = 0.0;
 static std::string g_last_benchmark_json;
 static bool g_has_model_tokenizer = false;                                             // Tokenizer assets present
+static std::vector<std::string> g_tokenizer_vocab;
+static std::unordered_map<std::string, int> g_tokenizer_lookup;
+static std::unique_ptr<CortexAICompression::LLMTokenizer> g_llm_tokenizer;
+static std::string g_token_embedding_layer_name;
+static std::vector<std::string> g_decoder_layer_order;
+static std::unique_ptr<CortexAICompression::LayerInfo> g_cached_token_embedding;
+static size_t g_native_hidden_dim = 0;
+static int g_native_max_steps = 2;            // bounded by default for latency safety
+static uint64_t g_native_timeout_ms = 10000;  // 10s default decode guard
+static bool g_fast_native_sampling = true;    // avoid full logits materialization when possible
+static bool g_native_timing_debug = false;
 
 /**
  * @brief Signal handler for graceful shutdown
@@ -140,6 +157,398 @@ std::string tensor_to_text(const std::vector<float>& tensor, int max_length) {
     return result;
 }
 
+static std::string bytes_to_string(const std::vector<std::byte>& bytes) {
+    if (bytes.empty()) return {};
+    return std::string(
+        reinterpret_cast<const char*>(bytes.data()),
+        reinterpret_cast<const char*>(bytes.data() + bytes.size())
+    );
+}
+
+static bool ensure_tokenizer_vocab_loaded() {
+    if (!g_tokenizer_vocab.empty() || !g_model_loader) {
+        return !g_tokenizer_vocab.empty();
+    }
+
+    try {
+        CortexAICompression::LayerInfo vocab_layer = g_model_loader->loadLayerByName("gguf_tokenizer_vocab");
+        std::istringstream stream(bytes_to_string(vocab_layer.raw_data));
+        std::string token;
+        while (std::getline(stream, token)) {
+            const int token_id = static_cast<int>(g_tokenizer_vocab.size());
+            g_tokenizer_lookup.emplace(token, token_id);
+            g_tokenizer_vocab.push_back(token);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Tokenizer] WARNING: Failed to load tokenizer vocab: " << e.what() << std::endl;
+    }
+
+    return !g_tokenizer_vocab.empty();
+}
+
+static int lookup_token_id(const std::string& token) {
+    auto it = g_tokenizer_lookup.find(token);
+    if (it != g_tokenizer_lookup.end()) return it->second;
+
+    const std::string sentencepiece_space = std::string("\xE2\x96\x81") + token;
+    it = g_tokenizer_lookup.find(sentencepiece_space);
+    if (it != g_tokenizer_lookup.end()) return it->second;
+
+    it = g_tokenizer_lookup.find(" " + token);
+    if (it != g_tokenizer_lookup.end()) return it->second;
+
+    if (token.size() == 1) {
+        return static_cast<int>(static_cast<unsigned char>(token[0]));
+    }
+    return -1;
+}
+
+static std::vector<int> tokenize_text_with_vocab(const std::string& text) {
+    std::vector<int> token_ids;
+    ensure_tokenizer_vocab_loaded();
+
+    std::string current;
+    auto flush_current = [&]() {
+        if (current.empty()) return;
+        const int token_id = lookup_token_id(current);
+        if (token_id >= 0) {
+            token_ids.push_back(token_id);
+        } else {
+            for (unsigned char ch : current) token_ids.push_back(static_cast<int>(ch));
+        }
+        current.clear();
+    };
+
+    for (unsigned char ch : text) {
+        if (std::isspace(ch)) {
+            flush_current();
+        } else if (std::ispunct(ch)) {
+            flush_current();
+            std::string punct(1, static_cast<char>(ch));
+            const int token_id = lookup_token_id(punct);
+            token_ids.push_back(token_id >= 0 ? token_id : static_cast<int>(ch));
+        } else {
+            current.push_back(static_cast<char>(ch));
+        }
+    }
+    flush_current();
+    return token_ids;
+}
+
+static bool infer_embedding_shape_from_index(size_t& vocab_size, size_t& embedding_dim) {
+    vocab_size = 0;
+    embedding_dim = 0;
+    if (!g_model_loader) return false;
+
+    for (const auto& seg : g_model_loader->getSegmentIndex()) {
+        std::string name = !seg.layer_name.empty() ? seg.layer_name : seg.name;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (name.find("token_embd") == std::string::npos &&
+            name.find("tok_embeddings") == std::string::npos &&
+            name.find("embed_tokens") == std::string::npos) {
+            continue;
+        }
+
+        if (seg.input_shape.size() >= 2 && seg.output_shape.size() >= 2) {
+            vocab_size = std::max(seg.input_shape.back(), seg.output_shape.back());
+            embedding_dim = std::min(seg.input_shape.back(), seg.output_shape.back());
+            return vocab_size > 0 && embedding_dim > 0;
+        }
+        if (seg.tensor_metadata && seg.tensor_metadata->dimensions.size() >= 2) {
+            vocab_size = std::max(seg.tensor_metadata->dimensions[0], seg.tensor_metadata->dimensions[1]);
+            embedding_dim = std::min(seg.tensor_metadata->dimensions[0], seg.tensor_metadata->dimensions[1]);
+            return vocab_size > 0 && embedding_dim > 0;
+        }
+    }
+
+    return false;
+}
+
+static std::vector<float> build_prompt_embedding(const std::string& prompt) {
+    size_t vocab_size = 0;
+    size_t embedding_dim = 0;
+    if (!infer_embedding_shape_from_index(vocab_size, embedding_dim)) {
+        return {};
+    }
+
+    std::vector<int> token_ids = tokenize_text_with_vocab(prompt);
+    if (token_ids.empty()) {
+        for (unsigned char ch : prompt) token_ids.push_back(static_cast<int>(ch));
+    }
+    if (token_ids.empty()) {
+        return {};
+    }
+
+    std::vector<float> embedding(embedding_dim, 0.0f);
+    size_t used_tokens = 0;
+    for (int token_id : token_ids) {
+        if (token_id < 0 || static_cast<size_t>(token_id) >= vocab_size) {
+            continue;
+        }
+
+        uint64_t state = static_cast<uint64_t>(token_id) + 0x9E3779B97F4A7C15ULL;
+        for (size_t probe = 0; probe < 8; ++probe) {
+            state ^= state >> 30;
+            state *= 0xBF58476D1CE4E5B9ULL;
+            state ^= state >> 27;
+            state *= 0x94D049BB133111EBULL;
+            state ^= state >> 31;
+            embedding[static_cast<size_t>(state % embedding_dim)] += (state & 1ULL) ? 1.0f : -1.0f;
+        }
+        ++used_tokens;
+    }
+
+    if (used_tokens == 0) return {};
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(used_tokens * 8));
+    for (float& value : embedding) value *= scale;
+
+    std::cout << "  - Tokenized prompt tokens: " << token_ids.size() << std::endl;
+    std::cout << "  - Prompt embedding size: " << embedding.size() << std::endl;
+    return embedding;
+}
+
+static bool is_token_embedding_name(const std::string& name_in) {
+    std::string n = name_in;
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return n.find("token_embd") != std::string::npos ||
+           n.find("tok_embeddings") != std::string::npos ||
+           n.find("embed_tokens") != std::string::npos;
+}
+
+static bool is_decoder_excluded_name(const std::string& name_in) {
+    std::string n = name_in;
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (n.find("gguf_") == 0 || n.find("tokenizer") != std::string::npos) {
+        return true;
+    }
+    return is_token_embedding_name(n);
+}
+
+static bool discover_native_llm_paths() {
+    if (!g_model_loader || !g_inference_engine) {
+        return false;
+    }
+    g_token_embedding_layer_name.clear();
+    g_decoder_layer_order.clear();
+    g_native_hidden_dim = 0;
+
+    const auto& segments = g_model_loader->getSegmentIndex();
+    for (const auto& seg : segments) {
+        const std::string candidate = !seg.layer_name.empty() ? seg.layer_name : seg.name;
+        if (g_token_embedding_layer_name.empty() && is_token_embedding_name(candidate)) {
+            g_token_embedding_layer_name = candidate;
+            if (seg.output_shape.size() >= 2) {
+                g_native_hidden_dim = seg.output_shape.back();
+            } else if (seg.input_shape.size() >= 2) {
+                g_native_hidden_dim = seg.input_shape.back();
+            }
+        }
+    }
+
+    auto execution_order = g_inference_engine->getExecutionOrder(segments);
+    for (const auto& layer_name : execution_order) {
+        if (is_decoder_excluded_name(layer_name)) {
+            continue;
+        }
+        g_decoder_layer_order.push_back(layer_name);
+    }
+    return !g_token_embedding_layer_name.empty();
+}
+
+struct EmbeddingLayout {
+    size_t vocab_size = 0;
+    size_t embedding_dim = 0;
+    bool valid() const { return vocab_size > 0 && embedding_dim > 0; }
+};
+
+static EmbeddingLayout infer_embedding_layout(const CortexAICompression::LayerInfo& token_embedding, int token_id_hint = -1) {
+    EmbeddingLayout best{};
+    const size_t total = token_embedding.weights.size();
+    if (total == 0) {
+        return best;
+    }
+
+    std::vector<std::pair<size_t, size_t>> candidates;
+    if (token_embedding.input_shape.size() >= 2 && token_embedding.output_shape.size() >= 2) {
+        candidates.emplace_back(token_embedding.input_shape.back(), token_embedding.output_shape.back());
+        candidates.emplace_back(token_embedding.output_shape.back(), token_embedding.input_shape.back());
+    }
+    if (g_llm_tokenizer && g_llm_tokenizer->isLoaded() && g_native_hidden_dim > 0) {
+        candidates.emplace_back(g_llm_tokenizer->vocabSize(), g_native_hidden_dim);
+    }
+    if (g_native_hidden_dim > 0) {
+        candidates.emplace_back(total / g_native_hidden_dim, g_native_hidden_dim);
+    }
+    candidates.emplace_back(total / 3584, 3584);
+
+    for (const auto& c : candidates) {
+        const size_t vocab = c.first;
+        const size_t dim = c.second;
+        if (vocab == 0 || dim == 0) continue;
+        if (vocab * dim > total) continue;
+        if (token_id_hint >= 0 && static_cast<size_t>(token_id_hint) >= vocab) continue;
+        if (dim < 64 || dim > 16384) continue;
+        if (!best.valid() || (vocab > best.vocab_size)) {
+            best = {vocab, dim};
+        }
+    }
+    return best;
+}
+
+static std::vector<float> embedding_lookup(const CortexAICompression::LayerInfo& token_embedding, int token_id) {
+    if (token_id < 0 || token_embedding.weights.empty()) {
+        return {};
+    }
+    const EmbeddingLayout layout = infer_embedding_layout(token_embedding, token_id);
+    if (!layout.valid() || static_cast<size_t>(token_id) >= layout.vocab_size) {
+        return {};
+    }
+    std::vector<float> out(layout.embedding_dim);
+    const float* row = token_embedding.weights.data() + (static_cast<size_t>(token_id) * layout.embedding_dim);
+    std::copy(row, row + layout.embedding_dim, out.begin());
+    return out;
+}
+
+static std::vector<float> build_prompt_context_hidden(
+    const CortexAICompression::LayerInfo& token_embedding,
+    const std::vector<int>& prompt_tokens) {
+    const EmbeddingLayout layout = infer_embedding_layout(token_embedding);
+    if (!layout.valid() || prompt_tokens.empty()) {
+        return {};
+    }
+
+    std::vector<float> context(layout.embedding_dim, 0.0f);
+    size_t used = 0;
+    for (int token_id : prompt_tokens) {
+        auto emb = embedding_lookup(token_embedding, token_id);
+        if (emb.empty()) {
+            continue;
+        }
+        for (size_t i = 0; i < context.size(); ++i) {
+            context[i] += emb[i];
+        }
+        ++used;
+    }
+    if (used == 0) {
+        return {};
+    }
+
+    const float inv = 1.0f / static_cast<float>(used);
+    for (float& value : context) {
+        value *= inv;
+    }
+    return context;
+}
+
+static bool token_is_repeated(const std::vector<int>& already_generated, int tok) {
+    return std::find(already_generated.begin(), already_generated.end(), tok) != already_generated.end();
+}
+
+static int sample_token_deterministic(
+    const std::vector<float>& logits,
+    const std::vector<int>& already_generated,
+    float temperature = 0.8f,
+    size_t top_k = 40) {
+    if (logits.empty()) return -1;
+
+    std::vector<std::pair<float, int>> scored;
+    scored.reserve(logits.size());
+    for (size_t i = 0; i < logits.size(); ++i) {
+        float score = logits[i];
+        if (temperature > 0.0f) {
+            score /= temperature;
+        }
+        const int tok = static_cast<int>(i);
+        if (std::find(already_generated.begin(), already_generated.end(), tok) != already_generated.end()) {
+            score -= 1.5f; // repetition penalty
+        }
+        scored.emplace_back(score, tok);
+    }
+    std::partial_sort(
+        scored.begin(),
+        scored.begin() + std::min(top_k, scored.size()),
+        scored.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+    return scored.empty() ? -1 : scored.front().second;
+}
+
+static int select_next_token_from_embedding_transpose(
+    const std::vector<float>& hidden,
+    const CortexAICompression::LayerInfo& token_embedding,
+    const std::vector<int>& already_generated,
+    float temperature = 0.8f) {
+    const EmbeddingLayout layout = infer_embedding_layout(token_embedding);
+    if (!layout.valid() || hidden.size() != layout.embedding_dim) {
+        return -1;
+    }
+
+    const float temp_scale = temperature > 0.0f ? (1.0f / temperature) : 1.0f;
+    const float* emb = token_embedding.weights.data();
+    struct BestCandidate {
+        float score = -std::numeric_limits<float>::infinity();
+        int token = -1;
+    };
+
+    const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    const size_t worker_count = std::min<size_t>(hw_threads, std::max<size_t>(1, layout.vocab_size / 4096));
+    std::vector<BestCandidate> best_by_worker(worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+
+    auto score_range = [&](size_t worker_index, size_t begin, size_t end) {
+        BestCandidate local_best;
+        for (size_t token = begin; token < end; ++token) {
+            const float* row = emb + (token * layout.embedding_dim);
+            float score = 0.0f;
+            for (size_t i = 0; i < layout.embedding_dim; ++i) {
+                score += row[i] * hidden[i];
+            }
+            score *= temp_scale;
+
+            const int tok = static_cast<int>(token);
+            if (token_is_repeated(already_generated, tok)) {
+                score -= 1.5f;
+            }
+            if (score > local_best.score) {
+                local_best.score = score;
+                local_best.token = tok;
+            }
+        }
+        best_by_worker[worker_index] = local_best;
+    };
+
+    const size_t chunk = (layout.vocab_size + worker_count - 1) / worker_count;
+    for (size_t worker = 1; worker < worker_count; ++worker) {
+        const size_t begin = worker * chunk;
+        const size_t end = std::min(layout.vocab_size, begin + chunk);
+        if (begin >= end) {
+            best_by_worker[worker] = BestCandidate{};
+            continue;
+        }
+        workers.emplace_back(score_range, worker, begin, end);
+    }
+    score_range(0, 0, std::min(layout.vocab_size, chunk));
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    BestCandidate best;
+    for (const auto& candidate : best_by_worker) {
+        if (candidate.score > best.score) {
+            best = candidate;
+        }
+    }
+
+    return best.token;
+}
+
 // Minimal parser to summarize benchmark JSON from SDK without external deps
 static void print_benchmark_summary(const std::string& json) {
     if (json.empty()) return;
@@ -209,13 +618,20 @@ bool load_model(const std::string& model_path, float sparsity = 0.02f) {
         // Create inference engine that uses the model loader
         std::cout << "Creating inference engine with on-demand loading..." << std::endl;
         g_inference_engine = std::make_unique<CortexAICompression::SDRInferenceEngine>(*g_model_loader);
+        g_tokenizer_vocab.clear();
+        g_tokenizer_lookup.clear();
+        g_llm_tokenizer.reset();
+        g_token_embedding_layer_name.clear();
+        g_decoder_layer_order.clear();
+        g_cached_token_embedding.reset();
         
         // Configure inference engine for optimal performance
         g_inference_engine->setBatchSize(1);
         g_inference_engine->enableDropout(false);
         g_inference_engine->setInferenceMode(false); // Set to inference mode
-        // Enable memory-optimized execution for large models
-        g_inference_engine->enableAggressiveMemoryManagement(true);
+        // Native decode is extremely sensitive to layer reload churn, so prefer speed here.
+        g_inference_engine->enableAggressiveMemoryManagement(false);
+        g_inference_engine->enableLayerPrefetch(true);
         g_inference_engine->initializeMemoryPool(8192); // 8GB cap by default; adjust as needed
         
         // Show model statistics
@@ -247,6 +663,28 @@ bool load_model(const std::string& model_path, float sparsity = 0.02f) {
                 std::cout << "  - Tokenizer type: " << tok_type << std::endl;
                 cortex_free_string(tok_type);
             }
+        }
+
+        if (g_has_model_tokenizer) {
+            try {
+                g_llm_tokenizer = std::make_unique<CortexAICompression::LLMTokenizer>();
+                g_llm_tokenizer->loadFromArchive(*g_model_loader);
+                std::cout << "  - Tokenizer runtime: LOADED (" << g_llm_tokenizer->vocabSize() << " tokens)" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "  - Tokenizer runtime load failed: " << e.what() << std::endl;
+                g_llm_tokenizer.reset();
+                g_has_model_tokenizer = false;
+            }
+        }
+
+        if (discover_native_llm_paths()) {
+            std::cout << "  - Native decode path: READY" << std::endl;
+            std::cout << "  - Embedding layer: " << g_token_embedding_layer_name << std::endl;
+            std::cout << "  - Decoder layers: " << g_decoder_layer_order.size() << std::endl;
+            std::cout << "  - Native decode max steps: " << g_native_max_steps << std::endl;
+            std::cout << "  - Native decode timeout: " << g_native_timeout_ms << "ms" << std::endl;
+        } else {
+            std::cout << "  - Native decode path: NOT READY (fallback path only)" << std::endl;
         }
         
         // Also try to create legacy engine as fallback
@@ -290,89 +728,155 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
     }
     
     auto start_time = std::chrono::high_resolution_clock::now();
-    
-    // Convert text input to tensor
-    std::vector<float> input_tensor = text_to_tensor(prompt);
-    
+
     std::cout << "Starting inference..." << std::endl;
     std::cout << "  - Input prompt: \"" << prompt << "\"" << std::endl;
-    std::cout << "  - Input tensor size: " << input_tensor.size() << std::endl;
     std::cout << "  - On-demand loading: " << (g_use_on_demand_loading ? "ENABLED" : "DISABLED") << std::endl;
-    
-    std::vector<float> output_tensor;
-    
-    // Try on-demand inference first (Ollama-style)
-    if (g_inference_engine && g_use_on_demand_loading) {
-        std::cout << "  - Using on-demand layer-by-layer execution..." << std::endl;
-        
+
+    std::string result;
+    bool native_decode_used = false;
+    bool native_decode_attempted = false;
+
+    if (g_use_on_demand_loading && g_inference_engine && g_model_loader &&
+        g_llm_tokenizer && g_llm_tokenizer->isLoaded() &&
+        !g_token_embedding_layer_name.empty() && !g_decoder_layer_order.empty()) {
         try {
-            // Run inference with on-demand loading
-            output_tensor = g_inference_engine->run(input_tensor);
-            
-            std::cout << "  - On-demand inference completed successfully" << std::endl;
-            std::cout << "  - Output tensor size: " << output_tensor.size() << std::endl;
-            
-        } catch (const std::exception& e) {
-            std::cerr << "  - On-demand inference failed: " << e.what() << std::endl;
-            std::cout << "  - Falling back to legacy engine..." << std::endl;
-            
-            // Fallback to legacy engine
-            if (g_engine) {
-                const size_t max_output_size = 1000;
-                output_tensor.resize(max_output_size);
-                size_t actual_output_size = 0;
-                
-                CortexError error = cortex_inference_engine_run(
-                    g_engine,
-                    input_tensor.data(),
-                    input_tensor.size(),
-                    output_tensor.data(),
-                    output_tensor.size(),
-                    &actual_output_size
-                );
-                
-                if (error.code != CORTEX_OK) {
-                    print_error(error);
-                    return "Error: Both on-demand and legacy inference failed";
+            native_decode_attempted = true;
+            native_decode_used = true;
+            std::cout << "  - Using native token decode path..." << std::endl;
+            auto prompt_tokens = g_llm_tokenizer->encode(prompt);
+            if (prompt_tokens.empty()) {
+                return "Error: Prompt tokenization produced no tokens";
+            }
+
+            if (!g_cached_token_embedding) {
+                const auto embed_load_start = std::chrono::steady_clock::now();
+                g_cached_token_embedding = std::make_unique<CortexAICompression::LayerInfo>(
+                    g_model_loader->loadLayerByName(g_token_embedding_layer_name));
+                const auto embed_load_end = std::chrono::steady_clock::now();
+                if (g_native_timing_debug) {
+                    const auto embed_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        embed_load_end - embed_load_start).count();
+                    std::cout << "  - Token embedding cache warmup: " << embed_load_ms << "ms" << std::endl;
                 }
-                
-                output_tensor.resize(actual_output_size);
-                std::cout << "  - Legacy inference completed" << std::endl;
-            } else {
-                return "Error: On-demand inference failed and no legacy engine available";
+            }
+            const CortexAICompression::LayerInfo& token_embedding = *g_cached_token_embedding;
+            if (token_embedding.weights.empty()) {
+                return "Error: Token embedding layer has no weights";
+            }
+
+            std::vector<int> generated;
+            generated.reserve(static_cast<size_t>(max_length));
+            const std::vector<float> prompt_hidden = build_prompt_context_hidden(token_embedding, prompt_tokens);
+            int cur_token = prompt_tokens.back();
+            const int step_limit = std::min(max_length, std::max(1, g_native_max_steps));
+            std::string stop_reason = "max_steps";
+            const auto native_start = std::chrono::steady_clock::now();
+            for (int step = 0; step < step_limit; ++step) {
+                const auto native_now = std::chrono::steady_clock::now();
+                const auto native_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(native_now - native_start).count();
+                if (static_cast<uint64_t>(native_elapsed) >= g_native_timeout_ms) {
+                    stop_reason = "timeout";
+                    break;
+                }
+                const auto decode_start = std::chrono::steady_clock::now();
+                std::vector<float> decoder_out;
+                if (step == 0) {
+                    if (prompt_hidden.empty()) {
+                        return "Error: Prompt context embedding failed";
+                    }
+                    decoder_out = g_inference_engine->runPrefill(prompt_hidden, g_decoder_layer_order);
+                } else {
+                    auto hidden = embedding_lookup(token_embedding, cur_token);
+                    if (hidden.empty()) {
+                        return "Error: Token embedding lookup failed";
+                    }
+                    decoder_out = g_inference_engine->runDecodeStep(hidden, g_decoder_layer_order);
+                }
+                const auto decode_end = std::chrono::steady_clock::now();
+                if (decoder_out.empty()) {
+                    return "Error: Decoder stack returned empty output";
+                }
+
+                const auto sample_start = std::chrono::steady_clock::now();
+                cur_token = g_fast_native_sampling
+                    ? select_next_token_from_embedding_transpose(
+                        decoder_out, token_embedding, generated, 0.8f)
+                    : -1;
+                const auto sample_end = std::chrono::steady_clock::now();
+                if (cur_token < 0) {
+                    return "Error: Failed to sample next token";
+                }
+                if (g_native_timing_debug) {
+                    const auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(decode_end - decode_start).count();
+                    const auto sample_ms = std::chrono::duration_cast<std::chrono::milliseconds>(sample_end - sample_start).count();
+                    std::cout << "    step " << (step + 1)
+                              << ": decoder=" << decode_ms << "ms"
+                              << ", sampling=" << sample_ms << "ms" << std::endl;
+                }
+                generated.push_back(cur_token);
+                if (g_llm_tokenizer->eosId() >= 0 && cur_token == g_llm_tokenizer->eosId()) {
+                    stop_reason = "eos";
+                    break;
+                }
+            }
+            result = g_llm_tokenizer->decode(generated);
+            if (result.empty()) {
+                result = "<empty>";
+            }
+            std::cout << "  - Native decode generated tokens: " << generated.size() << std::endl;
+            std::cout << "  - Native decode stop reason: " << stop_reason << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "  - Native decode failed: " << e.what() << std::endl;
+            native_decode_used = false;
+        }
+    }
+
+    if (native_decode_attempted && !native_decode_used) {
+        return "Error: Native GGUF decode failed (see stderr diagnostics)";
+    }
+
+    if (!native_decode_used) {
+        std::vector<float> input_tensor = build_prompt_embedding(prompt);
+        if (input_tensor.empty()) {
+            input_tensor = text_to_tensor(prompt);
+        }
+        std::cout << "  - Input tensor size: " << input_tensor.size() << std::endl;
+
+        std::vector<float> output_tensor;
+        if (g_inference_engine && g_use_on_demand_loading) {
+            std::cout << "  - Using on-demand layer-by-layer execution..." << std::endl;
+            try {
+                output_tensor = g_inference_engine->run(input_tensor);
+            } catch (const std::exception& e) {
+                std::cerr << "  - On-demand inference failed: " << e.what() << std::endl;
+                if (!g_engine) {
+                    return "Error: On-demand inference failed and no legacy engine available";
+                }
             }
         }
-    }
-    // Use legacy engine directly
-    else if (g_engine) {
-        std::cout << "  - Using legacy inference engine..." << std::endl;
-        
-        const size_t max_output_size = 1000;
-        output_tensor.resize(max_output_size);
-        size_t actual_output_size = 0;
-        
-        CortexError error = cortex_inference_engine_run(
-            g_engine,
-            input_tensor.data(),
-            input_tensor.size(),
-            output_tensor.data(),
-            output_tensor.size(),
-            &actual_output_size
-        );
-        
-        if (error.code != CORTEX_OK) {
-            print_error(error);
-            return "Error: Legacy inference failed";
+
+        if ((output_tensor.empty()) && g_engine) {
+            std::cout << "  - Falling back to legacy engine..." << std::endl;
+            const size_t max_output_size = 1000;
+            output_tensor.resize(max_output_size);
+            size_t actual_output_size = 0;
+            CortexError error = cortex_inference_engine_run(
+                g_engine,
+                input_tensor.data(),
+                input_tensor.size(),
+                output_tensor.data(),
+                output_tensor.size(),
+                &actual_output_size
+            );
+            if (error.code != CORTEX_OK) {
+                print_error(error);
+                return "Error: Inference failed";
+            }
+            output_tensor.resize(actual_output_size);
         }
-        
-        output_tensor.resize(actual_output_size);
-        std::cout << "  - Legacy inference completed" << std::endl;
-    } else {
-        return "Error: No inference engine available";
+        result = tensor_to_text(output_tensor, max_length);
     }
-    
-    // Convert output tensor back to text
-    std::string result = tensor_to_text(output_tensor, max_length);
     
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -546,6 +1050,9 @@ void print_usage(const char* program_name) {
     std::cout << "  -p, --prompt TEXT       Generate text from prompt and exit" << std::endl;
     std::cout << "  -m, --max-length N      Maximum output length (default: 100)" << std::endl;
     std::cout << "  --profile PATH          Write profiling JSON after single-prompt run" << std::endl;
+    std::cout << "  --tokenize-debug TEXT   Show tokenizer IDs and decoded roundtrip" << std::endl;
+    std::cout << "  --native-max-steps N    Max token steps in native decode (default: 2)" << std::endl;
+    std::cout << "  --native-timeout-ms N   Timeout for native decode loop (default: 10000)" << std::endl;
     std::cout << "  --legacy                Use legacy mode (load all layers at once)" << std::endl;
     std::cout << "  --on-demand             Use on-demand mode (load layers as needed)" << std::endl;
     std::cout << "  --download URL          Download model and compress to .sdr (auto-detect format)" << std::endl;
@@ -592,6 +1099,7 @@ int main(int argc, char* argv[]) {
     bool interactive_mode = false;
     int max_length = 100;
     std::string profile_path;
+    std::string tokenize_debug_text;
     // Download+compress (auto-detect) options
     bool run_download = false;
     std::string dl_url;
@@ -629,6 +1137,28 @@ int main(int argc, char* argv[]) {
                 profile_path = argv[++i];
             } else {
                 std::cerr << "Error: --profile requires a path argument" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--tokenize-debug") {
+            if (i + 1 < argc) {
+                tokenize_debug_text = argv[++i];
+            } else {
+                std::cerr << "Error: --tokenize-debug requires text" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--native-max-steps") {
+            if (i + 1 < argc) {
+                g_native_max_steps = std::max(1, std::stoi(argv[++i]));
+            } else {
+                std::cerr << "Error: --native-max-steps requires an integer" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--native-timeout-ms") {
+            if (i + 1 < argc) {
+                g_native_timeout_ms = static_cast<uint64_t>(std::stoull(argv[++i]));
+                if (g_native_timeout_ms == 0) g_native_timeout_ms = 1000;
+            } else {
+                std::cerr << "Error: --native-timeout-ms requires an integer" << std::endl;
                 return 1;
             }
         } else if (arg == "-s" || arg == "--sparsity") {
@@ -761,7 +1291,19 @@ int main(int argc, char* argv[]) {
     }
     
     // Run in appropriate mode
-    if (!prompt.empty()) {
+    if (!tokenize_debug_text.empty()) {
+        if (!g_llm_tokenizer || !g_llm_tokenizer->isLoaded()) {
+            std::cerr << "Tokenizer runtime is not loaded. Provide a GGUF-derived .sdr model." << std::endl;
+            return 1;
+        }
+        auto ids = g_llm_tokenizer->encode(tokenize_debug_text);
+        std::cout << "Token IDs:";
+        for (int id : ids) {
+            std::cout << " " << id;
+        }
+        std::cout << std::endl;
+        std::cout << "Roundtrip: " << g_llm_tokenizer->decode(ids) << std::endl;
+    } else if (!prompt.empty()) {
         // Single prompt mode
         std::cout << "Generating response for: " << prompt << std::endl;
         std::string response = generate_text(prompt, max_length);

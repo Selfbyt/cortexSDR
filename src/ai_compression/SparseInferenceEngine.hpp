@@ -149,6 +149,12 @@ public:
      * @throws std::runtime_error On decompression or I/O errors.
      */
     LayerInfo loadLayerByName(const std::string& name) const;
+    /**
+     * @brief Load and decompress a single segment by exact segment name.
+     * @param name Exact segment name from archive index.
+     * @return Decompressed ModelSegment payload + metadata.
+     */
+    ModelSegment loadSegmentByName(const std::string& name) const;
     
     /**
      * @brief Start asynchronous materialization of a single layer.
@@ -250,6 +256,25 @@ public:
      * @throws std::runtime_error On layer load or execution errors.
      */
     std::vector<float> run(const std::vector<float>& input_tensor);
+    /**
+     * @brief Run decoder stack for prompt prefill or first step.
+     * @param input_hidden Hidden input vector (typically token embedding).
+     * @param decoder_layer_names Ordered decoder layers (without tokenizer/embed).
+     */
+    std::vector<float> runPrefill(const std::vector<float>& input_hidden, const std::vector<std::string>& decoder_layer_names);
+    /**
+     * @brief Run one decode step using previous hidden state.
+     * @param prev_hidden Previous hidden vector.
+     * @param decoder_layer_names Ordered decoder layers.
+     */
+    std::vector<float> runDecodeStep(const std::vector<float>& prev_hidden, const std::vector<std::string>& decoder_layer_names);
+    /**
+     * @brief Project hidden vector to token logits using embedding matrix.
+     * @param hidden Hidden vector of size embedding_dim.
+     * @param token_embedding Layer containing token embedding weights.
+     * @return Logits sized to vocabulary.
+     */
+    std::vector<float> computeTokenLogitsFromEmbedding(const std::vector<float>& hidden, const LayerInfo& token_embedding) const;
     const RunStats& getLastRunStats() const { return last_run_stats_; }
     
     /**

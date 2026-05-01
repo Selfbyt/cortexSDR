@@ -10,15 +10,15 @@
 
 // Platform-specific SIMD includes
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    #if defined(__AVX2__)
+    #if defined(CORTEXSDR_SIMD_AVX2) || defined(__AVX2__)
         #include <immintrin.h>
         #define USE_AVX2
         #define SIMD_LEVEL "AVX2"
-    #elif defined(__SSE4_1__)
+    #elif defined(CORTEXSDR_SIMD_SSE41) || defined(__SSE4_1__)
         #include <smmintrin.h>
         #define USE_SSE41
         #define SIMD_LEVEL "SSE4.1"
-    #elif defined(__SSE2__)
+    #elif defined(CORTEXSDR_SIMD_SSE2) || defined(__SSE2__)
         #include <emmintrin.h>
         #define USE_SSE2
         #define SIMD_LEVEL "SSE2"

@@ -17,12 +17,17 @@
 #include "cortex_sdk.h"
 #include "c_api.hpp"
 #include "../SparseInferenceEngine.hpp"
+#include "../LLMTokenizer.hpp"
 #include "../core/AICompressor.hpp"
 #include "../core/AIDecompressor.hpp"
 #include <string>
 #include <cstring>
 #include "../parsers/ModelParserFactory.hpp"
+#include <algorithm>
+#include <chrono>
+#include <limits>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <iostream>
@@ -61,6 +66,12 @@ using namespace CortexAICompression;
 struct CortexInferenceEngine {
     std::unique_ptr<SDRModelLoader> model_loader;
     std::unique_ptr<SDRInferenceEngine> inference_engine;
+    std::unique_ptr<LLMTokenizer> tokenizer;
+    std::string token_embedding_layer_name;
+    std::vector<std::string> decoder_layer_order;
+    std::unique_ptr<LayerInfo> cached_token_embedding;
+    size_t native_hidden_dim = 0;
+    bool native_decode_ready = false;
 };
 
 // Global storage for handles
@@ -78,6 +89,247 @@ namespace {
         char* cstr = new char[str.length() + 1];
         strcpy(cstr, str.c_str());
         return cstr;
+    }
+
+    std::string to_lower_copy(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
+    }
+
+    bool is_token_embedding_name(const std::string& name_in) {
+        const std::string n = to_lower_copy(name_in);
+        return n.find("token_embd") != std::string::npos ||
+               n.find("tok_embeddings") != std::string::npos ||
+               n.find("embed_tokens") != std::string::npos;
+    }
+
+    bool is_decoder_excluded_name(const std::string& name_in) {
+        const std::string n = to_lower_copy(name_in);
+        if (n.find("gguf_") == 0 || n.find("tokenizer") != std::string::npos) {
+            return true;
+        }
+        return is_token_embedding_name(n);
+    }
+
+    bool discover_native_llm_paths(CortexInferenceEngine& engine) {
+        engine.token_embedding_layer_name.clear();
+        engine.decoder_layer_order.clear();
+        engine.native_hidden_dim = 0;
+
+        const auto& segments = engine.model_loader->getSegmentIndex();
+        for (const auto& seg : segments) {
+            const std::string candidate = !seg.layer_name.empty() ? seg.layer_name : seg.name;
+            if (engine.token_embedding_layer_name.empty() && is_token_embedding_name(candidate)) {
+                engine.token_embedding_layer_name = candidate;
+                if (seg.output_shape.size() >= 2) {
+                    engine.native_hidden_dim = seg.output_shape.back();
+                } else if (seg.input_shape.size() >= 2) {
+                    engine.native_hidden_dim = seg.input_shape.back();
+                }
+            }
+        }
+
+        auto execution_order = engine.inference_engine->getExecutionOrder(segments);
+        for (const auto& layer_name : execution_order) {
+            if (is_decoder_excluded_name(layer_name)) {
+                continue;
+            }
+            engine.decoder_layer_order.push_back(layer_name);
+        }
+
+        engine.native_decode_ready =
+            engine.tokenizer && engine.tokenizer->isLoaded() &&
+            !engine.token_embedding_layer_name.empty() &&
+            !engine.decoder_layer_order.empty();
+        return engine.native_decode_ready;
+    }
+
+    struct EmbeddingLayout {
+        size_t vocab_size = 0;
+        size_t embedding_dim = 0;
+        bool valid() const { return vocab_size > 0 && embedding_dim > 0; }
+    };
+
+    EmbeddingLayout infer_embedding_layout(
+        const CortexInferenceEngine& engine,
+        const LayerInfo& token_embedding,
+        int token_id_hint = -1) {
+        EmbeddingLayout best{};
+        const size_t total = token_embedding.weights.size();
+        if (total == 0) {
+            return best;
+        }
+
+        std::vector<std::pair<size_t, size_t>> candidates;
+        if (token_embedding.input_shape.size() >= 2 && token_embedding.output_shape.size() >= 2) {
+            candidates.emplace_back(token_embedding.input_shape.back(), token_embedding.output_shape.back());
+            candidates.emplace_back(token_embedding.output_shape.back(), token_embedding.input_shape.back());
+        }
+        if (engine.tokenizer && engine.tokenizer->isLoaded() && engine.native_hidden_dim > 0) {
+            candidates.emplace_back(engine.tokenizer->vocabSize(), engine.native_hidden_dim);
+        }
+        if (engine.native_hidden_dim > 0) {
+            candidates.emplace_back(total / engine.native_hidden_dim, engine.native_hidden_dim);
+        }
+        candidates.emplace_back(total / 3584, 3584);
+
+        for (const auto& c : candidates) {
+            const size_t vocab = c.first;
+            const size_t dim = c.second;
+            if (vocab == 0 || dim == 0) continue;
+            if (vocab * dim > total) continue;
+            if (token_id_hint >= 0 && static_cast<size_t>(token_id_hint) >= vocab) continue;
+            if (dim < 64 || dim > 16384) continue;
+            if (!best.valid() || vocab > best.vocab_size) {
+                best = {vocab, dim};
+            }
+        }
+        return best;
+    }
+
+    std::vector<float> embedding_lookup(
+        const CortexInferenceEngine& engine,
+        const LayerInfo& token_embedding,
+        int token_id) {
+        if (token_id < 0 || token_embedding.weights.empty()) {
+            return {};
+        }
+        const EmbeddingLayout layout = infer_embedding_layout(engine, token_embedding, token_id);
+        if (!layout.valid() || static_cast<size_t>(token_id) >= layout.vocab_size) {
+            return {};
+        }
+        std::vector<float> out(layout.embedding_dim);
+        const float* row = token_embedding.weights.data() + (static_cast<size_t>(token_id) * layout.embedding_dim);
+        std::copy(row, row + layout.embedding_dim, out.begin());
+        return out;
+    }
+
+    std::vector<float> build_prompt_context_hidden(
+        const CortexInferenceEngine& engine,
+        const LayerInfo& token_embedding,
+        const std::vector<int>& prompt_tokens) {
+        const EmbeddingLayout layout = infer_embedding_layout(engine, token_embedding);
+        if (!layout.valid() || prompt_tokens.empty()) {
+            return {};
+        }
+
+        std::vector<float> context(layout.embedding_dim, 0.0f);
+        size_t used = 0;
+        for (int token_id : prompt_tokens) {
+            auto emb = embedding_lookup(engine, token_embedding, token_id);
+            if (emb.empty()) {
+                continue;
+            }
+            for (size_t i = 0; i < context.size(); ++i) {
+                context[i] += emb[i];
+            }
+            ++used;
+        }
+        if (used == 0) {
+            return {};
+        }
+
+        const float inv = 1.0f / static_cast<float>(used);
+        for (float& value : context) {
+            value *= inv;
+        }
+        return context;
+    }
+
+    bool token_is_repeated(const std::vector<int>& already_generated, int tok) {
+        return std::find(already_generated.begin(), already_generated.end(), tok) != already_generated.end();
+    }
+
+    int select_next_token_from_embedding_transpose(
+        const CortexInferenceEngine& engine,
+        const std::vector<float>& hidden,
+        const LayerInfo& token_embedding,
+        const std::vector<int>& already_generated,
+        float temperature = 0.8f) {
+        const EmbeddingLayout layout = infer_embedding_layout(engine, token_embedding);
+        if (!layout.valid() || hidden.size() != layout.embedding_dim) {
+            return -1;
+        }
+
+        const float temp_scale = temperature > 0.0f ? (1.0f / temperature) : 1.0f;
+        const float* emb = token_embedding.weights.data();
+        struct BestCandidate {
+            float score = -std::numeric_limits<float>::infinity();
+            int token = -1;
+        };
+
+        const unsigned int hw_threads = (std::max)(1u, std::thread::hardware_concurrency());
+        const size_t desired_workers = (std::max)(static_cast<size_t>(1), layout.vocab_size / 4096);
+        const size_t hw_threads_size = static_cast<size_t>(hw_threads);
+        const size_t worker_count = (std::min)(hw_threads_size, desired_workers);
+        std::vector<BestCandidate> best_by_worker(worker_count);
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+
+        auto score_range = [&](size_t worker_index, size_t begin, size_t end) {
+            BestCandidate local_best;
+            for (size_t token = begin; token < end; ++token) {
+                const float* row = emb + (token * layout.embedding_dim);
+                float score = 0.0f;
+                for (size_t i = 0; i < layout.embedding_dim; ++i) {
+                    score += row[i] * hidden[i];
+                }
+                score *= temp_scale;
+
+                const int tok = static_cast<int>(token);
+                if (token_is_repeated(already_generated, tok)) {
+                    score -= 1.5f;
+                }
+                if (score > local_best.score) {
+                    local_best.score = score;
+                    local_best.token = tok;
+                }
+            }
+            best_by_worker[worker_index] = local_best;
+        };
+
+        const size_t chunk = (layout.vocab_size + worker_count - 1) / worker_count;
+        for (size_t worker = 1; worker < worker_count; ++worker) {
+            const size_t begin = worker * chunk;
+            const size_t end = (std::min)(layout.vocab_size, begin + chunk);
+            if (begin >= end) {
+                best_by_worker[worker] = BestCandidate{};
+                continue;
+            }
+            workers.emplace_back(score_range, worker, begin, end);
+        }
+        score_range(0, 0, (std::min)(layout.vocab_size, chunk));
+        for (auto& worker : workers) {
+            worker.join();
+        }
+
+        BestCandidate best;
+        for (const auto& candidate : best_by_worker) {
+            if (candidate.score > best.score) {
+                best = candidate;
+            }
+        }
+        return best.token;
+    }
+
+    CortexError ensure_native_generation_ready(CortexInferenceEngine& engine) {
+        if (engine.native_decode_ready) {
+            return {nullptr, CORTEX_SUCCESS};
+        }
+        if (!engine.tokenizer) {
+            engine.tokenizer = std::make_unique<LLMTokenizer>();
+            try {
+                engine.tokenizer->loadFromArchive(*engine.model_loader);
+            } catch (const std::exception& e) {
+                return {str_to_c(std::string("Tokenizer load failed: ") + e.what()), CORTEX_ERROR_INFERENCE};
+            }
+        }
+        if (!discover_native_llm_paths(engine)) {
+            return {"Native generation path is not available for this model", CORTEX_ERROR_UNSUPPORTED_FORMAT};
+        }
+        return {nullptr, CORTEX_SUCCESS};
     }
 }
 
@@ -133,6 +385,19 @@ CortexError cortex_inference_engine_create(
         
         // Create the inference engine
         engine->inference_engine = std::make_unique<SDRInferenceEngine>(*engine->model_loader);
+        engine->inference_engine->enableAggressiveMemoryManagement(false);
+        engine->inference_engine->enableLayerPrefetch(true);
+        engine->inference_engine->setInferenceMode(false);
+        engine->inference_engine->setBatchSize(1);
+
+        try {
+            engine->tokenizer = std::make_unique<LLMTokenizer>();
+            engine->tokenizer->loadFromArchive(*engine->model_loader);
+            discover_native_llm_paths(*engine);
+        } catch (...) {
+            engine->tokenizer.reset();
+            engine->native_decode_ready = false;
+        }
         
         // Store the handle
         *handle = static_cast<CortexInferenceEngineHandle>(engine);
@@ -296,6 +561,80 @@ CortexError cortex_inference_engine_free(
         delete engine;
         g_inferenceEngines.erase(handle);
         
+        return {nullptr, CORTEX_SUCCESS};
+    } catch (const std::exception& e) {
+        return convert_exception(e);
+    }
+}
+
+CortexError cortex_inference_engine_generate_text(
+    CortexInferenceEngineHandle handle,
+    const char* prompt,
+    int max_new_tokens,
+    char** out_text)
+{
+    try {
+        if (!handle || g_inferenceEngines.find(handle) == g_inferenceEngines.end() || !prompt || !out_text) {
+            return {"Invalid argument(s)", CORTEX_ERROR_INVALID_ARGUMENT};
+        }
+
+        auto engine = g_inferenceEngines[handle];
+        CortexError ready = ensure_native_generation_ready(*engine);
+        if (ready.code != CORTEX_SUCCESS) {
+            return ready;
+        }
+
+        auto prompt_tokens = engine->tokenizer->encode(prompt);
+        if (prompt_tokens.empty()) {
+            return {"Prompt tokenization produced no tokens", CORTEX_ERROR_INFERENCE};
+        }
+
+        if (!engine->cached_token_embedding) {
+            engine->cached_token_embedding = std::make_unique<LayerInfo>(
+                engine->model_loader->loadLayerByName(engine->token_embedding_layer_name));
+        }
+        const LayerInfo& token_embedding = *engine->cached_token_embedding;
+        if (token_embedding.weights.empty()) {
+            return {"Token embedding layer has no weights", CORTEX_ERROR_INFERENCE};
+        }
+
+        const int step_limit = (std::max)(1, max_new_tokens);
+        std::vector<int> generated;
+        generated.reserve(static_cast<size_t>(step_limit));
+        const std::vector<float> prompt_hidden =
+            build_prompt_context_hidden(*engine, token_embedding, prompt_tokens);
+        int cur_token = prompt_tokens.back();
+
+        for (int step = 0; step < step_limit; ++step) {
+            std::vector<float> decoder_out;
+            if (step == 0) {
+                if (prompt_hidden.empty()) {
+                    return {"Prompt context embedding failed", CORTEX_ERROR_INFERENCE};
+                }
+                decoder_out = engine->inference_engine->runPrefill(prompt_hidden, engine->decoder_layer_order);
+            } else {
+                auto hidden = embedding_lookup(*engine, token_embedding, cur_token);
+                if (hidden.empty()) {
+                    return {"Token embedding lookup failed", CORTEX_ERROR_INFERENCE};
+                }
+                decoder_out = engine->inference_engine->runDecodeStep(hidden, engine->decoder_layer_order);
+            }
+            if (decoder_out.empty()) {
+                return {"Decoder stack returned empty output", CORTEX_ERROR_INFERENCE};
+            }
+
+            cur_token = select_next_token_from_embedding_transpose(
+                *engine, decoder_out, token_embedding, generated, 0.8f);
+            if (cur_token < 0) {
+                return {"Failed to sample next token", CORTEX_ERROR_INFERENCE};
+            }
+            generated.push_back(cur_token);
+            if (engine->tokenizer->eosId() >= 0 && cur_token == engine->tokenizer->eosId()) {
+                break;
+            }
+        }
+
+        *out_text = str_to_c(engine->tokenizer->decode(generated));
         return {nullptr, CORTEX_SUCCESS};
     } catch (const std::exception& e) {
         return convert_exception(e);
@@ -731,6 +1070,22 @@ CortexError cortex_inference_engine_enable_aggressive_memory(
         }
         auto engine = g_inferenceEngines[handle];
         engine->inference_engine->enableAggressiveMemoryManagement(enable != 0);
+        return {nullptr, CORTEX_SUCCESS};
+    } catch (const std::exception& e) {
+        return convert_exception(e);
+    }
+}
+
+CortexError cortex_inference_engine_enable_layer_prefetch(
+    CortexInferenceEngineHandle handle,
+    int enable)
+{
+    try {
+        if (!handle || g_inferenceEngines.find(handle) == g_inferenceEngines.end()) {
+            return {"Invalid handle", CORTEX_ERROR_INVALID_ARGUMENT};
+        }
+        auto engine = g_inferenceEngines[handle];
+        engine->inference_engine->enableLayerPrefetch(enable != 0);
         return {nullptr, CORTEX_SUCCESS};
     } catch (const std::exception& e) {
         return convert_exception(e);

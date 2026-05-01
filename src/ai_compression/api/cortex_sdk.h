@@ -161,6 +161,14 @@ CORTEXSDR_API CortexError cortex_inference_engine_get_memory_usage(
 );
 
 /**
+ * Enable or disable asynchronous layer prefetching for on-demand execution.
+ */
+CORTEXSDR_API CortexError cortex_inference_engine_enable_layer_prefetch(
+    CortexInferenceEngineHandle handle,
+    int enable
+);
+
+/**
  * Get last run benchmark stats as JSON (caller must free with cortex_free_string)
  */
 CORTEXSDR_API CortexError cortex_inference_engine_get_last_run_stats_json(
@@ -201,6 +209,19 @@ CORTEXSDR_API CortexError cortex_inference_engine_run_layer(
     float* output_data,
     size_t output_size,
     size_t* actual_output_size
+);
+
+/**
+ * Generate text with the SDK's native tokenizer + on-demand decode path.
+ *
+ * The returned string is owned by the caller and must be freed with
+ * `cortex_free_string`.
+ */
+CORTEXSDR_API CortexError cortex_inference_engine_generate_text(
+    CortexInferenceEngineHandle handle,
+    const char* prompt,
+    int max_new_tokens,
+    char** out_text
 );
 
 /**
