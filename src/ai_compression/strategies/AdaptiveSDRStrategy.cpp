@@ -31,6 +31,42 @@ bool isMetadataLikeSegmentType(SegmentType type) {
            type == SegmentType::TOKENIZER_VOCAB ||
            type == SegmentType::TOKENIZER_MODEL;
 }
+
+bool isGGUFTensorFormat(const std::string& data_format) {
+    if (data_format.empty()) {
+        return false;
+    }
+    std::string lower = data_format;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower == "f32" ||
+           lower == "fp32" ||
+           lower == "f16" ||
+           lower == "fp16" ||
+           lower == "bf16" ||
+           lower == "i8" ||
+           lower == "int8" ||
+           lower.rfind("q", 0) == 0 ||
+           lower.rfind("iq", 0) == 0 ||
+           lower.rfind("tq", 0) == 0;
+}
+
+bool preferLosslessDirectStorage(const ModelSegment& segment) {
+    if (segment.type == SegmentType::TOKENIZER_VOCAB ||
+        segment.type == SegmentType::TOKENIZER_MODEL) {
+        return true;
+    }
+
+    if (segment.isWeightTensor()) {
+        return true;
+    }
+
+    if ((segment.type == SegmentType::MODEL_INPUT || segment.type == SegmentType::MODEL_OUTPUT) &&
+        isGGUFTensorFormat(segment.data_format)) {
+        return true;
+    }
+
+    return false;
+}
 } // namespace
 
 /**
@@ -92,10 +128,9 @@ void AdaptiveSDRStrategy::setSDRWidth(size_t width) {
 }
 
 std::vector<std::byte> AdaptiveSDRStrategy::compress(const ModelSegment& segment) const {
-    // Tokenizer assets must be byte-exact for runtime tokenization.
-    if (segment.type == SegmentType::TOKENIZER_VOCAB ||
-        segment.type == SegmentType::TOKENIZER_MODEL) {
-        std::cerr << "Using direct storage for tokenizer segment '" << segment.name
+    // GGUF/LLM runtime assets must be byte-exact for faithful reconstruction.
+    if (preferLosslessDirectStorage(segment)) {
+        std::cerr << "Using direct storage for lossless segment '" << segment.name
                   << "' (" << segment.data.size() << " bytes)\n";
         return compressWithDirectStorage(segment);
     }
@@ -107,19 +142,6 @@ std::vector<std::byte> AdaptiveSDRStrategy::compress(const ModelSegment& segment
         return compressWithDirectStorage(segment);
     }
     
-    // Apply SDR compression to all segments including embeddings for maximum compression
-    // Previously embeddings were stored uncompressed for fidelity, but now we compress them
-    // to achieve better overall model compression ratios
-    auto lowerName = segment.name;
-    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-    const bool looksLikeEmbedding = (lowerName.find("embed") != std::string::npos ||
-                                     lowerName.find("wte")   != std::string::npos ||
-                                     lowerName.find("embedding") != std::string::npos) &&
-                                    lowerName.find(".weight") != std::string::npos;
-    if (looksLikeEmbedding) {
-        std::cerr << "Embedding tensor ('" << segment.name << "') using SDR compression for maximum compression ratio" << std::endl;
-    }
-
     // For larger segments, use metadata-safe strategy for metadata-like content,
     // and tensor SDR strategy for numerical tensors.
     if (isMetadataLikeSegmentType(segment.type)) {

@@ -70,6 +70,7 @@ enum class LayerType {
 struct LayerInfo {
     std::string name;                       ///< Layer identifier/name
     std::string layer_type;                 ///< Layer operation type
+    std::string data_format;                ///< Backing tensor/storage format (e.g. Q4_K, F16)
     std::vector<size_t> active_indices;     ///< Sparse representation indices
     std::vector<std::byte> raw_data;        ///< Raw compressed layer data
     std::vector<size_t> input_shape;        ///< Expected input tensor shape

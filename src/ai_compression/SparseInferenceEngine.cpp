@@ -261,6 +261,16 @@ static uint32_t readPackedBitsLSB(const uint8_t* bytes, size_t bit_offset, size_
     return value;
 }
 
+static void ggufGetScaleMinQ4K(const uint8_t* scales, size_t j, uint8_t& scale, uint8_t& min) {
+    if (j < 4) {
+        scale = static_cast<uint8_t>(scales[j] & 0x3FU);
+        min = static_cast<uint8_t>(scales[j + 4] & 0x3FU);
+    } else {
+        scale = static_cast<uint8_t>((scales[j + 4] & 0x0FU) | ((scales[j - 4] >> 6) << 4));
+        min = static_cast<uint8_t>((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));
+    }
+}
+
 static bool decodeSupportedGGUFQuantized(
     const std::vector<std::byte>& source_data,
     const std::string& format_lower,
@@ -315,17 +325,58 @@ static bool decodeSupportedGGUFQuantized(
         }
 
         if (format_lower == "q6_k") {
-            // q6_k block layout (210 bytes): ql[128], qh[64], scales[16], d(fp16)
             const uint8_t* ql = block;
             const uint8_t* qh = block + 128;
             const int8_t* scales = reinterpret_cast<const int8_t*>(block + 192);
             const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 208));
-            for (size_t i = 0; i < 256 && out_index < decode_count; ++i) {
-                const uint8_t low4 = (i & 1U) == 0U ? (ql[i / 2] & 0x0F) : (ql[i / 2] >> 4);
-                const uint8_t high2 = static_cast<uint8_t>((qh[i / 4] >> (2 * (i % 4))) & 0x03U);
-                const int q = static_cast<int>(low4 | (high2 << 4)) - 32;
-                const int scale = static_cast<int>(scales[i / 16]);
-                output[out_index++] = static_cast<float>(q * scale) * d;
+            for (size_t half = 0; half < 2 && out_index < decode_count; ++half) {
+                const uint8_t* ql_half = ql + half * 64;
+                const uint8_t* qh_half = qh + half * 32;
+                const int8_t* sc_half = scales + half * 8;
+                for (size_t l = 0; l < 32 && out_index < decode_count; ++l) {
+                    const int q0 = static_cast<int>((ql_half[l] & 0x0F) |
+                                                    (((qh_half[l] >> 0) & 0x03) << 4)) - 32;
+                    output[out_index++] = d * static_cast<float>(sc_half[0] * q0);
+                }
+                for (size_t l = 0; l < 32 && out_index < decode_count; ++l) {
+                    const int q1 = static_cast<int>((ql_half[l + 32] & 0x0F) |
+                                                    (((qh_half[l] >> 2) & 0x03) << 4)) - 32;
+                    output[out_index++] = d * static_cast<float>(sc_half[2] * q1);
+                }
+                for (size_t l = 0; l < 32 && out_index < decode_count; ++l) {
+                    const int q2 = static_cast<int>(((ql_half[l] >> 4) & 0x0F) |
+                                                    (((qh_half[l] >> 4) & 0x03) << 4)) - 32;
+                    output[out_index++] = d * static_cast<float>(sc_half[4] * q2);
+                }
+                for (size_t l = 0; l < 32 && out_index < decode_count; ++l) {
+                    const int q3 = static_cast<int>(((ql_half[l + 32] >> 4) & 0x0F) |
+                                                    (((qh_half[l] >> 6) & 0x03) << 4)) - 32;
+                    output[out_index++] = d * static_cast<float>(sc_half[6] * q3);
+                }
+            }
+            continue;
+        }
+
+        if (format_lower == "q4_k") {
+            const float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block));
+            const float dmin = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block + 2));
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs = block + 16;
+            for (size_t group = 0; group < 4 && out_index < decode_count; ++group) {
+                uint8_t scale0 = 0, min0 = 0, scale1 = 0, min1 = 0;
+                ggufGetScaleMinQ4K(scales, group * 2, scale0, min0);
+                ggufGetScaleMinQ4K(scales, group * 2 + 1, scale1, min1);
+                const float d0 = d * static_cast<float>(scale0);
+                const float m0 = dmin * static_cast<float>(min0);
+                const float d1 = d * static_cast<float>(scale1);
+                const float m1 = dmin * static_cast<float>(min1);
+                const uint8_t* qgroup = qs + group * 32;
+                for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                    output[out_index++] = d0 * static_cast<float>(qgroup[i] & 0x0F) - m0;
+                }
+                for (size_t i = 0; i < 32 && out_index < decode_count; ++i) {
+                    output[out_index++] = d1 * static_cast<float>(qgroup[i] >> 4) - m1;
+                }
             }
             continue;
         }
@@ -709,6 +760,9 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
     if (layer.layer_type.empty()) {
         layer.layer_type = model_segment.layer_type;
     }
+    if (layer.data_format.empty()) {
+        layer.data_format = model_segment.data_format;
+    }
     if (isNormalizationLikeName(layer.name) || isNormalizationLikeName(model_segment.name)) {
         const std::string lower_layer_type = toLowerCopy(layer.layer_type);
         if (lower_layer_type.find("norm") == std::string::npos) {
@@ -838,41 +892,63 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
         }
     } else {
         if (!source_data.empty()) {
-            layer.weights.resize(num_elements);
+            const std::string lower_layer_name = toLowerCopy(layer.name);
+            const std::string lower_segment_name = toLowerCopy(model_segment.name);
+            const bool is_llm_generation_projection =
+                lower_layer_name.find("blk.") != std::string::npos ||
+                lower_segment_name.find("blk.") != std::string::npos ||
+                lower_layer_name.find("attn_") != std::string::npos ||
+                lower_segment_name.find("attn_") != std::string::npos ||
+                lower_layer_name.find("ffn_") != std::string::npos ||
+                lower_segment_name.find("ffn_") != std::string::npos ||
+                lower_layer_name.find("output") != std::string::npos ||
+                lower_segment_name.find("output") != std::string::npos;
+            const bool defer_large_quantized_decode =
+                is_gguf_quantized &&
+                !norm_like &&
+                !is_llm_generation_projection &&
+                num_elements > (1ULL * 1024ULL * 1024ULL);
+            if (defer_large_quantized_decode) {
+                layer.weights.clear();
+            } else {
+                layer.weights.resize(num_elements);
+            }
             if (is_gguf_quantized && supports_direct_gguf_decode) {
-                std::vector<float> decoded;
-                if (decodeSupportedGGUFQuantized(source_data, format_lower, num_elements, decoded)) {
-                    layer.weights = std::move(decoded);
-                } else {
-                    std::cerr << "[SDRInferenceEngine] WARNING: Failed decoding GGUF quantized weights format '"
-                              << model_segment.data_format << "' for segment " << model_segment.name << std::endl;
-                    layer.weights.clear();
+                if (!defer_large_quantized_decode) {
+                    std::vector<float> decoded;
+                    if (decodeSupportedGGUFQuantized(source_data, format_lower, num_elements, decoded)) {
+                        layer.weights = std::move(decoded);
+                    } else {
+                        std::cerr << "[SDRInferenceEngine] WARNING: Failed decoding GGUF quantized weights format '"
+                                  << model_segment.data_format << "' for segment " << model_segment.name << std::endl;
+                        layer.weights.clear();
+                    }
                 }
             } else if (is_gguf_quantized) {
                 std::cerr << "[SDRInferenceEngine] WARNING: Unsupported GGUF quantized format '" << model_segment.data_format
                           << "' for layer segment " << model_segment.name
                           << ". Clearing decoded weight tensor; layer may fall back to pass-through." << std::endl;
                 layer.weights.clear();
-            } else if (decode_kind == TensorDecodeKind::FP16) {
+            } else if (!defer_large_quantized_decode && decode_kind == TensorDecodeKind::FP16) {
                 // Convert FP16 to FP32
                 const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.weights[i] = fp16_to_fp32(fp16_data[i]);
                 }
-            } else if (decode_kind == TensorDecodeKind::BF16) {
+            } else if (!defer_large_quantized_decode && decode_kind == TensorDecodeKind::BF16) {
                 const uint16_t* bf16_data = reinterpret_cast<const uint16_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size() / sizeof(uint16_t));
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.weights[i] = bf16_to_fp32(bf16_data[i]);
                 }
-            } else if (decode_kind == TensorDecodeKind::INT8) {
+            } else if (!defer_large_quantized_decode && decode_kind == TensorDecodeKind::INT8) {
                 const int8_t* int8_data = reinterpret_cast<const int8_t*>(source_data.data());
                 const size_t max_elements = std::min(num_elements, source_data.size());
                 for (size_t i = 0; i < max_elements; ++i) {
                     layer.weights[i] = static_cast<float>(int8_data[i]);
                 }
-            } else if (decode_kind == TensorDecodeKind::INT4) {
+            } else if (!defer_large_quantized_decode && decode_kind == TensorDecodeKind::INT4) {
                 size_t out_index = 0;
                 for (size_t i = 0; i < source_data.size() && out_index < num_elements; ++i) {
                     const uint8_t packed = static_cast<uint8_t>(source_data[i]);
@@ -883,7 +959,7 @@ static void fillLayerInfoFromSegment(const ModelSegment& model_segment, LayerInf
                         layer.weights[out_index++] = static_cast<float>(high);
                     }
                 }
-            } else {
+            } else if (!defer_large_quantized_decode) {
                 const size_t byte_count = std::min(source_data.size(), layer.weights.size() * sizeof(float));
                 std::memcpy(layer.weights.data(), source_data.data(), byte_count);
             }
@@ -1060,10 +1136,25 @@ std::shared_future<LayerInfo> SDRModelLoader::loadLayerByNameAsync(const std::st
                 const bool is_layer_norm = seg_info.original_type == SegmentType::LAYER_NORM_WEIGHTS ||
                                           isNormalizationLikeName(seg_info.name) ||
                                           isNormalizationLikeName(name);
+                const bool is_embedding = seg_info.original_type == SegmentType::EMBEDDING_WEIGHTS;
+                const std::string lower_name = toLowerCopy(name);
+                const std::string lower_seg_name = toLowerCopy(seg_info.name);
+                const bool is_llm_generation_projection =
+                    lower_name.find("blk.") != std::string::npos ||
+                    lower_seg_name.find("blk.") != std::string::npos ||
+                    lower_name.find("attn_") != std::string::npos ||
+                    lower_seg_name.find("attn_") != std::string::npos ||
+                    lower_name.find("ffn_") != std::string::npos ||
+                    lower_seg_name.find("ffn_") != std::string::npos ||
+                    lower_name.find("output") != std::string::npos ||
+                    lower_seg_name.find("output") != std::string::npos;
                 
                 std::vector<std::byte> compressed_bytes =
                     decompressor_->readCompressedBytes(archive_path_, seg_info, seg_info.data_offset);
-                if (!is_layer_norm && supportsSparseStreamingCompute(compressed_bytes)) {
+                if (!is_layer_norm &&
+                    !is_embedding &&
+                    !is_llm_generation_projection &&
+                    supportsSparseStreamingCompute(compressed_bytes)) {
                     layer.raw_data = std::move(compressed_bytes);
                     have_primary_compressed_weights = true;
                     continue;
@@ -1962,7 +2053,6 @@ std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tenso
     auto run_start = std::chrono::high_resolution_clock::now();
     last_run_stats_ = RunStats{};
     intermediate_tensors_.clear();
-    execution_graph_.reset();
     const auto& segments = loader_.getSegmentIndex();
     if (segments.empty()) {
         std::cerr << "[SDRInferenceEngine] No segments found in the model loader!" << std::endl;
@@ -1970,7 +2060,12 @@ std::vector<float> SDRInferenceEngine::run(const std::vector<float>& input_tenso
     }
 
 
-    std::vector<std::string> layer_names = getExecutionOrder(segments);
+    std::vector<std::string> layer_names;
+    if (execution_graph_) {
+        layer_names = execution_graph_->get_execution_order();
+    } else {
+        layer_names = getExecutionOrder(segments);
+    }
     
     if (layer_names.empty()) {
         std::cerr << "[SDRInferenceEngine] No executable layers found!" << std::endl;

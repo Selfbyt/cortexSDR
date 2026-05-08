@@ -57,10 +57,12 @@ static std::string g_token_embedding_layer_name;
 static std::vector<std::string> g_decoder_layer_order;
 static std::unique_ptr<CortexAICompression::LayerInfo> g_cached_token_embedding;
 static size_t g_native_hidden_dim = 0;
-static int g_native_max_steps = 2;            // bounded by default for latency safety
+static int g_native_max_steps = 32;           // allow a minimally coherent response by default
 static uint64_t g_native_timeout_ms = 10000;  // 10s default decode guard
 static bool g_fast_native_sampling = true;    // avoid full logits materialization when possible
 static bool g_native_timing_debug = false;
+enum class PromptTemplateStyle { None, QwenInstruct };
+static PromptTemplateStyle g_prompt_template_style = PromptTemplateStyle::None;
 
 /**
  * @brief Signal handler for graceful shutdown
@@ -163,6 +165,58 @@ static std::string bytes_to_string(const std::vector<std::byte>& bytes) {
         reinterpret_cast<const char*>(bytes.data()),
         reinterpret_cast<const char*>(bytes.data() + bytes.size())
     );
+}
+
+static std::string to_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static void detect_prompt_template_style(const std::string& model_path) {
+    g_prompt_template_style = PromptTemplateStyle::None;
+
+    std::string hint_blob = to_lower_copy(model_path);
+    if (g_model_loader) {
+        try {
+            auto meta = g_model_loader->loadSegmentByName("gguf_metadata");
+            hint_blob += "\n";
+            hint_blob += to_lower_copy(bytes_to_string(meta.data));
+        } catch (...) {
+        }
+        try {
+            auto cfg = g_model_loader->loadSegmentByName("gguf_config");
+            hint_blob += "\n";
+            hint_blob += to_lower_copy(bytes_to_string(cfg.data));
+        } catch (...) {
+        }
+    }
+
+    if (hint_blob.find("qwen") != std::string::npos &&
+        (hint_blob.find("instruct") != std::string::npos ||
+         hint_blob.find("chat_template") != std::string::npos)) {
+        g_prompt_template_style = PromptTemplateStyle::QwenInstruct;
+    }
+}
+
+static std::string apply_prompt_template_if_needed(const std::string& prompt) {
+    if (g_prompt_template_style == PromptTemplateStyle::QwenInstruct &&
+        prompt.find("<|im_start|>") == std::string::npos) {
+        // Only inject the chat template when the loaded tokenizer can represent
+        // the control tokens. Otherwise we flood the prompt with <unk> pieces,
+        // which both slows generation and destroys output quality.
+        if (g_llm_tokenizer) {
+            const auto start_id = g_llm_tokenizer->tokenToId("<|im_start|>");
+            const auto end_id = g_llm_tokenizer->tokenToId("<|im_end|>");
+            const auto newline_id = g_llm_tokenizer->tokenToId("\n");
+            if (!start_id.has_value() || !end_id.has_value() || !newline_id.has_value()) {
+                return prompt;
+            }
+        }
+        return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    }
+    return prompt;
 }
 
 static bool ensure_tokenizer_vocab_loaded() {
@@ -311,20 +365,14 @@ static std::vector<float> build_prompt_embedding(const std::string& prompt) {
 }
 
 static bool is_token_embedding_name(const std::string& name_in) {
-    std::string n = name_in;
-    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
+    std::string n = to_lower_copy(name_in);
     return n.find("token_embd") != std::string::npos ||
            n.find("tok_embeddings") != std::string::npos ||
            n.find("embed_tokens") != std::string::npos;
 }
 
 static bool is_decoder_excluded_name(const std::string& name_in) {
-    std::string n = name_in;
-    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
+    std::string n = to_lower_copy(name_in);
     if (n.find("gguf_") == 0 || n.find("tokenizer") != std::string::npos) {
         return true;
     }
@@ -425,22 +473,59 @@ static std::vector<float> build_prompt_context_hidden(
     }
 
     std::vector<float> context(layout.embedding_dim, 0.0f);
-    size_t used = 0;
-    for (int token_id : prompt_tokens) {
+    float total_weight = 0.0f;
+    const size_t count = prompt_tokens.size();
+    const size_t start = count > 6 ? count - 6 : 0;
+    for (size_t idx = start; idx < count; ++idx) {
+        const int token_id = prompt_tokens[idx];
+        if (g_llm_tokenizer) {
+            if (token_id == g_llm_tokenizer->bosId() || token_id == g_llm_tokenizer->eosId()) {
+                continue;
+            }
+        }
         auto emb = embedding_lookup(token_embedding, token_id);
         if (emb.empty()) {
             continue;
         }
-        for (size_t i = 0; i < context.size(); ++i) {
-            context[i] += emb[i];
+        const float relative = static_cast<float>(idx - start + 1) / static_cast<float>(count - start + 1);
+        float weight = 0.1f + 0.9f * relative * relative;
+        if (g_llm_tokenizer) {
+            auto token = g_llm_tokenizer->idToToken(token_id);
+            if (token.has_value()) {
+                std::string normalized = token.value();
+                if (!normalized.empty() &&
+                    static_cast<unsigned char>(normalized[0]) == 0xC4 &&
+                    normalized.size() >= 2 &&
+                    static_cast<unsigned char>(normalized[1]) == 0xA0) {
+                    normalized.erase(0, 2);
+                }
+                const bool punctuation_only =
+                    !normalized.empty() &&
+                    std::all_of(normalized.begin(), normalized.end(), [](unsigned char ch) {
+                        return std::ispunct(ch) != 0;
+                    });
+                const bool special_token =
+                    normalized.size() >= 2 &&
+                    normalized.front() == '<' &&
+                    normalized.back() == '>';
+                if (special_token) {
+                    weight *= 0.15f;
+                }
+                if (punctuation_only) {
+                    weight *= 0.2f;
+                }
+            }
         }
-        ++used;
+        for (size_t i = 0; i < context.size(); ++i) {
+            context[i] += emb[i] * weight;
+        }
+        total_weight += weight;
     }
-    if (used == 0) {
+    if (total_weight <= 0.0f) {
         return {};
     }
 
-    const float inv = 1.0f / static_cast<float>(used);
+    const float inv = 1.0f / total_weight;
     for (float& value : context) {
         value *= inv;
     }
@@ -624,6 +709,7 @@ bool load_model(const std::string& model_path, float sparsity = 0.02f) {
         g_token_embedding_layer_name.clear();
         g_decoder_layer_order.clear();
         g_cached_token_embedding.reset();
+        g_prompt_template_style = PromptTemplateStyle::None;
         
         // Configure inference engine for optimal performance
         g_inference_engine->setBatchSize(1);
@@ -686,6 +772,10 @@ bool load_model(const std::string& model_path, float sparsity = 0.02f) {
         } else {
             std::cout << "  - Native decode path: NOT READY (fallback path only)" << std::endl;
         }
+        detect_prompt_template_style(compressed_path);
+        if (g_prompt_template_style == PromptTemplateStyle::QwenInstruct) {
+            std::cout << "  - Prompt template: Qwen instruct chat" << std::endl;
+        }
         
         // Also try to create legacy engine as fallback
         CortexError error = cortex_inference_engine_create(compressed_path.c_str(), &g_engine);
@@ -728,10 +818,14 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
     }
     
     auto start_time = std::chrono::high_resolution_clock::now();
+    const std::string effective_prompt = apply_prompt_template_if_needed(prompt);
 
     std::cout << "Starting inference..." << std::endl;
     std::cout << "  - Input prompt: \"" << prompt << "\"" << std::endl;
     std::cout << "  - On-demand loading: " << (g_use_on_demand_loading ? "ENABLED" : "DISABLED") << std::endl;
+    if (effective_prompt != prompt) {
+        std::cout << "  - Applied prompt template for instruct chat" << std::endl;
+    }
 
     std::string result;
     bool native_decode_used = false;
@@ -744,9 +838,9 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
             native_decode_attempted = true;
             native_decode_used = true;
             std::cout << "  - Using native token decode path..." << std::endl;
-            auto prompt_tokens = g_llm_tokenizer->encode(prompt);
+            auto prompt_tokens = g_llm_tokenizer->encode(effective_prompt);
             if (prompt_tokens.empty()) {
-                return "Error: Prompt tokenization produced no tokens";
+                throw std::runtime_error("Prompt tokenization produced no tokens");
             }
 
             if (!g_cached_token_embedding) {
@@ -761,8 +855,8 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                 }
             }
             const CortexAICompression::LayerInfo& token_embedding = *g_cached_token_embedding;
-            if (token_embedding.weights.empty()) {
-                return "Error: Token embedding layer has no weights";
+            if (token_embedding.weights.empty() && token_embedding.raw_data.empty()) {
+                throw std::runtime_error("Token embedding layer has no accessible backing data");
             }
 
             std::vector<int> generated;
@@ -783,19 +877,19 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                 std::vector<float> decoder_out;
                 if (step == 0) {
                     if (prompt_hidden.empty()) {
-                        return "Error: Prompt context embedding failed";
+                        throw std::runtime_error("Prompt context embedding failed");
                     }
                     decoder_out = g_inference_engine->runPrefill(prompt_hidden, g_decoder_layer_order);
                 } else {
                     auto hidden = embedding_lookup(token_embedding, cur_token);
                     if (hidden.empty()) {
-                        return "Error: Token embedding lookup failed";
+                        throw std::runtime_error("Token embedding lookup failed");
                     }
                     decoder_out = g_inference_engine->runDecodeStep(hidden, g_decoder_layer_order);
                 }
                 const auto decode_end = std::chrono::steady_clock::now();
                 if (decoder_out.empty()) {
-                    return "Error: Decoder stack returned empty output";
+                    throw std::runtime_error("Decoder stack returned empty output");
                 }
 
                 const auto sample_start = std::chrono::steady_clock::now();
@@ -805,7 +899,7 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                     : -1;
                 const auto sample_end = std::chrono::steady_clock::now();
                 if (cur_token < 0) {
-                    return "Error: Failed to sample next token";
+                    throw std::runtime_error("Failed to sample next token");
                 }
                 if (g_native_timing_debug) {
                     const auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(decode_end - decode_start).count();
@@ -832,14 +926,35 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
         }
     }
 
+    if (!native_decode_used && g_engine && g_has_model_tokenizer) {
+        native_decode_attempted = true;
+        std::cout << "  - Falling back to SDK token decode path..." << std::endl;
+        char* generated_text = nullptr;
+        CortexError gen_error = cortex_inference_engine_generate_text(
+            g_engine,
+            effective_prompt.c_str(),
+            max_length,
+            &generated_text
+        );
+        if (gen_error.code == CORTEX_OK && generated_text) {
+            native_decode_used = true;
+            result = generated_text;
+            cortex_free_string(generated_text);
+        } else if (gen_error.code != CORTEX_OK) {
+            std::cerr << "  - SDK token decode failed: "
+                      << (gen_error.message ? gen_error.message : "unknown error") << std::endl;
+            cortex_error_free(&gen_error);
+        }
+    }
+
     if (native_decode_attempted && !native_decode_used) {
         return "Error: Native GGUF decode failed (see stderr diagnostics)";
     }
 
     if (!native_decode_used) {
-        std::vector<float> input_tensor = build_prompt_embedding(prompt);
+        std::vector<float> input_tensor = build_prompt_embedding(effective_prompt);
         if (input_tensor.empty()) {
-            input_tensor = text_to_tensor(prompt);
+            input_tensor = text_to_tensor(effective_prompt);
         }
         std::cout << "  - Input tensor size: " << input_tensor.size() << std::endl;
 
@@ -1051,7 +1166,7 @@ void print_usage(const char* program_name) {
     std::cout << "  -m, --max-length N      Maximum output length (default: 100)" << std::endl;
     std::cout << "  --profile PATH          Write profiling JSON after single-prompt run" << std::endl;
     std::cout << "  --tokenize-debug TEXT   Show tokenizer IDs and decoded roundtrip" << std::endl;
-    std::cout << "  --native-max-steps N    Max token steps in native decode (default: 2)" << std::endl;
+    std::cout << "  --native-max-steps N    Max token steps in native decode (default: 32)" << std::endl;
     std::cout << "  --native-timeout-ms N   Timeout for native decode loop (default: 10000)" << std::endl;
     std::cout << "  --legacy                Use legacy mode (load all layers at once)" << std::endl;
     std::cout << "  --on-demand             Use on-demand mode (load layers as needed)" << std::endl;
@@ -1300,6 +1415,23 @@ int main(int argc, char* argv[]) {
         std::cout << "Token IDs:";
         for (int id : ids) {
             std::cout << " " << id;
+        }
+        std::cout << std::endl;
+        std::cout << "Token Texts:";
+        for (int id : ids) {
+            auto token = g_llm_tokenizer->idToToken(id);
+            std::cout << " [" << id << ":";
+            if (token.has_value()) {
+                for (unsigned char ch : token.value()) {
+                    if (ch == '\n') std::cout << "\\n";
+                    else if (ch == '\r') std::cout << "\\r";
+                    else if (ch == '\t') std::cout << "\\t";
+                    else std::cout << static_cast<char>(ch);
+                }
+            } else {
+                std::cout << "<missing>";
+            }
+            std::cout << "]";
         }
         std::cout << std::endl;
         std::cout << "Roundtrip: " << g_llm_tokenizer->decode(ids) << std::endl;
