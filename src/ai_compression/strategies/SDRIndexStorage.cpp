@@ -381,6 +381,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressToTensor(const std::ve
 std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& segment) const {
     std::vector<std::byte> compressedOutput;
     std::vector<size_t> indices;
+    bool usedWeightPreservation = false; // Track which compression method was used
     
     // Log compression attempt
     
@@ -409,6 +410,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
                 }
                 // Compress using the new weight preservation method
                 compressedOutput = compressIndicesWithValues(indexValuePairs);
+                usedWeightPreservation = true;
             } else {
                 // For non-weight tensors, use the original approach
                 indices = extractSignificantIndices(segment);
@@ -460,32 +462,12 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
             throw CompressionError("Compression ineffective, output larger than threshold");
         }
 
-        // Assign format flag based on tensor size and compression method
+        // Assign format flag based on compression method used
         std::vector<std::byte> flaggedOutput;
         
-        // Check if this is weight preservation format by decoding the varint and checking the flag
-        bool isWeightPreservationFormat = false;
-        if (!compressedOutput.empty() && compressedOutput.size() > 1) {
-            try {
-                size_t offset = 0;
-                size_t count = decodeVarint(compressedOutput, offset);
-                (void)count; // Unused, just need to skip past it
-                if (offset < compressedOutput.size() && static_cast<uint8_t>(compressedOutput[offset]) == 2) {
-                    isWeightPreservationFormat = true;
-                }
-            } catch (...) {
-                // If varint decode fails, not weight preservation format
-                isWeightPreservationFormat = false;
-            }
-        }
-        
-        if (isWeightPreservationFormat) {
-            // Weight preservation format - use special flag
-            if (segment.isWeightTensor()) {
-                flaggedOutput.push_back(static_cast<std::byte>(0x95)); // Weight preservation format
-            } else {
-                flaggedOutput.push_back(static_cast<std::byte>(0x96)); // Non-weight with values
-            }
+        if (usedWeightPreservation) {
+            // Weight preservation format - always use 0x95 for weight tensors
+            flaggedOutput.push_back(static_cast<std::byte>(0x95));
         } else {
             // Original format based on tensor size (number of indices)
             size_t numIndices = indices.size();
