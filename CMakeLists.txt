@@ -55,6 +55,7 @@ set(COMMON_SOURCES
     src/ai_compression/strategies/GzipStrategy.cpp
     src/ai_compression/strategies/NumericalRLE.cpp
     src/ai_compression/strategies/SDRIndexStorage.cpp
+    src/ai_compression/strategies/SparseWeightReconstruction.cpp
     src/ai_compression/strategies/MetadataSDRStrategy.cpp
     src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
     src/ai_compression/streaming/StreamingCompressor.cpp
@@ -467,6 +468,7 @@ set(SDK_SOURCES
     src/ai_compression/strategies/MetadataSDRStrategy.cpp
     src/ai_compression/strategies/QuantizedTensorStrategy.cpp
     src/ai_compression/strategies/SDRIndexStorage.cpp
+    src/ai_compression/strategies/SparseWeightReconstruction.cpp
     src/ai_compression/kernels/blas_kernels.cpp
     src/ai_compression/kernels/simd_kernels.cpp
     src/ai_compression/kernels/conv_kernels.cpp
@@ -558,6 +560,16 @@ target_compile_definitions(cortexsdr_text_cli PRIVATE CORTEXSDR_STATIC=1)
 add_executable(cortexsdr_bench src/cortexsdr_bench.cpp)
 target_link_libraries(cortexsdr_bench PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
 target_compile_definitions(cortexsdr_bench PRIVATE CORTEXSDR_STATIC=1)
+
+# SDR Size Analyzer Tool
+add_executable(analyze_sdr_size analyze_sdr_size.cpp)
+# No dependencies needed - standalone tool
+
+# Error Calculator Tool
+add_executable(calculate_error calculate_error.cpp)
+target_link_libraries(calculate_error PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(calculate_error PRIVATE CORTEXSDR_STATIC=1)
+target_include_directories(calculate_error PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Desktop application target removed
 

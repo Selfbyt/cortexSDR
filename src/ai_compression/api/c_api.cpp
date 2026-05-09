@@ -49,6 +49,64 @@ namespace {
         return cstr;
     }
 
+    // Automatically detect and find all parts of a multi-part model
+    // Supports Hugging Face patterns like: model-00001-of-00002.gguf
+    std::vector<std::string> findModelParts(const std::string& model_path) {
+        std::vector<std::string> parts;
+        
+        std::filesystem::path path(model_path);
+        if (!std::filesystem::exists(path)) {
+            // File doesn't exist, return original path
+            return {model_path};
+        }
+        
+        std::filesystem::path parent = path.parent_path();
+        if (parent.empty()) {
+            parent = std::filesystem::current_path();
+        }
+        
+        std::string filename = path.filename().string();
+        
+        // Pattern: model-00001-of-00005.gguf (Hugging Face standard)
+        std::regex pattern(R"(^(.+)-(\d+)-of-(\d+)(\..+)$)");
+        std::smatch match;
+        
+        if (std::regex_match(filename, match, pattern)) {
+            std::string base_name = match[1].str();
+            int current_part = std::stoi(match[2].str());
+            int total_parts = std::stoi(match[3].str());
+            std::string ext = match[4].str();
+            
+            std::cout << "[Multi-part detection] Found " << total_parts << "-part model: " << base_name << std::endl;
+            
+            // Find all parts
+            for (int i = 1; i <= total_parts; i++) {
+                // Format with leading zeros matching the original
+                std::ostringstream part_name;
+                part_name << base_name << "-";
+                part_name << std::setfill('0') << std::setw(5) << i;
+                part_name << "-of-";
+                part_name << std::setfill('0') << std::setw(5) << total_parts;
+                part_name << ext;
+                
+                std::filesystem::path part_path = parent / part_name.str();
+                if (std::filesystem::exists(part_path)) {
+                    parts.push_back(part_path.string());
+                    std::cout << "  [Part " << i << "/" << total_parts << "] " << part_path.filename().string() << std::endl;
+                } else {
+                    std::cerr << "  [Warning] Missing part " << i << "/" << total_parts << ": " << part_path.filename().string() << std::endl;
+                }
+            }
+            
+            if (!parts.empty()) {
+                return parts;
+            }
+        }
+        
+        // No multi-part pattern detected, return single file
+        return {model_path};
+    }
+
     std::string sanitizeFileName(const std::string& value) {
         std::string output;
         output.reserve(value.size());
@@ -261,7 +319,8 @@ CortexError cortex_compression_options_init(CortexCompressionOptions* options) {
 struct ModelInfo {
     std::string originalPath;
     std::string actualPath; 
-    std::string format;     
+    std::string format;
+    std::vector<std::string> additionalFiles;  // For multi-part models
 };
 
 std::unordered_map<CortexCompressorHandle, ModelInfo> g_modelInfoMap;
@@ -366,10 +425,82 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         ai_compressor->registerStrategy(SegmentType::TOKENIZER_MODEL, 4, GZIP_STRATEGY_ID, gzipStrategy);
 
         *handle = reinterpret_cast<CortexCompressorHandle>(ai_compressor);
-        g_modelInfoMap[*handle] = {model_path, actualModelPath, actualFormat};
+        
+        // Auto-detect multi-part models
+        std::vector<std::string> model_parts = findModelParts(actualModelPath);
+        std::vector<std::string> additional_parts;
+        
+        if (model_parts.size() > 1) {
+            std::cout << "[API] Auto-detected " << model_parts.size() << "-part model" << std::endl;
+            // First part is the primary, rest are additional
+            actualModelPath = model_parts[0];
+            for (size_t i = 1; i < model_parts.size(); i++) {
+                additional_parts.push_back(model_parts[i]);
+            }
+            std::cout << "[API] Will compress all " << model_parts.size() << " parts into single archive" << std::endl;
+        }
+        
+        g_modelInfoMap[*handle] = {model_path, actualModelPath, actualFormat, additional_parts};
         return {nullptr, 0};
     } catch (const std::exception& e) {
         return convert_exception(e);
+    }
+}
+
+CortexError cortex_compressor_add_file(CortexCompressorHandle handle, const char* model_path) {
+    try {
+        if (!handle || !model_path) {
+            return {str_to_c("Invalid arguments (null handle or path)"), 1};
+        }
+        
+        auto it = g_modelInfoMap.find(handle);
+        if (it == g_modelInfoMap.end()) {
+            return {str_to_c("Internal error: Model info not found for handle."), 1};
+        }
+        
+        // Clear auto-detected files on first manual add (to prevent duplication)
+        static std::unordered_set<CortexCompressorHandle> handles_with_manual_adds;
+        if (handles_with_manual_adds.find(handle) == handles_with_manual_adds.end()) {
+            // First manual add - clear auto-detected files
+            if (!it->second.additionalFiles.empty()) {
+                std::cout << "[API] Clearing auto-detected files (manual mode)" << std::endl;
+                it->second.additionalFiles.clear();
+            }
+            handles_with_manual_adds.insert(handle);
+        }
+        
+        // Add the file to the list of additional files
+        it->second.additionalFiles.push_back(model_path);
+        
+        return {nullptr, 0};
+    } catch (const std::exception& e) {
+        return convert_exception(e);
+    }
+}
+
+int cortex_model_get_parts(const char* model_path, char*** parts_out, int* num_parts) {
+    try {
+        if (!model_path) {
+            return 0;
+        }
+        
+        std::vector<std::string> parts = findModelParts(model_path);
+        
+        if (num_parts) {
+            *num_parts = static_cast<int>(parts.size());
+        }
+        
+        if (parts_out) {
+            *parts_out = new char*[parts.size()];
+            for (size_t i = 0; i < parts.size(); i++) {
+                (*parts_out)[i] = str_to_c(parts[i]);
+            }
+        }
+        
+        return static_cast<int>(parts.size());
+    } catch (const std::exception& e) {
+        std::cerr << "Error in cortex_model_get_parts: " << e.what() << std::endl;
+        return 0;
     }
 }
 
@@ -384,8 +515,16 @@ CortexError cortex_compressor_compress(CortexCompressorHandle handle, const char
         if (it == g_modelInfoMap.end()) {
              return {str_to_c("Internal error: Model info not found for handle."), 1};
         }
+        
+        // Compress the primary file
         const std::string& modelToCompress = it->second.actualPath;
         compressor->compressModelStreaming(modelToCompress, streamCompressor);
+        
+        // Compress additional files if any (for multi-part models)
+        for (const auto& additionalFile : it->second.additionalFiles) {
+            compressor->compressModelStreaming(additionalFile, streamCompressor);
+        }
+        
         streamCompressor.finalizeArchive();
         return {nullptr, 0};
     } catch (const std::exception& e) {

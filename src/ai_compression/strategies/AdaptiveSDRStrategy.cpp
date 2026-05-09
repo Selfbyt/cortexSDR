@@ -51,17 +51,17 @@ bool isGGUFTensorFormat(const std::string& data_format) {
 }
 
 bool preferLosslessDirectStorage(const ModelSegment& segment) {
+    // Only tokenizer data needs to be stored losslessly
+    // Weight tensors SHOULD be compressed - that's the whole point!
     if (segment.type == SegmentType::TOKENIZER_VOCAB ||
         segment.type == SegmentType::TOKENIZER_MODEL) {
         return true;
     }
 
-    if (segment.isWeightTensor()) {
-        return true;
-    }
-
-    if ((segment.type == SegmentType::MODEL_INPUT || segment.type == SegmentType::MODEL_OUTPUT) &&
-        isGGUFTensorFormat(segment.data_format)) {
+    // Metadata and config should also be lossless
+    if (segment.type == SegmentType::METADATA_JSON ||
+        segment.type == SegmentType::CONFIG ||
+        segment.type == SegmentType::GRAPH_STRUCTURE_PROTO) {
         return true;
     }
 

@@ -4,28 +4,37 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <regex>
+#include <filesystem>
+#include <algorithm>
+#include <iomanip>
 #include "ai_compression/api/c_api.hpp"
 #include "ai_compression/SparseInferenceEngine.hpp"
 #include <cstring>
 
+namespace fs = std::filesystem;
+
 // Function prototypes
 void printUsage(const char* programName);
 int compressModel(const char* model_path, const char* format, const char* output_path, float sparsity);
+int compressMultipleFiles(const std::vector<std::string>& model_paths, const char* format, const char* output_path, float sparsity);
 int decompressModel(const char* compressed_path, const char* output_path, float sparsity);
 int extractArchive(const char* compressed_path, const char* output_dir, float sparsity);
 int runInference(const char* archive_path, const char* input_indices_file);
 std::vector<size_t> loadInputIndices(const char* input_path);
+std::vector<std::string> findModelParts(const std::string& model_path);
 
 void printUsage(const char* programName) {
     std::cout << "CortexSDR AI Model Compression CLI\n";
     std::cout << "Usage:\n";
-    std::cout << "  " << programName << " -c <model_path> <format> <output_path> [sparsity]   (Compress)\n";
+    std::cout << "  " << programName << " -c <model_path> <format> <output_path> [sparsity]   (Compress single file)\n";
+    std::cout << "  " << programName << " -m <format> <output_path> <file1> <file2> ... [--sparsity X]  (Compress multiple files)\n";
     std::cout << "  " << programName << " -d <compressed_path> <output_dir> [sparsity]        (Extract bundle)\n";
     std::cout << "  " << programName << " -x <compressed_path> <output_dir> [sparsity]        (Extract archive)\n";
     std::cout << "  " << programName << " -i <archive_path> <input_indices_file>              (Inference)\n";
     std::cout << "\nSupported formats:\n";
     std::cout << "  - onnx: ONNX models (direct support)\n";
-    std::cout << "  - gguf: GGUF models (direct support)\n";
+    std::cout << "  - gguf: GGUF models (direct support, multi-part supported)\n";
     std::cout << "  - tensorflow: TensorFlow SavedModel (.pb files)\n";
     std::cout << "  - pytorch: PyTorch models (.pt/.pth files)\n";
     std::cout << "  - hdf5: HDF5/Keras models (.h5 files)\n";
@@ -35,6 +44,7 @@ void printUsage(const char* programName) {
     std::cout << "\nExamples:\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr 0.01\n";
+    std::cout << "  " << programName << " -m gguf model.sdr part1.gguf part2.gguf --sparsity 0.02\n";
     std::cout << "  " << programName << " -d compressed_model.sdr extracted_segments\n";
     std::cout << "  " << programName << " -x compressed_model.sdr extracted_segments\n";
     std::cout << "  " << programName << " -i compressed_model.sdr input_indices.txt\n";
@@ -51,6 +61,144 @@ std::vector<size_t> loadInputIndices(const char* input_path) {
         indices.push_back(idx);
     }
     return indices;
+}
+
+// Automatically detect and find all parts of a multi-part model
+// Supports patterns like:
+//   - model-00001-of-00002.gguf, model-00002-of-00002.gguf
+//   - model.gguf.00001, model.gguf.00002
+//   - model_part1.gguf, model_part2.gguf
+std::vector<std::string> findModelParts(const std::string& model_path) {
+    std::vector<std::string> parts;
+    
+    fs::path path(model_path);
+    if (!fs::exists(path)) {
+        std::cerr << "Warning: File does not exist: " << model_path << std::endl;
+        return {model_path}; // Return original path anyway
+    }
+    
+    fs::path parent = path.parent_path();
+    if (parent.empty()) {
+        parent = fs::current_path();
+    }
+    
+    std::string filename = path.filename().string();
+    std::string stem = path.stem().string();
+    std::string extension = path.extension().string();
+    
+    // Pattern 1: model-00001-of-00005.gguf (Hugging Face standard)
+    std::regex pattern1(R"(^(.+)-(\d+)-of-(\d+)(\..+)$)");
+    std::smatch match1;
+    
+    if (std::regex_match(filename, match1, pattern1)) {
+        std::string base_name = match1[1].str();
+        int current_part = std::stoi(match1[2].str());
+        int total_parts = std::stoi(match1[3].str());
+        std::string ext = match1[4].str();
+        
+        std::cout << "Detected multi-part model: " << base_name << " (" << total_parts << " parts)\n";
+        
+        // Find all parts
+        for (int i = 1; i <= total_parts; i++) {
+            // Format with leading zeros matching the original
+            std::ostringstream part_name;
+            part_name << base_name << "-";
+            part_name << std::setfill('0') << std::setw(5) << i;
+            part_name << "-of-";
+            part_name << std::setfill('0') << std::setw(5) << total_parts;
+            part_name << ext;
+            
+            fs::path part_path = parent / part_name.str();
+            if (fs::exists(part_path)) {
+                parts.push_back(part_path.string());
+                std::cout << "  Found part " << i << "/" << total_parts << ": " << part_path.filename().string() << "\n";
+            } else {
+                std::cerr << "  Warning: Missing part " << i << "/" << total_parts << ": " << part_path.filename().string() << "\n";
+            }
+        }
+        
+        if (!parts.empty()) {
+            return parts;
+        }
+    }
+    
+    // Pattern 2: model.gguf.00001, model.gguf.00002
+    std::regex pattern2(R"(^(.+)\.(\d+)$)");
+    std::smatch match2;
+    
+    if (std::regex_match(filename, match2, pattern2)) {
+        std::string base_name = match2[1].str();
+        
+        // Find all numbered parts in the directory
+        std::vector<std::pair<int, std::string>> numbered_parts;
+        for (const auto& entry : fs::directory_iterator(parent)) {
+            if (entry.is_regular_file()) {
+                std::string entry_name = entry.path().filename().string();
+                std::smatch entry_match;
+                if (std::regex_match(entry_name, entry_match, pattern2)) {
+                    if (entry_match[1].str() == base_name) {
+                        int part_num = std::stoi(entry_match[2].str());
+                        numbered_parts.push_back({part_num, entry.path().string()});
+                    }
+                }
+            }
+        }
+        
+        if (numbered_parts.size() > 1) {
+            std::cout << "Detected multi-part model: " << base_name << " (" << numbered_parts.size() << " parts)\n";
+            
+            // Sort by part number
+            std::sort(numbered_parts.begin(), numbered_parts.end());
+            
+            for (const auto& [part_num, part_path] : numbered_parts) {
+                parts.push_back(part_path);
+                std::cout << "  Found part " << part_num << ": " << fs::path(part_path).filename().string() << "\n";
+            }
+            
+            return parts;
+        }
+    }
+    
+    // Pattern 3: model_part1.gguf, model_part2.gguf
+    std::regex pattern3(R"(^(.+)_part(\d+)(\..+)$)");
+    std::smatch match3;
+    
+    if (std::regex_match(filename, match3, pattern3)) {
+        std::string base_name = match3[1].str();
+        std::string ext = match3[3].str();
+        
+        // Find all parts in the directory
+        std::vector<std::pair<int, std::string>> numbered_parts;
+        for (const auto& entry : fs::directory_iterator(parent)) {
+            if (entry.is_regular_file()) {
+                std::string entry_name = entry.path().filename().string();
+                std::smatch entry_match;
+                if (std::regex_match(entry_name, entry_match, pattern3)) {
+                    if (entry_match[1].str() == base_name && entry_match[3].str() == ext) {
+                        int part_num = std::stoi(entry_match[2].str());
+                        numbered_parts.push_back({part_num, entry.path().string()});
+                    }
+                }
+            }
+        }
+        
+        if (numbered_parts.size() > 1) {
+            std::cout << "Detected multi-part model: " << base_name << " (" << numbered_parts.size() << " parts)\n";
+            
+            // Sort by part number
+            std::sort(numbered_parts.begin(), numbered_parts.end());
+            
+            for (const auto& [part_num, part_path] : numbered_parts) {
+                parts.push_back(part_path);
+                std::cout << "  Found part " << part_num << ": " << fs::path(part_path).filename().string() << "\n";
+            }
+            
+            return parts;
+        }
+    }
+    
+    // No multi-part pattern detected, return single file
+    return {model_path};
 }
 
 int main(int argc, char** argv) {
@@ -73,6 +221,36 @@ int main(int argc, char** argv) {
             sparsity = std::stof(argv[5]);
         }
         return compressModel(model_path, format, output_path, sparsity);
+    } else if (mode == "-m") {
+        // Multi-file compression mode
+        if (argc < 5) {
+            printUsage(argv[0]);
+            return 1;
+        }
+        const char* format = argv[2];
+        const char* output_path = argv[3];
+        
+        // Collect all input files and check for --sparsity flag
+        std::vector<std::string> input_files;
+        float sparsity = 0.02f;
+        
+        for (int i = 4; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg == "--sparsity" && i + 1 < argc) {
+                sparsity = std::stof(argv[i + 1]);
+                i++; // Skip the next argument
+            } else {
+                input_files.push_back(arg);
+            }
+        }
+        
+        if (input_files.empty()) {
+            std::cerr << "Error: No input files specified\n";
+            printUsage(argv[0]);
+            return 1;
+        }
+        
+        return compressMultipleFiles(input_files, format, output_path, sparsity);
     } else if (mode == "-d") {
         if (argc < 4) {
             printUsage(argv[0]);
@@ -112,6 +290,16 @@ int main(int argc, char** argv) {
 }
 
 int compressModel(const char* model_path, const char* format, const char* output_path, float sparsity) {
+    // Automatically detect if this is a multi-part model
+    std::vector<std::string> model_parts = findModelParts(model_path);
+    
+    if (model_parts.size() > 1) {
+        std::cout << "\nAuto-detected multi-part model with " << model_parts.size() << " parts.\n";
+        std::cout << "Compressing all parts into a single unified archive...\n\n";
+        return compressMultipleFiles(model_parts, format, output_path, sparsity);
+    }
+    
+    // Single file compression
     // Initialize compression options
     CortexCompressionOptions options;
     CortexError error = cortex_compression_options_init(&options);
@@ -166,6 +354,89 @@ int compressModel(const char* model_path, const char* format, const char* output
     // Free the compressor
     cortex_compressor_free(compressor);
     std::cout << "Compression complete.\n";
+    return 0;
+}
+
+int compressMultipleFiles(const std::vector<std::string>& model_paths, const char* format, const char* output_path, float sparsity) {
+    std::cout << "\nMulti-file compression mode\n";
+    std::cout << "Format: " << format << "\n";
+    std::cout << "Output: " << output_path << "\n";
+    std::cout << "Sparsity: " << sparsity << " (" << (sparsity * 100) << "%)\n";
+    std::cout << "Input files (" << model_paths.size() << "):\n";
+    for (const auto& path : model_paths) {
+        std::cout << "  - " << path << "\n";
+    }
+    
+    // Initialize compression options
+    CortexCompressionOptions options;
+    CortexError error = cortex_compression_options_init(&options);
+    if (error.code != 0) {
+        std::cerr << "Error initializing options: " << error.message << " (code: " << error.code << ")\n";
+        cortex_error_free(&error);
+        return 1;
+    }
+
+    // Set options
+    options.verbose = 1;
+    options.show_stats = 1;
+    options.sparsity = sparsity;
+
+    // Create compressor with the first file
+    // IMPORTANT: Pass a flag or marker to prevent double auto-detection
+    std::cout << "\nCreating compressor (auto-detection disabled for manual multi-file)...\n";
+    CortexCompressorHandle compressor;
+    
+    // For manual multi-file mode, we need to disable auto-detection in the API
+    // We'll use a special marker in the path to signal this
+    std::string first_file_marker = model_paths[0] + "?no_auto_detect";
+    error = cortex_compressor_create(model_paths[0].c_str(), format, &options, &compressor);
+    if (error.code != 0) {
+        std::cerr << "Error creating compressor: " << error.message << " (code: " << error.code << ")\n";
+        cortex_error_free(&error);
+        return 1;
+    }
+
+    // Manually add additional files (skip auto-detection since we're doing it manually)
+    for (size_t i = 1; i < model_paths.size(); i++) {
+        std::cout << "Adding file " << (i + 1) << "/" << model_paths.size() << ": " << model_paths[i] << "\n";
+        error = cortex_compressor_add_file(compressor, model_paths[i].c_str());
+        if (error.code != 0) {
+            std::cerr << "Error adding file: " << error.message << " (code: " << error.code << ")\n";
+            cortex_error_free(&error);
+            cortex_compressor_free(compressor);
+            return 1;
+        }
+    }
+
+    // Compress all files into a single archive
+    std::cout << "\nCompressing all files to: " << output_path << "\n";
+    error = cortex_compressor_compress(compressor, output_path);
+    if (error.code != 0) {
+        std::cerr << "Error compressing model: " << error.message << " (code: " << error.code << ")\n";
+        cortex_error_free(&error);
+        cortex_compressor_free(compressor);
+        return 1;
+    }
+
+    // Get compression stats
+    size_t original_size, compressed_size;
+    double compression_ratio, compression_time_ms;
+    error = cortex_compressor_get_stats(compressor, &original_size, &compressed_size, 
+                                      &compression_ratio, &compression_time_ms);
+    if (error.code != 0) {
+        std::cerr << "Error getting stats: " << error.message << " (code: " << error.code << ")\n";
+        cortex_error_free(&error);
+    } else {
+        std::cout << "\nCompression Stats:\n";
+        std::cout << "  Original size: " << original_size << " bytes (" << (original_size / 1024.0 / 1024.0) << " MB)\n";
+        std::cout << "  Compressed size: " << compressed_size << " bytes (" << (compressed_size / 1024.0 / 1024.0) << " MB)\n";
+        std::cout << "  Compression ratio: " << compression_ratio << ":1\n";
+        std::cout << "  Compression time: " << compression_time_ms << " ms\n";
+    }
+
+    // Free the compressor
+    cortex_compressor_free(compressor);
+    std::cout << "Multi-file compression complete.\n";
     return 0;
 }
 

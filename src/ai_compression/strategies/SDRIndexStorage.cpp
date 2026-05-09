@@ -1,4 +1,5 @@
 #include "SDRIndexStorage.hpp"
+#include "SparseWeightReconstruction.hpp"
 #include "../core/ModelSegment.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -254,20 +255,17 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
             values.push_back(value);
         }
         
-        // Set the values in the tensor
+        // Set the values in the tensor using improved reconstruction
         size_t elementSize = 4; // Default to 4 bytes for float32
         size_t numElements = originalSize / elementSize;
         
-        for (size_t i = 0; i < indices.size() && i < values.size(); ++i) {
-            size_t index = indices[i];
-            float value = values[i];
-            
-            // Verify the index is within bounds
-            if (index < numElements) {
-                std::memcpy(decompressedData.data() + index * elementSize, &value, elementSize);
-            }
-        }
+        // Use sparse weight reconstruction instead of just zero-filling
+        std::vector<float> reconstructed = SparseWeightReconstruction::reconstruct(
+            indices, values, numElements, ReconstructionMethod::SMOOTH_DECAY
+        );
         
+        // Copy reconstructed values to output
+        std::memcpy(decompressedData.data(), reconstructed.data(), originalSize);
         
         return decompressedData;
     } catch (const std::exception& e) {

@@ -52,6 +52,21 @@ CORTEXSDR_API CortexError cortex_compressor_create(
     CortexCompressorHandle* handle
 );
 
+// Check if a model path is a multi-part model and get all parts
+// Returns the number of parts found (1 for single file, >1 for multi-part)
+// If parts_out is not NULL, it will be filled with the paths (caller must free each string and the array)
+CORTEXSDR_API int cortex_model_get_parts(
+    const char* model_path,
+    char*** parts_out,
+    int* num_parts
+);
+
+// Add additional file to compressor (for multi-part models)
+CORTEXSDR_API CortexError cortex_compressor_add_file(
+    CortexCompressorHandle handle,
+    const char* model_path
+);
+
 // Compress a model
 CORTEXSDR_API CortexError cortex_compressor_compress(
     CortexCompressorHandle handle,
