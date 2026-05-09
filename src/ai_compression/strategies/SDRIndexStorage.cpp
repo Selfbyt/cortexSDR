@@ -463,9 +463,23 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         // Assign format flag based on tensor size and compression method
         std::vector<std::byte> flaggedOutput;
         
-        // Check if this is weight preservation format (flag 2 is already in compressedOutput)
-        if (!compressedOutput.empty() && compressedOutput.size() > 1 && 
-            static_cast<uint8_t>(compressedOutput[1]) == 2) {
+        // Check if this is weight preservation format by decoding the varint and checking the flag
+        bool isWeightPreservationFormat = false;
+        if (!compressedOutput.empty() && compressedOutput.size() > 1) {
+            try {
+                size_t offset = 0;
+                size_t count = decodeVarint(compressedOutput, offset);
+                (void)count; // Unused, just need to skip past it
+                if (offset < compressedOutput.size() && static_cast<uint8_t>(compressedOutput[offset]) == 2) {
+                    isWeightPreservationFormat = true;
+                }
+            } catch (...) {
+                // If varint decode fails, not weight preservation format
+                isWeightPreservationFormat = false;
+            }
+        }
+        
+        if (isWeightPreservationFormat) {
             // Weight preservation format - use special flag
             if (segment.isWeightTensor()) {
                 flaggedOutput.push_back(static_cast<std::byte>(0x95)); // Weight preservation format
