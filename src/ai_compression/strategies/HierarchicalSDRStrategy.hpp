@@ -26,6 +26,7 @@
 #include "../core/ModelSegment.hpp"
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -205,6 +206,65 @@ public:
         const SharedDictionary& dict,
         const float* x,
         size_t batch) const;
+
+    // ---------------------------------------------------------------------
+    // Multi-pass compression pipeline.
+    //
+    // Groups a batch of segments by (role-derived) compression config,
+    // pools tiles per group, fits a shared dictionary per group, and
+    // encodes each segment as codes-only bytes referencing its group's
+    // dictionary. This is the orchestration that turns the shared-dict
+    // building blocks into a usable cross-layer compressor.
+    // ---------------------------------------------------------------------
+
+    /// Result of compressGroupedSegments() — in-memory, not yet a file format.
+    struct SharedDictArchive {
+        std::vector<SharedDictionary> dictionaries; ///< One per group/role
+        struct SegmentEntry {
+            std::string name;
+            size_t dict_index;                       ///< Index into dictionaries[]
+            std::vector<std::byte> codes_bytes;
+            size_t original_size;                    ///< Bytes for decompress validation
+            SegmentType original_type;
+        };
+        std::vector<SegmentEntry> segments;
+
+        /** Total bytes (dictionaries + all codes) — useful for storage comparisons. */
+        size_t totalBytes() const;
+
+        // -----------------------------------------------------------------
+        // Serialisation. Self-contained format — not yet integrated with the
+        // main .sdr archive (that requires touching AICompressor and
+        // SDRModelLoader). Magic = "HSDA", little-endian, see implementation
+        // for the exact layout.
+        // -----------------------------------------------------------------
+        /** Write to a binary stream. Throws on I/O failure. */
+        void writeToStream(std::ostream& out) const;
+
+        /** Read from a binary stream produced by writeToStream(). */
+        static SharedDictArchive readFromStream(std::istream& in);
+
+        /** Convenience: write to file at the given path. */
+        void writeToFile(const std::string& path) const;
+
+        /** Convenience: read from file at the given path. */
+        static SharedDictArchive readFromFile(const std::string& path);
+    };
+
+    /**
+     * @brief Compress a batch of segments using one shared dictionary per role.
+     *
+     * Segments with matching compression config (n_atoms, n_stages,
+     * active_bits_per_stage, tile_rows, tile_cols, stage_decay) are pooled
+     * and share a dictionary. Segments that fail validation (wrong dtype,
+     * shape too small, protection predicate hits) are skipped — the caller
+     * is expected to handle them via a parallel fallback path.
+     *
+     * Skipped segments are reported via `out_skipped_names` if provided.
+     */
+    SharedDictArchive compressGroupedSegments(
+        const std::vector<ModelSegment>& segments,
+        std::vector<std::string>* out_skipped_names = nullptr) const;
 
 private:
     HierarchicalSDRConfig attn_default_;

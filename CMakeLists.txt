@@ -584,6 +584,16 @@ add_executable(test_hsdr_protection src/test_hsdr_protection.cpp)
 target_link_libraries(test_hsdr_protection PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 target_compile_definitions(test_hsdr_protection PRIVATE CORTEXSDR_STATIC=1)
 
+# HSDR multi-pass pipeline test (auto-group by role, shared dict per group)
+add_executable(test_hsdr_pipeline src/test_hsdr_pipeline.cpp)
+target_link_libraries(test_hsdr_pipeline PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_pipeline PRIVATE CORTEXSDR_STATIC=1)
+
+# HSDR pipeline disk-roundtrip test (writeToFile / readFromFile / verify)
+add_executable(test_hsdr_pipeline_disk src/test_hsdr_pipeline_disk.cpp)
+target_link_libraries(test_hsdr_pipeline_disk PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_pipeline_disk PRIVATE CORTEXSDR_STATIC=1)
+
 # SDR Size Analyzer Tool
 add_executable(analyze_sdr_size analyze_sdr_size.cpp)
 # No dependencies needed - standalone tool

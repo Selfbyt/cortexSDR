@@ -12,8 +12,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cctype>
+#include <fstream>
+#include <functional>
 #include <iostream>
 #include <random>
+#include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace CortexAICompression {
@@ -1034,6 +1039,389 @@ std::vector<float> HierarchicalSDRStrategy::matmulWithExternalDictionary(
         }
     }
     return Y;
+}
+
+// --------------------------------------------------------------------------
+// Multi-pass pipeline: compressGroupedSegments
+// --------------------------------------------------------------------------
+
+size_t HierarchicalSDRStrategy::SharedDictArchive::totalBytes() const {
+    size_t total = 0;
+    for (const auto& d : dictionaries) {
+        total += d.atoms.size() * sizeof(float);
+        total += d.stage_scales.size() * sizeof(float);
+        // Plus the small config struct itself, which lives in headers when serialised.
+        total += sizeof(HierarchicalSDRConfig);
+    }
+    for (const auto& s : segments) total += s.codes_bytes.size();
+    return total;
+}
+
+// --------------------------------------------------------------------------
+// Disk format for SharedDictArchive
+// --------------------------------------------------------------------------
+//
+// All multi-byte values are written in host byte order (little-endian on the
+// platforms we target). The format is self-describing enough to be safely
+// versioned, but is NOT the same as the main .sdr archive format yet —
+// integration with AICompressor / SDRModelLoader comes in a follow-up round.
+//
+//   [Top-level header]
+//      magic[4]            = 'H','S','D','A'
+//      version (uint32)
+//      num_dictionaries (uint32)
+//      num_segments (uint32)
+//
+//   For each dictionary:
+//      config (HierarchicalSDRConfig, raw POD, 12 bytes)
+//      n_stage_scales (uint32)   -- redundant with config.n_stages, but explicit
+//      stage_scales[n_stage_scales]
+//      atoms_count (uint32)      -- equals n_atoms * tile_rows * tile_cols
+//      atoms[atoms_count]        (float32)
+//
+//   For each segment entry:
+//      name_length (uint32)
+//      name[name_length]         (char, not null-terminated)
+//      dict_index (uint32)
+//      original_size (uint64)
+//      original_type (uint8)
+//      codes_length (uint32)
+//      codes_bytes[codes_length]
+//
+// Trailing padding/footer: none. The reader knows totals from the top-level
+// header.
+
+namespace {
+
+constexpr char kHSDAMagic[4] = {'H', 'S', 'D', 'A'};
+constexpr uint32_t kHSDAVersion = 1;
+
+template <typename T>
+void writePOD(std::ostream& out, const T& value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+    if (!out) throw CompressionError("HSDA write: stream error");
+}
+
+template <typename T>
+void writeArray(std::ostream& out, const T* data, size_t count) {
+    if (count == 0) return;
+    out.write(reinterpret_cast<const char*>(data), sizeof(T) * count);
+    if (!out) throw CompressionError("HSDA write: stream error");
+}
+
+template <typename T>
+void readPODStream(std::istream& in, T& value) {
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(T))) {
+        throw CompressionError("HSDA read: truncated stream");
+    }
+}
+
+template <typename T>
+void readArrayStream(std::istream& in, T* data, size_t count) {
+    if (count == 0) return;
+    in.read(reinterpret_cast<char*>(data), sizeof(T) * count);
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(T) * count)) {
+        throw CompressionError("HSDA read: truncated array");
+    }
+}
+
+}  // anonymous namespace
+
+void HierarchicalSDRStrategy::SharedDictArchive::writeToStream(std::ostream& out) const {
+    // Top-level header.
+    out.write(kHSDAMagic, sizeof(kHSDAMagic));
+    if (!out) throw CompressionError("HSDA write: cannot write magic");
+    writePOD<uint32_t>(out, kHSDAVersion);
+    writePOD<uint32_t>(out, static_cast<uint32_t>(dictionaries.size()));
+    writePOD<uint32_t>(out, static_cast<uint32_t>(segments.size()));
+
+    // Dictionaries.
+    for (const auto& d : dictionaries) {
+        writePOD<HierarchicalSDRConfig>(out, d.config);
+        writePOD<uint32_t>(out, static_cast<uint32_t>(d.stage_scales.size()));
+        writeArray<float>(out, d.stage_scales.data(), d.stage_scales.size());
+        writePOD<uint32_t>(out, static_cast<uint32_t>(d.atoms.size()));
+        writeArray<float>(out, d.atoms.data(), d.atoms.size());
+    }
+
+    // Segments.
+    for (const auto& s : segments) {
+        writePOD<uint32_t>(out, static_cast<uint32_t>(s.name.size()));
+        if (!s.name.empty()) {
+            out.write(s.name.data(), static_cast<std::streamsize>(s.name.size()));
+            if (!out) throw CompressionError("HSDA write: name write failed");
+        }
+        writePOD<uint32_t>(out, static_cast<uint32_t>(s.dict_index));
+        writePOD<uint64_t>(out, static_cast<uint64_t>(s.original_size));
+        writePOD<uint8_t>(out, static_cast<uint8_t>(s.original_type));
+        writePOD<uint32_t>(out, static_cast<uint32_t>(s.codes_bytes.size()));
+        writeArray<std::byte>(out, s.codes_bytes.data(), s.codes_bytes.size());
+    }
+}
+
+HierarchicalSDRStrategy::SharedDictArchive
+HierarchicalSDRStrategy::SharedDictArchive::readFromStream(std::istream& in) {
+    char magic[4];
+    in.read(magic, sizeof(magic));
+    if (in.gcount() != 4 || std::memcmp(magic, kHSDAMagic, 4) != 0) {
+        throw CompressionError("HSDA read: bad magic — not an HSDA stream");
+    }
+    uint32_t version = 0, n_dicts = 0, n_segs = 0;
+    readPODStream(in, version);
+    if (version != kHSDAVersion) {
+        throw CompressionError("HSDA read: unsupported version");
+    }
+    readPODStream(in, n_dicts);
+    readPODStream(in, n_segs);
+
+    SharedDictArchive archive;
+    archive.dictionaries.resize(n_dicts);
+    for (uint32_t i = 0; i < n_dicts; ++i) {
+        auto& d = archive.dictionaries[i];
+        readPODStream(in, d.config);
+        uint32_t n_scales = 0;
+        readPODStream(in, n_scales);
+        d.stage_scales.resize(n_scales);
+        readArrayStream(in, d.stage_scales.data(), d.stage_scales.size());
+        uint32_t n_atoms_floats = 0;
+        readPODStream(in, n_atoms_floats);
+        d.atoms.resize(n_atoms_floats);
+        readArrayStream(in, d.atoms.data(), d.atoms.size());
+    }
+
+    archive.segments.resize(n_segs);
+    for (uint32_t i = 0; i < n_segs; ++i) {
+        auto& s = archive.segments[i];
+        uint32_t name_len = 0;
+        readPODStream(in, name_len);
+        s.name.resize(name_len);
+        if (name_len > 0) {
+            in.read(s.name.data(), name_len);
+            if (in.gcount() != static_cast<std::streamsize>(name_len)) {
+                throw CompressionError("HSDA read: name truncated");
+            }
+        }
+        uint32_t dict_idx = 0;
+        readPODStream(in, dict_idx);
+        if (dict_idx >= archive.dictionaries.size()) {
+            throw CompressionError("HSDA read: dict_index out of range");
+        }
+        s.dict_index = dict_idx;
+        uint64_t orig_size = 0;
+        readPODStream(in, orig_size);
+        s.original_size = static_cast<size_t>(orig_size);
+        uint8_t orig_type = 0;
+        readPODStream(in, orig_type);
+        s.original_type = static_cast<SegmentType>(orig_type);
+        uint32_t codes_len = 0;
+        readPODStream(in, codes_len);
+        s.codes_bytes.resize(codes_len);
+        readArrayStream(in, s.codes_bytes.data(), s.codes_bytes.size());
+    }
+    return archive;
+}
+
+void HierarchicalSDRStrategy::SharedDictArchive::writeToFile(const std::string& path) const {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw CompressionError("HSDA writeToFile: cannot open " + path);
+    }
+    writeToStream(out);
+}
+
+HierarchicalSDRStrategy::SharedDictArchive
+HierarchicalSDRStrategy::SharedDictArchive::readFromFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw CompressionError("HSDA readFromFile: cannot open " + path);
+    }
+    return readFromStream(in);
+}
+
+namespace {
+
+/// Key used to group segments that can share one dictionary.
+/// Two segments may share if their compression configs match in every
+/// dimension that the shared dictionary serializes.
+struct DictGroupKey {
+    uint16_t tile_rows;
+    uint16_t tile_cols;
+    uint16_t n_atoms;
+    uint8_t  n_stages;
+    uint8_t  active_bits_per_stage;
+    float    stage_decay;
+
+    bool operator==(const DictGroupKey& o) const {
+        return tile_rows == o.tile_rows && tile_cols == o.tile_cols
+            && n_atoms == o.n_atoms && n_stages == o.n_stages
+            && active_bits_per_stage == o.active_bits_per_stage
+            && stage_decay == o.stage_decay;
+    }
+};
+
+struct DictGroupKeyHash {
+    size_t operator()(const DictGroupKey& k) const {
+        size_t h = std::hash<uint32_t>{}(
+            (uint32_t(k.tile_rows) << 16) | k.tile_cols);
+        h ^= std::hash<uint32_t>{}(
+            (uint32_t(k.n_atoms) << 16) | (uint32_t(k.n_stages) << 8) | k.active_bits_per_stage)
+            + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<float>{}(k.stage_decay)
+            + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+DictGroupKey keyForConfig(const HierarchicalSDRConfig& cfg) {
+    return DictGroupKey{cfg.tile_rows, cfg.tile_cols, cfg.n_atoms,
+                        cfg.n_stages, cfg.active_bits_per_stage, cfg.stage_decay};
+}
+
+/// Validate that a segment is acceptable for HSDR (FP32 weight, 2-D, shape fits).
+/// Returns true if OK; false otherwise (caller skips it).
+bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
+                     std::string* reason = nullptr) {
+    if (!seg.isWeightTensor()) {
+        if (reason) *reason = "not a weight tensor";
+        return false;
+    }
+    if (!seg.tensor_metadata.has_value() ||
+        seg.tensor_metadata.value().dimensions.size() != 2) {
+        if (reason) *reason = "missing 2-D tensor_metadata";
+        return false;
+    }
+    if (seg.data.size() % sizeof(float) != 0) {
+        if (reason) *reason = "byte size not multiple of sizeof(float)";
+        return false;
+    }
+    // FP32 check (matches the regular compress() logic).
+    bool is_fp32 = (seg.type == SegmentType::WEIGHTS_FP32);
+    if (!is_fp32) {
+        std::string fmt;
+        fmt.reserve(seg.data_format.size());
+        for (char c : seg.data_format) {
+            fmt.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        if (fmt == "f32" || fmt == "float32" || fmt == "fp32") is_fp32 = true;
+    }
+    if (!is_fp32) {
+        if (reason) *reason = "not FP32";
+        return false;
+    }
+    const auto& dims = seg.tensor_metadata.value().dimensions;
+    const size_t R = dims[0];
+    const size_t C = dims[1];
+    if (R * C * sizeof(float) != seg.data.size()) {
+        if (reason) *reason = "shape/data size mismatch";
+        return false;
+    }
+    // For shared-dict path we require exact divisibility (edge handling lives in
+    // the per-tensor compress() path, not the shared one).
+    if (R % cfg.tile_rows != 0 || C % cfg.tile_cols != 0) {
+        if (reason) *reason = "shape not divisible by tile size";
+        return false;
+    }
+    return true;
+}
+
+}  // anonymous namespace
+
+HierarchicalSDRStrategy::SharedDictArchive
+HierarchicalSDRStrategy::compressGroupedSegments(
+    const std::vector<ModelSegment>& segments,
+    std::vector<std::string>* out_skipped_names) const
+{
+    // 1. Bucket segments by their effective compression config.
+    std::unordered_map<DictGroupKey, std::vector<size_t>, DictGroupKeyHash> buckets;
+    std::vector<HierarchicalSDRConfig> per_segment_cfg(segments.size());
+
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto& seg = segments[i];
+        const HierarchicalSDRConfig cfg = configFor(seg);
+        per_segment_cfg[i] = cfg;
+
+        if (protection_ && protection_(seg)) {
+            if (out_skipped_names) out_skipped_names->push_back(seg.name);
+            continue;
+        }
+        std::string why;
+        if (!segmentSuitable(seg, cfg, &why)) {
+            if (out_skipped_names) out_skipped_names->push_back(seg.name);
+            continue;
+        }
+        buckets[keyForConfig(cfg)].push_back(i);
+    }
+
+    SharedDictArchive archive;
+    archive.dictionaries.reserve(buckets.size());
+    archive.segments.reserve(segments.size());
+
+    // 2. For each bucket: pool tiles, fit a shared dictionary, encode each segment.
+    for (auto& kv : buckets) {
+        const std::vector<size_t>& seg_indices = kv.second;
+        if (seg_indices.empty()) continue;
+        const HierarchicalSDRConfig& cfg = per_segment_cfg[seg_indices.front()];
+
+        // 2a. Pool tiles. Per-segment tile extraction.
+        std::vector<float> pooled;
+        uint32_t pooled_count = 0;
+        const uint32_t tile_dim = cfg.tileSize();
+
+        // First pass: total size to reserve.
+        size_t total_tiles_floats = 0;
+        for (size_t idx : seg_indices) {
+            const auto& s = segments[idx];
+            const auto& dims = s.tensor_metadata.value().dimensions;
+            const uint32_t R = static_cast<uint32_t>(dims[0]);
+            const uint32_t C = static_cast<uint32_t>(dims[1]);
+            const uint32_t nt = (R / cfg.tile_rows) * (C / cfg.tile_cols);
+            total_tiles_floats += static_cast<size_t>(nt) * tile_dim;
+            pooled_count += nt;
+        }
+        pooled.reserve(total_tiles_floats);
+
+        // Second pass: actually extract.
+        for (size_t idx : seg_indices) {
+            const auto& s = segments[idx];
+            const auto& dims = s.tensor_metadata.value().dimensions;
+            const uint32_t R = static_cast<uint32_t>(dims[0]);
+            const uint32_t C = static_cast<uint32_t>(dims[1]);
+            const float* w = reinterpret_cast<const float*>(s.data.data());
+            uint32_t nt_check = 0;
+            std::vector<float> tiles = extractTiles(w, R, C, cfg.tile_rows, cfg.tile_cols, nt_check);
+            pooled.insert(pooled.end(), tiles.begin(), tiles.end());
+        }
+
+        if (pooled_count < cfg.n_atoms) {
+            // Pool too small to fit the requested dictionary — skip the whole bucket
+            // and mark every member as skipped.
+            for (size_t idx : seg_indices) {
+                if (out_skipped_names) out_skipped_names->push_back(segments[idx].name);
+            }
+            continue;
+        }
+
+        // 2b. Fit shared dictionary on the pool.
+        SharedDictionary shared = fitSharedDictionary(pooled, pooled_count, cfg);
+        const size_t dict_index = archive.dictionaries.size();
+        archive.dictionaries.push_back(std::move(shared));
+
+        // 2c. Encode each segment in the bucket against the new shared dict.
+        const SharedDictionary& dict_ref = archive.dictionaries[dict_index];
+        for (size_t idx : seg_indices) {
+            const auto& s = segments[idx];
+            SharedDictArchive::SegmentEntry entry;
+            entry.name = s.name;
+            entry.dict_index = dict_index;
+            entry.codes_bytes = compressWithExternalDictionary(s, dict_ref);
+            entry.original_size = s.data.size();
+            entry.original_type = s.type;
+            archive.segments.push_back(std::move(entry));
+        }
+    }
+
+    return archive;
 }
 
 // --------------------------------------------------------------------------
