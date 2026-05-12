@@ -599,6 +599,16 @@ add_executable(test_hsda_reader src/test_hsda_reader.cpp)
 target_link_libraries(test_hsda_reader PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 target_compile_definitions(test_hsda_reader PRIVATE CORTEXSDR_STATIC=1)
 
+# HSDR multi-dtype input test (FP16, BF16, INT8 dequantise paths)
+add_executable(test_hsdr_dtypes src/test_hsdr_dtypes.cpp)
+target_link_libraries(test_hsdr_dtypes PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_dtypes PRIVATE CORTEXSDR_STATIC=1)
+
+# Inference engine matmul-routing test (HSDR→fused, others→dense fallback)
+add_executable(test_inference_matmul_routing src/test_inference_matmul_routing.cpp)
+target_link_libraries(test_inference_matmul_routing PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_inference_matmul_routing PRIVATE CORTEXSDR_STATIC=1)
+
 # SDR Size Analyzer Tool
 add_executable(analyze_sdr_size analyze_sdr_size.cpp)
 # No dependencies needed - standalone tool

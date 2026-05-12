@@ -1265,6 +1265,48 @@ const std::vector<CompressedSegmentHeader>& SDRModelLoader::getSegmentIndex() co
  * @details Initializes the dispatch table for common ops and the default
  * fallback handler for unknown layer types.
  */
+std::vector<float> SDRInferenceEngine::matmulForLayer(
+    const std::string& segment_name, const float* x, size_t batch) const
+{
+    // Strategy id 5 = HSDR per the loader's registration table. When set, we
+    // skip FP32 materialisation entirely and go through the fused path.
+    constexpr uint8_t HSDR_STRATEGY_ID = 5;
+    const auto* header = loader_.findSegmentHeader(segment_name);
+    if (header && header->compression_strategy_id == HSDR_STRATEGY_ID) {
+        return loader_.matmulHSDR(segment_name, x, batch);
+    }
+
+    // Fallback: load + dense FP32 matmul. Same correctness as before — just
+    // no fused-inference benefit, since the segment isn't HSDR-encoded.
+    ModelSegment seg = loader_.loadSegmentByName(segment_name);
+    if (!seg.tensor_metadata.has_value()
+        || seg.tensor_metadata.value().dimensions.size() != 2) {
+        throw std::runtime_error(
+            "matmulForLayer: segment '" + segment_name +
+            "' has no 2-D tensor_metadata; cannot fall back to dense matmul");
+    }
+    if (seg.data.size() % sizeof(float) != 0) {
+        throw std::runtime_error(
+            "matmulForLayer: segment '" + segment_name +
+            "' is not FP32 (size not a multiple of 4 bytes); HSDR helper "
+            "doesn't dequantise on the read path yet");
+    }
+    const auto& dims = seg.tensor_metadata.value().dimensions;
+    const size_t R = dims[0];
+    const size_t C = dims[1];
+    const float* W = reinterpret_cast<const float*>(seg.data.data());
+    std::vector<float> Y(R * batch, 0.0f);
+    for (size_t r = 0; r < R; ++r) {
+        for (size_t c = 0; c < C; ++c) {
+            const float w = W[r * C + c];
+            for (size_t b = 0; b < batch; ++b) {
+                Y[r * batch + b] += w * x[c * batch + b];
+            }
+        }
+    }
+    return Y;
+}
+
 SDRInferenceEngine::SDRInferenceEngine(SDRModelLoader& model_loader)
     : loader_(model_loader), batch_size(1), dropout_enabled(false), training_mode(false),
       memory_pool_offset_(0), max_memory_usage_(8ULL * 1024 * 1024 * 1024), // 8GB default

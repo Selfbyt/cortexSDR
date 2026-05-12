@@ -282,7 +282,30 @@ public:
      * @param model_loader Reference to SDRModelLoader for layer access
      */
     explicit SDRInferenceEngine(SDRModelLoader& model_loader);
-    
+
+    /**
+     * @brief Matmul Y = W·x for a named weight segment, routing HSDR-encoded
+     *        segments through the fused-inference path (no materialisation).
+     *
+     * @param segment_name Exact archive name of the weight segment.
+     * @param x Activation input, row-major (input_dim × batch).
+     * @param batch Number of input columns.
+     * @return Y of shape (segment_rows, batch), row-major.
+     *
+     * @details If the segment is HSDR-encoded (strategy id 5) and was written
+     * in 1-D row-tile mode, this calls `SDRModelLoader::matmulHSDR()` —
+     * skipping FP32 materialisation entirely. For all other strategies the
+     * implementation falls back to a load + dense matmul.
+     *
+     * Note: the forward-pass code paths (attention, MLP) don't yet call this;
+     * they still materialise FP32 weights via `loadSegmentByName`. This helper
+     * is the migration target — once it's hooked into the kernels, HSDR
+     * segments get the speed win without changing those call-sites' API.
+     */
+    std::vector<float> matmulForLayer(const std::string& segment_name,
+                                       const float* x,
+                                       size_t batch) const;
+
     /**
      * @brief Run end-to-end inference over the model's execution order.
      * @param input_tensor Input tensor (flattened, row-major).

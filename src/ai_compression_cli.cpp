@@ -612,23 +612,103 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
         std::cout << "  pipeline produced " << archive.dictionaries.size()
                   << " dictionaries and " << archive.segments.size()
                   << " compressed segments in " << fit_s << " s\n";
-        std::cout << "  skipped " << skipped.size() << " segments "
-                  << "(non-FP32, shape-too-small, or protected)\n";
+
+        // Bucket the skipped segments by reason so users see *why* nothing went
+        // through (most common cause on real models: tensor is already quantised,
+        // or it's a 1-D layer-norm without the 2-D shape HSDR needs).
+        if (!skipped.empty()) {
+            std::unordered_map<std::string, size_t> by_name(segments.size());
+            for (size_t i = 0; i < segments.size(); ++i) by_name[segments[i].name] = i;
+
+            // HSDR now accepts FP32, FP16, BF16, and uniform-INT8 inputs (via
+            // the dequantizeSegmentToFP32 helper). Anything else — block
+            // formats like Q4_K_M, Q5_K, Q6_K, AWQ/GPTQ — is still unsupported
+            // and reported here per-format so users see what they'd need to
+            // convert (or add support for).
+            auto isSupportedDtype = [](const ModelSegment& s) -> bool {
+                if (s.type == SegmentType::WEIGHTS_FP32
+                    || s.type == SegmentType::WEIGHTS_FP16
+                    || s.type == SegmentType::WEIGHTS_INT8) return true;
+                std::string fmt = s.data_format;
+                for (auto& c : fmt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                return fmt == "f32" || fmt == "fp32" || fmt == "float32"
+                    || fmt == "f16" || fmt == "fp16" || fmt == "float16" || fmt == "half"
+                    || fmt == "bf16" || fmt == "bfloat16"
+                    || fmt == "i8"  || fmt == "int8"
+                    || fmt == "q4_0" || fmt == "q8_0";
+            };
+
+            size_t skip_not_weight = 0, skip_unsupported_dtype = 0, skip_not_2d = 0;
+            size_t skip_shape_small = 0, skip_other = 0;
+            std::vector<std::string> sample_unsupported, sample_not_2d, sample_shape_small;
+            std::unordered_map<std::string, size_t> unsupported_format_counts;
+            const size_t SAMPLE_CAP = 3;
+            for (const auto& name : skipped) {
+                auto it = by_name.find(name);
+                if (it == by_name.end()) { ++skip_other; continue; }
+                const auto& s = segments[it->second];
+                if (!s.isWeightTensor()) { ++skip_not_weight; continue; }
+                if (!s.tensor_metadata.has_value() ||
+                    s.tensor_metadata.value().dimensions.size() != 2) {
+                    ++skip_not_2d;
+                    if (sample_not_2d.size() < SAMPLE_CAP) sample_not_2d.push_back(name);
+                    continue;
+                }
+                if (!isSupportedDtype(s)) {
+                    ++skip_unsupported_dtype;
+                    if (sample_unsupported.size() < SAMPLE_CAP) sample_unsupported.push_back(name);
+                    const std::string fmt = s.data_format.empty() ? "(empty)" : s.data_format;
+                    ++unsupported_format_counts[fmt];
+                    continue;
+                }
+                // Supported dtype + 2-D shape → either shape too small for tile
+                // size, or protected by the predicate. We can't tell from outside,
+                // so lump them under "shape_small_or_protected".
+                ++skip_shape_small;
+                if (sample_shape_small.size() < SAMPLE_CAP) sample_shape_small.push_back(name);
+            }
+            std::cout << "  skipped " << skipped.size() << " segments:\n";
+            std::cout << "    " << skip_not_weight << " not a weight tensor\n";
+            std::cout << "    " << skip_not_2d
+                      << " not 2-D (norms, biases, etc.)\n";
+            for (const auto& n : sample_not_2d) std::cout << "      e.g. " << n << "\n";
+            std::cout << "    " << skip_unsupported_dtype
+                      << " unsupported dtype (f32/f16/bf16/i8 supported)\n";
+            for (const auto& kv : unsupported_format_counts) {
+                std::cout << "      • format='" << kv.first << "': " << kv.second << " tensors\n";
+            }
+            for (const auto& n : sample_unsupported) std::cout << "      e.g. " << n << "\n";
+            std::cout << "    " << skip_shape_small
+                      << " supported dtype but shape too small / protected\n";
+            for (const auto& n : sample_shape_small) std::cout << "      e.g. " << n << "\n";
+            if (skip_other > 0) std::cout << "    " << skip_other << " unclassified\n";
+        }
 
         // 4. Serialize to disk.
         archive.writeToFile(output_hsda_path);
         const auto archive_bytes = std::filesystem::file_size(output_hsda_path);
         std::cout << "  wrote " << archive_bytes << " bytes to " << output_hsda_path << "\n";
 
-        // Stats: total original weight bytes vs archive bytes.
-        size_t total_weight_bytes = 0;
-        for (const auto& s : segments) {
-            if (s.isWeightTensor()) total_weight_bytes += s.data.size();
+        // Stats: total bytes of weights HSDR actually encoded vs the archive size.
+        // (Comparing "all weights" to a near-empty archive when everything was
+        // skipped produces a nonsense ratio, so we use only the encoded subset.)
+        size_t encoded_original_bytes = 0;
+        {
+            std::unordered_map<std::string, size_t> by_name(segments.size());
+            for (size_t i = 0; i < segments.size(); ++i) by_name[segments[i].name] = i;
+            for (const auto& entry : archive.segments) {
+                auto it = by_name.find(entry.name);
+                if (it != by_name.end()) encoded_original_bytes += segments[it->second].data.size();
+            }
         }
-        if (total_weight_bytes > 0) {
-            const double ratio = static_cast<double>(total_weight_bytes)
+        if (archive.segments.empty()) {
+            std::cout << "  (no segments encoded — nothing to compute a ratio for)\n";
+        } else if (encoded_original_bytes > 0) {
+            const double ratio = static_cast<double>(encoded_original_bytes)
                                  / static_cast<double>(archive_bytes);
-            std::cout << "  ratio (all-weights / archive): " << ratio << "x\n";
+            std::cout << "  encoded-original bytes: " << encoded_original_bytes
+                      << "  →  archive bytes: " << archive_bytes
+                      << "  ratio: " << ratio << "x\n";
         }
         std::cout << "HSDR compression complete.\n";
         return 0;

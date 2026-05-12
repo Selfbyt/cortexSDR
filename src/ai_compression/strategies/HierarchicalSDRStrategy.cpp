@@ -8,6 +8,7 @@
  * decompression is a pure dictionary lookup + signed accumulation.
  */
 #include "HierarchicalSDRStrategy.hpp"
+#include "../utils/fp16_convert.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -435,6 +436,154 @@ struct HSDRCodesHeader {
 };
 #pragma pack(pop)
 
+/// Normalise a data_format string to lowercase for comparison.
+std::string lowerFormat(const std::string& fmt) {
+    std::string out;
+    out.reserve(fmt.size());
+    for (char c : fmt) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
+/// Dequantise a segment to FP32 in-memory. Supports:
+///   • FP32                          — zero-copy reinterpret returned via output vector
+///   • FP16 (data_format == "f16")   — SIMD-accelerated via Utils::fp16_to_fp32_array
+///   • BF16                          — top-16-bit shift up to FP32
+///   • INT8 with TensorMetadata scale/zero_point — linear dequant
+///
+/// Throws CompressionError for unsupported dtypes (e.g. GGUF block-quantised
+/// formats Q4_K_M etc., which need llama.cpp-style per-block code).
+///
+/// Returns a vector<float> of length R*C. The HSDR fitter consumes this
+/// without caring whether the original was lower-precision.
+std::vector<float> dequantizeSegmentToFP32(const ModelSegment& segment) {
+    using namespace Utils;
+    const std::string fmt = lowerFormat(segment.data_format);
+
+    // ---------------------------------------------------------------------
+    // Dispatch by `data_format` first (more specific than `type`, e.g. BF16
+    // and FP16 both ride the WEIGHTS_FP16 enum). Fall through to the type
+    // enum only when the format string is empty / unknown.
+    // ---------------------------------------------------------------------
+
+    // BF16 — top 16 bits of FP32 representation. Must come before the FP16
+    // type-based branch because BF16 data is often tagged as WEIGHTS_FP16.
+    if (fmt == "bf16" || fmt == "bfloat16") {
+        if (segment.data.size() % sizeof(uint16_t) != 0) {
+            throw CompressionError("HSDR dequant: BF16 byte size not a multiple of 2");
+        }
+        const size_t n = segment.data.size() / sizeof(uint16_t);
+        std::vector<float> out(n);
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(segment.data.data());
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
+            std::memcpy(&out[i], &bits, sizeof(float));
+        }
+        return out;
+    }
+
+    // GGUF block formats (Q4_0, Q8_0) — must come before the WEIGHTS_INT8 /
+    // WEIGHTS_INT4 type-based branches, because those segments often carry
+    // SegmentType::WEIGHTS_INT8 even though the byte layout is block-quantised.
+    if (fmt == "q4_0") {
+        constexpr size_t QK = 32;
+        constexpr size_t BLOCK_BYTES = sizeof(uint16_t) + QK / 2;  // 18
+        static_assert(BLOCK_BYTES == 18, "Q4_0 block size");
+        if (segment.data.size() % BLOCK_BYTES != 0) {
+            throw CompressionError("HSDR dequant: Q4_0 byte size not a multiple of 18");
+        }
+        const size_t n_blocks = segment.data.size() / BLOCK_BYTES;
+        std::vector<float> out(n_blocks * QK);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(segment.data.data());
+        for (size_t b = 0; b < n_blocks; ++b) {
+            uint16_t d_bits;
+            std::memcpy(&d_bits, p, sizeof(uint16_t));
+            const float d = fp16_to_fp32(d_bits);
+            const uint8_t* qs = p + 2;
+            for (size_t j = 0; j < QK / 2; ++j) {
+                const uint8_t byte = qs[j];
+                const int low  = static_cast<int>(byte & 0x0F) - 8;
+                const int high = static_cast<int>(byte >> 4)   - 8;
+                out[b * QK + 2 * j    ] = static_cast<float>(low)  * d;
+                out[b * QK + 2 * j + 1] = static_cast<float>(high) * d;
+            }
+            p += BLOCK_BYTES;
+        }
+        return out;
+    }
+
+    if (fmt == "q8_0") {
+        constexpr size_t QK = 32;
+        constexpr size_t BLOCK_BYTES = sizeof(uint16_t) + QK;  // 34
+        static_assert(BLOCK_BYTES == 34, "Q8_0 block size");
+        if (segment.data.size() % BLOCK_BYTES != 0) {
+            throw CompressionError("HSDR dequant: Q8_0 byte size not a multiple of 34");
+        }
+        const size_t n_blocks = segment.data.size() / BLOCK_BYTES;
+        std::vector<float> out(n_blocks * QK);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(segment.data.data());
+        for (size_t b = 0; b < n_blocks; ++b) {
+            uint16_t d_bits;
+            std::memcpy(&d_bits, p, sizeof(uint16_t));
+            const float d = fp16_to_fp32(d_bits);
+            const int8_t* qs = reinterpret_cast<const int8_t*>(p + 2);
+            for (size_t j = 0; j < QK; ++j) {
+                out[b * QK + j] = static_cast<float>(qs[j]) * d;
+            }
+            p += BLOCK_BYTES;
+        }
+        return out;
+    }
+
+    // FP32 fast path — copy bytes into a float vector.
+    if (segment.type == SegmentType::WEIGHTS_FP32 ||
+        fmt == "f32" || fmt == "fp32" || fmt == "float32") {
+        if (segment.data.size() % sizeof(float) != 0) {
+            throw CompressionError("HSDR dequant: FP32 byte size not a multiple of 4");
+        }
+        const size_t n = segment.data.size() / sizeof(float);
+        std::vector<float> out(n);
+        std::memcpy(out.data(), segment.data.data(), segment.data.size());
+        return out;
+    }
+
+    // FP16 — uses the existing SIMD-accelerated converter (F16C / NEON / scalar).
+    if (segment.type == SegmentType::WEIGHTS_FP16 ||
+        fmt == "f16" || fmt == "fp16" || fmt == "float16" || fmt == "half") {
+        if (segment.data.size() % sizeof(uint16_t) != 0) {
+            throw CompressionError("HSDR dequant: FP16 byte size not a multiple of 2");
+        }
+        const size_t n = segment.data.size() / sizeof(uint16_t);
+        std::vector<float> out(n);
+        fp16_to_fp32_array(reinterpret_cast<const uint16_t*>(segment.data.data()),
+                            out.data(), n);
+        return out;
+    }
+
+    // INT8 with uniform (scale, zero_point) — requires TensorMetadata to carry the params.
+    if (segment.type == SegmentType::WEIGHTS_INT8 || fmt == "i8" || fmt == "int8") {
+        if (!segment.tensor_metadata.has_value()
+            || !segment.tensor_metadata.value().scale.has_value()) {
+            throw CompressionError("HSDR dequant: INT8 input needs tensor_metadata.scale");
+        }
+        const float scale = segment.tensor_metadata.value().scale.value();
+        const float zp = segment.tensor_metadata.value().zero_point.value_or(0.0f);
+        const size_t n = segment.data.size();  // 1 byte per element
+        std::vector<float> out(n);
+        const int8_t* src = reinterpret_cast<const int8_t*>(segment.data.data());
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = (static_cast<float>(src[i]) - zp) * scale;
+        }
+        return out;
+    }
+
+    // Everything else (Q4_K, Q5_K, Q6_K, Q8_K, IQ*-, AWQ, GPTQ, etc.) requires
+    // format-specific block-dequant code with super-block + sub-block layouts.
+    // Carry-overs to a future round; documented in STEP0 followups.
+    throw CompressionError("HSDR dequant: unsupported input dtype '" + segment.data_format
+                            + "' (type=" + std::to_string(static_cast<int>(segment.type))
+                            + "); supported: f32, f16, bf16, i8, q4_0, q8_0");
+}
+
 /// Drive the encode step (greedy MP) for a whole tensor against an external
 /// dictionary. Used by both `compressWithExternalDictionary` (single-tile-row
 /// encoding) and as a helper for full segment encoding.
@@ -492,24 +641,11 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
                                "' is protected; deferring to lossless fallback");
     }
 
-    // Only FP32 input. Other dtypes fall through to the lower-priority strategy.
-    bool is_fp32 = (segment.type == SegmentType::WEIGHTS_FP32);
-    if (!is_fp32) {
-        std::string fmt;
-        fmt.reserve(segment.data_format.size());
-        for (char c : segment.data_format) {
-            fmt.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-        if (fmt == "f32" || fmt == "float32" || fmt == "fp32") is_fp32 = true;
-    }
-    if (!is_fp32) {
-        throw CompressionError("HierarchicalSDRStrategy: only FP32 weights supported");
-    }
-
-    if (segment.data.size() % sizeof(float) != 0) {
-        throw CompressionError("HSDR: byte size not a multiple of sizeof(float)");
-    }
-    const size_t num_elements = segment.data.size() / sizeof(float);
+    // Dequantise to FP32. Throws CompressionError for unsupported dtypes
+    // (the strategy chain in AICompressor then falls through to the next
+    // priority — typically QuantizedTensorStrategy or Gzip).
+    std::vector<float> fp32_view = dequantizeSegmentToFP32(segment);
+    const size_t num_elements = fp32_view.size();
 
     // Need a 2-D shape; pull from tensor metadata.
     if (!segment.tensor_metadata.has_value() ||
@@ -537,7 +673,10 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
         throw CompressionError("HSDR: not enough tiles to fit the requested dictionary size");
     }
 
-    const float* weight = reinterpret_cast<const float*>(segment.data.data());
+    // `fp32_view` holds the (possibly dequantised) FP32 weight values. This is
+    // what HSDR fits — the original dtype (FP16/BF16/INT8) is invisible past
+    // dequantizeSegmentToFP32.
+    const float* weight = fp32_view.data();
 
     // Slice out the aligned (R_full × C_full) top-left block into a contiguous
     // buffer so extractTiles' stride matches. Edge strips outside this block
@@ -875,9 +1014,16 @@ std::vector<std::byte> HierarchicalSDRStrategy::compressWithExternalDictionary(
         throw CompressionError("compressWithExternalDictionary: dictionary size doesn't match config");
     }
 
+    // Dequantise to FP32 if needed (FP16/BF16/INT8 input is now supported).
+    std::vector<float> fp32_view = dequantizeSegmentToFP32(segment);
+    if (fp32_view.size() != static_cast<size_t>(R) * C) {
+        throw CompressionError(
+            "compressWithExternalDictionary: dequantised element count doesn't match shape");
+    }
+
     uint32_t n_tiles = 0;
-    const float* weight = reinterpret_cast<const float*>(segment.data.data());
-    std::vector<float> tiles = extractTiles(weight, R, C, cfg.tile_rows, cfg.tile_cols, n_tiles);
+    std::vector<float> tiles = extractTiles(fp32_view.data(), R, C,
+                                             cfg.tile_rows, cfg.tile_cols, n_tiles);
 
     const uint32_t slots_per_tile = static_cast<uint32_t>(cfg.n_stages) * cfg.active_bits_per_stage;
     std::vector<uint16_t> indices(static_cast<size_t>(n_tiles) * slots_per_tile);
@@ -1280,6 +1426,22 @@ DictGroupKey keyForConfig(const HierarchicalSDRConfig& cfg) {
 
 /// Validate that a segment is acceptable for HSDR (FP32 weight, 2-D, shape fits).
 /// Returns true if OK; false otherwise (caller skips it).
+/// Lightweight check of whether `dequantizeSegmentToFP32` can handle this segment.
+/// Cheap (just inspects type + data_format), unlike actually running the dequant.
+bool segmentDtypeSupported(const ModelSegment& seg) {
+    if (seg.type == SegmentType::WEIGHTS_FP32
+        || seg.type == SegmentType::WEIGHTS_FP16
+        || seg.type == SegmentType::WEIGHTS_INT8) {
+        return true;
+    }
+    const std::string fmt = lowerFormat(seg.data_format);
+    return fmt == "f32" || fmt == "fp32" || fmt == "float32"
+        || fmt == "f16" || fmt == "fp16" || fmt == "float16" || fmt == "half"
+        || fmt == "bf16" || fmt == "bfloat16"
+        || fmt == "i8" || fmt == "int8"
+        || fmt == "q4_0" || fmt == "q8_0";
+}
+
 bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
                      std::string* reason = nullptr) {
     if (!seg.isWeightTensor()) {
@@ -1291,28 +1453,28 @@ bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
         if (reason) *reason = "missing 2-D tensor_metadata";
         return false;
     }
-    if (seg.data.size() % sizeof(float) != 0) {
-        if (reason) *reason = "byte size not multiple of sizeof(float)";
-        return false;
-    }
-    // FP32 check (matches the regular compress() logic).
-    bool is_fp32 = (seg.type == SegmentType::WEIGHTS_FP32);
-    if (!is_fp32) {
-        std::string fmt;
-        fmt.reserve(seg.data_format.size());
-        for (char c : seg.data_format) {
-            fmt.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
-        if (fmt == "f32" || fmt == "float32" || fmt == "fp32") is_fp32 = true;
-    }
-    if (!is_fp32) {
-        if (reason) *reason = "not FP32";
+    if (!segmentDtypeSupported(seg)) {
+        if (reason) *reason = "unsupported dtype (need f32/f16/bf16/i8)";
         return false;
     }
     const auto& dims = seg.tensor_metadata.value().dimensions;
     const size_t R = dims[0];
     const size_t C = dims[1];
-    if (R * C * sizeof(float) != seg.data.size()) {
+    // Each supported dtype has a fixed byte-per-element width. The dequant
+    // helper does precise validation; here we just want to catch obviously
+    // mismatched shapes without doing the full conversion.
+    size_t expected_bytes = 0;
+    if (seg.type == SegmentType::WEIGHTS_FP32) expected_bytes = R * C * 4;
+    else if (seg.type == SegmentType::WEIGHTS_FP16) expected_bytes = R * C * 2;
+    else if (seg.type == SegmentType::WEIGHTS_INT8) expected_bytes = R * C;
+    else {
+        const std::string fmt = lowerFormat(seg.data_format);
+        if (fmt == "f32" || fmt == "fp32" || fmt == "float32") expected_bytes = R * C * 4;
+        else if (fmt == "f16" || fmt == "fp16" || fmt == "float16" || fmt == "half"
+                 || fmt == "bf16" || fmt == "bfloat16") expected_bytes = R * C * 2;
+        else if (fmt == "i8" || fmt == "int8") expected_bytes = R * C;
+    }
+    if (expected_bytes != 0 && expected_bytes != seg.data.size()) {
         if (reason) *reason = "shape/data size mismatch";
         return false;
     }
@@ -1381,15 +1543,21 @@ HierarchicalSDRStrategy::compressGroupedSegments(
         }
         pooled.reserve(total_tiles_floats);
 
-        // Second pass: actually extract.
+        // Second pass: actually extract. Dequantise each segment to FP32 (no-op
+        // for already-FP32) before tile extraction so the pool is dtype-uniform.
         for (size_t idx : seg_indices) {
             const auto& s = segments[idx];
             const auto& dims = s.tensor_metadata.value().dimensions;
             const uint32_t R = static_cast<uint32_t>(dims[0]);
             const uint32_t C = static_cast<uint32_t>(dims[1]);
-            const float* w = reinterpret_cast<const float*>(s.data.data());
+            std::vector<float> fp32_view = dequantizeSegmentToFP32(s);
+            if (fp32_view.size() != static_cast<size_t>(R) * C) {
+                throw CompressionError("compressGroupedSegments: dequant size mismatch on '"
+                                       + s.name + "'");
+            }
             uint32_t nt_check = 0;
-            std::vector<float> tiles = extractTiles(w, R, C, cfg.tile_rows, cfg.tile_cols, nt_check);
+            std::vector<float> tiles = extractTiles(fp32_view.data(), R, C,
+                                                     cfg.tile_rows, cfg.tile_cols, nt_check);
             pooled.insert(pooled.end(), tiles.begin(), tiles.end());
         }
 
