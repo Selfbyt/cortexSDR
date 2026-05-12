@@ -179,6 +179,7 @@ std::vector<std::byte> SDRIndexStorageStrategy::compressIndicesWithValues(const 
 
 // --- decompressIndicesWithValues Implementation ---
 std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(const std::vector<std::byte>& compressedData, size_t originalSize) const {
+    std::cerr << "[DECOMPRESS] decompressIndicesWithValues called, originalSize=" << originalSize << ", compressedSize=" << compressedData.size() << "\n";
     if (compressedData.empty()) {
         throw CompressionError("Empty compressed data");
     }
@@ -259,10 +260,26 @@ std::vector<std::byte> SDRIndexStorageStrategy::decompressIndicesWithValues(cons
         size_t elementSize = 4; // Default to 4 bytes for float32
         size_t numElements = originalSize / elementSize;
         
-        // Use sparse weight reconstruction instead of just zero-filling
+        // Use sparse weight reconstruction - choose method based on coverage
+        // For high coverage (>5%), use ZERO_FILL for speed
+        // For low coverage (<5%), use NEAREST_NEIGHBOR for better quality
+        float coverage = static_cast<float>(indices.size()) / static_cast<float>(numElements);
+        ReconstructionMethod method = (coverage > 0.05f) ? 
+            ReconstructionMethod::ZERO_FILL : 
+            ReconstructionMethod::NEAREST_NEIGHBOR;
+        
+        std::cerr << "[DECOMPRESS] Reconstructing " << numElements << " elements from " << indices.size() 
+                  << " stored values (coverage: " << (coverage * 100.0f) << "%, method: " 
+                  << (method == ReconstructionMethod::ZERO_FILL ? "ZERO_FILL" : "NEAREST_NEIGHBOR") << ")\n";
+        
         std::vector<float> reconstructed = SparseWeightReconstruction::reconstruct(
-            indices, values, numElements, ReconstructionMethod::SMOOTH_DECAY
+            indices, values, numElements, method
         );
+        std::cerr << "[DECOMPRESS] Reconstruction complete, first 5 values: ";
+        for (size_t i = 0; i < std::min(size_t(5), reconstructed.size()); ++i) {
+            std::cerr << reconstructed[i] << " ";
+        }
+        std::cerr << "\n";
         
         // Copy reconstructed values to output
         std::memcpy(decompressedData.data(), reconstructed.data(), originalSize);
@@ -451,9 +468,23 @@ std::vector<std::byte> SDRIndexStorageStrategy::compress(const ModelSegment& seg
         }
         
         // Check if compression was effective enough
+        // For high sparsity (>=10%), we expect larger compressed sizes due to storing more values
         float compressionThreshold = 1.0f; // Default: must be smaller than original
         if (segment.data.size() < 1024) {
             compressionThreshold = 1.2f; // Allow up to 20% larger for small segments
+        } else if (usedWeightPreservation) {
+            // For weight preservation with high sparsity, allow larger compressed sizes
+            // Calculate expected size based on sparsity
+            float sparsityRatio = sparsity_;
+            if (segment.tensor_metadata.has_value() && segment.tensor_metadata.value().sparsity_ratio > 0) {
+                sparsityRatio = segment.tensor_metadata.value().sparsity_ratio;
+            }
+            
+            if (sparsityRatio >= 0.10f) {
+                // For high sparsity, allow compressed size up to 2x original
+                // This accounts for storing indices + values for many elements
+                compressionThreshold = 2.0f;
+            }
         }
         if (compressedOutput.size() > segment.data.size() * compressionThreshold) {
             std::cerr << "  Compression ineffective (" << compressedOutput.size() 
@@ -688,18 +719,32 @@ std::vector<size_t> SDRIndexStorageStrategy::extractSignificantIndices(const Mod
     size_t activeBitsCount = static_cast<size_t>(totalElements * sparsityRatio);
     activeBitsCount = std::max(size_t(1), activeBitsCount); // Ensure at least one active bit
     
-    // Cap active bits with a sparsity-aware safety bound so changing sparsity
-    // still has visible effect while avoiding runaway memory/CPU usage.
-    size_t baseMaxActiveBits;
-    if (totalElements > 10000000) {
-        baseMaxActiveBits = 10000;
-    } else if (totalElements > 1000000) {
-        baseMaxActiveBits = 5000;
+    // Cap active bits with a sparsity-aware safety bound
+    // For high sparsity (>10%), allow more values but still cap for memory safety
+    size_t maxActiveBits;
+    if (sparsityRatio >= 0.10f) {
+        // For sparsity >= 10%, allow up to the requested amount but cap at reasonable limits
+        if (totalElements > 10000000) {
+            maxActiveBits = std::min(activeBitsCount, static_cast<size_t>(1000000)); // Cap at 1M for very large tensors
+        } else if (totalElements > 1000000) {
+            maxActiveBits = std::min(activeBitsCount, static_cast<size_t>(500000)); // Cap at 500K
+        } else {
+            maxActiveBits = activeBitsCount; // No cap for smaller tensors
+        }
     } else {
-        baseMaxActiveBits = 2000;
+        // For low sparsity (<10%), use the old conservative caps
+        size_t baseMaxActiveBits;
+        if (totalElements > 10000000) {
+            baseMaxActiveBits = 10000;
+        } else if (totalElements > 1000000) {
+            baseMaxActiveBits = 5000;
+        } else {
+            baseMaxActiveBits = 2000;
+        }
+        const float multiplier = std::max(0.25f, 1.0f + (sparsityRatio * 8.0f));
+        maxActiveBits = static_cast<size_t>(static_cast<float>(baseMaxActiveBits) * multiplier);
     }
-    const float multiplier = std::max(0.25f, 1.0f + (sparsityRatio * 8.0f));
-    const size_t maxActiveBits = static_cast<size_t>(static_cast<float>(baseMaxActiveBits) * multiplier);
+    
     if (activeBitsCount > maxActiveBits) {
         activeBitsCount = maxActiveBits;
         sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;
@@ -864,18 +909,32 @@ std::vector<std::pair<size_t, float>> SDRIndexStorageStrategy::extractSignifican
     size_t activeBitsCount = static_cast<size_t>(totalElements * sparsityRatio);
     activeBitsCount = std::max(size_t(1), activeBitsCount); // Ensure at least one active bit
     
-    // Cap active bits with a sparsity-aware safety bound so changing sparsity
-    // still has visible effect while avoiding runaway memory/CPU usage.
-    size_t baseMaxActiveBits;
-    if (totalElements > 10000000) {
-        baseMaxActiveBits = 10000;
-    } else if (totalElements > 1000000) {
-        baseMaxActiveBits = 5000;
+    // Cap active bits with a sparsity-aware safety bound
+    // For high sparsity (>10%), allow more values but still cap for memory safety
+    size_t maxActiveBits;
+    if (sparsityRatio >= 0.10f) {
+        // For sparsity >= 10%, allow up to the requested amount but cap at reasonable limits
+        if (totalElements > 10000000) {
+            maxActiveBits = std::min(activeBitsCount, static_cast<size_t>(1000000)); // Cap at 1M for very large tensors
+        } else if (totalElements > 1000000) {
+            maxActiveBits = std::min(activeBitsCount, static_cast<size_t>(500000)); // Cap at 500K
+        } else {
+            maxActiveBits = activeBitsCount; // No cap for smaller tensors
+        }
     } else {
-        baseMaxActiveBits = 2000;
+        // For low sparsity (<10%), use the old conservative caps
+        size_t baseMaxActiveBits;
+        if (totalElements > 10000000) {
+            baseMaxActiveBits = 10000;
+        } else if (totalElements > 1000000) {
+            baseMaxActiveBits = 5000;
+        } else {
+            baseMaxActiveBits = 2000;
+        }
+        const float multiplier = std::max(0.25f, 1.0f + (sparsityRatio * 8.0f));
+        maxActiveBits = static_cast<size_t>(static_cast<float>(baseMaxActiveBits) * multiplier);
     }
-    const float multiplier = std::max(0.25f, 1.0f + (sparsityRatio * 8.0f));
-    const size_t maxActiveBits = static_cast<size_t>(static_cast<float>(baseMaxActiveBits) * multiplier);
+    
     if (activeBitsCount > maxActiveBits) {
         activeBitsCount = maxActiveBits;
         sparsityRatio = static_cast<float>(activeBitsCount) / totalElements;

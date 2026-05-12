@@ -735,9 +735,7 @@ SDRModelLoader::SDRModelLoader(const std::string& archive_path) : archive_path_(
     decompressor_->registerStrategy(SDR_STRATEGY_ID, adaptiveStrategy);
     decompressor_->registerStrategy(RLE_STRATEGY_ID, std::make_shared<NumericalRLEStrategy>());
     decompressor_->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
-#ifdef ENABLE_QUANTIZATION
     decompressor_->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());
-#endif
 
     // Legacy compatibility support
     auto legacySdrStrategy = std::make_shared<SDRIndexStorageStrategy>();

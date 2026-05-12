@@ -41,6 +41,9 @@ void printUsage(const char* programName) {
     std::cout << "\nNote: All formats are compressed using the same SDR-based compression strategies.\n";
     std::cout << "\nOptions:\n";
     std::cout << "  sparsity: Fraction of active bits in SDR encoding (default: 0.02 = 2%)\n";
+    std::cout << "            Lower values = better compression, higher values = better quality\n";
+    std::cout << "            Recommended: 0.01-0.05 for high compression (50-100:1 ratio)\n";
+    std::cout << "                        0.10-0.50 for better quality (lower compression)\n";
     std::cout << "\nExamples:\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr\n";
     std::cout << "  " << programName << " -c model.onnx onnx compressed_model.sdr 0.01\n";

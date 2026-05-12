@@ -8,12 +8,34 @@
 #include <algorithm> // For minmax_element
 #include <limits>
 #include <stdexcept>
+#include <cctype>
 
 namespace CortexAICompression {
 
 std::vector<std::byte> QuantizedTensorStrategy::compress(const ModelSegment& segment) const {
     if (!segment.isWeightTensor()) {
         throw CompressionError("QuantizedTensorStrategy only supports weight tensors");
+    }
+
+    // Only handle FP32 input. FP16, INT8, INT4, and already-quantized GGUF tensors
+    // are rejected here so the strategy chain falls through to a lossless fallback.
+    // SegmentType alone isn't enough — role-tagged types (ATTENTION_WEIGHTS, etc.)
+    // can carry any underlying dtype — so we also inspect data_format from the parser.
+    bool is_fp32 = (segment.type == SegmentType::WEIGHTS_FP32);
+    if (!is_fp32) {
+        std::string fmt;
+        fmt.reserve(segment.data_format.size());
+        for (char c : segment.data_format) fmt.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (fmt == "f32" || fmt == "float32" || fmt == "fp32") {
+            is_fp32 = true;
+        }
+    }
+    if (!is_fp32) {
+        throw CompressionError("QuantizedTensorStrategy currently only handles FP32 input data");
+    }
+
+    if (segment.data.size() % sizeof(float) != 0) {
+        throw CompressionError("Segment byte size is not a multiple of sizeof(float)");
     }
 
     // Convert raw bytes to float vector

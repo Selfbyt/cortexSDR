@@ -286,11 +286,7 @@ namespace {
         decompressor->registerStrategy(SDR_STRATEGY_ID + 10, sdrStrategy);
         decompressor->registerStrategy(RLE_STRATEGY_ID, std::make_shared<NumericalRLEStrategy>());
         decompressor->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
-#ifdef ENABLE_QUANTIZATION
         decompressor->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());
-#else
-        (void)QUANT_STRATEGY_ID;
-#endif
 
         return decompressor;
     }
@@ -307,7 +303,7 @@ CortexError cortex_compression_options_init(CortexCompressionOptions* options) {
         options->use_delta_encoding = 1;
         options->use_rle = 1;
         options->compression_level = 6; 
-        options->use_quantization = 0;
+        options->use_quantization = 1;
         options->quantization_bits = 8;
         options->sparsity = 0.02f; 
         return {nullptr, 0};
@@ -379,37 +375,31 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         ai_compressor->registerStrategy(SegmentType::TOKENIZER_VOCAB, 1, SDR_STRATEGY_ID, adaptiveStrategy);
         ai_compressor->registerStrategy(SegmentType::TOKENIZER_MODEL, 1, SDR_STRATEGY_ID, adaptiveStrategy);
         
-        // Tensor data segments
+        // Tensor data segments.
+        // SDR is intentionally NOT registered for weight tensor types: magnitude
+        // pruning + heuristic interpolation destroys LLM semantics. SDR is reserved
+        // for naturally-sparse data (SPARSE_INDICES) and metadata.
         if (options->use_delta_encoding) {
             ai_compressor->registerStrategy(SegmentType::SPARSE_INDICES, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP16, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT8, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT4, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::ATTENTION_WEIGHTS, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::EMBEDDING_WEIGHTS, 2, SDR_STRATEGY_ID, adaptiveStrategy);
-            ai_compressor->registerStrategy(SegmentType::LAYER_NORM_WEIGHTS, 2, SDR_STRATEGY_ID, adaptiveStrategy);
         }
 
-            if (options->use_rle) {
-                auto rleStrategy = std::make_shared<NumericalRLEStrategy>();
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 3, RLE_STRATEGY_ID, rleStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP16, 3, RLE_STRATEGY_ID, rleStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT8, 3, RLE_STRATEGY_ID, rleStrategy);
-            ai_compressor->registerStrategy(SegmentType::ATTENTION_WEIGHTS, 3, RLE_STRATEGY_ID, rleStrategy);
-            ai_compressor->registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 3, RLE_STRATEGY_ID, rleStrategy);
-            ai_compressor->registerStrategy(SegmentType::EMBEDDING_WEIGHTS, 3, RLE_STRATEGY_ID, rleStrategy);
-            ai_compressor->registerStrategy(SegmentType::LAYER_NORM_WEIGHTS, 3, RLE_STRATEGY_ID, rleStrategy);
-            }
+        // Quantization is the primary lossy compressor for weight tensors.
+        // It throws on non-FP32 input (already-quantized GGUF, FP16, etc.) so those
+        // segments fall through to the Gzip lossless fallback below.
+        if (options->use_quantization) {
+            auto quantStrategy = std::make_shared<QuantizedTensorStrategy>(options->quantization_bits);
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 2, QUANT_STRATEGY_ID, quantStrategy);
+            ai_compressor->registerStrategy(SegmentType::ATTENTION_WEIGHTS, 2, QUANT_STRATEGY_ID, quantStrategy);
+            ai_compressor->registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 2, QUANT_STRATEGY_ID, quantStrategy);
+            ai_compressor->registerStrategy(SegmentType::EMBEDDING_WEIGHTS, 2, QUANT_STRATEGY_ID, quantStrategy);
+            ai_compressor->registerStrategy(SegmentType::LAYER_NORM_WEIGHTS, 2, QUANT_STRATEGY_ID, quantStrategy);
+        }
 
-#ifdef ENABLE_QUANTIZATION
-            if (options->use_quantization) {
-                auto quantStrategy = std::make_shared<QuantizedTensorStrategy>(options->quantization_bits);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 3, QUANT_STRATEGY_ID, quantStrategy);
-            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP16, 3, QUANT_STRATEGY_ID, quantStrategy);
-            }
-#endif
+        if (options->use_rle) {
+            auto rleStrategy = std::make_shared<NumericalRLEStrategy>();
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT8, 3, RLE_STRATEGY_ID, rleStrategy);
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_INT4, 3, RLE_STRATEGY_ID, rleStrategy);
+        }
 
         // Register Gzip as fallback for weight tensors with lowest priority
         ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 4, GZIP_STRATEGY_ID, gzipStrategy);

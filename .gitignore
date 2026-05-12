@@ -111,3 +111,18 @@ benchmarks/tmp/
 # Commercial/internal documents
 COMMERCIAL_README.md
 POTENTIAL_CUSTOMERS.md
+
+# Inference / debug output dropped at repo root
+inference_stdout.txt
+inference_stderr.txt
+inference_output/
+
+# Research scratch (Python venvs, caches, large artefact dumps)
+research/**/.venv/
+research/**/__pycache__/
+research/**/.cache/
+research/**/results/*.json
+research/**/results/*.npz
+research/**/results/*.npy
+research/**/results/*.png
+research/**/results/exp_*_checkpoints/
