@@ -5,6 +5,7 @@
 #include "../strategies/GzipStrategy.hpp"
 #include "../strategies/NumericalRLE.hpp"
 #include "../strategies/QuantizedTensorStrategy.hpp"
+#include "../strategies/HierarchicalSDRStrategy.hpp"
 #include "../strategies/AdaptiveSDRStrategy.hpp"
 #include "../parsers/ONNXModelParser.hpp"
 #include "../parsers/GGUFModelParser.hpp"
@@ -277,6 +278,7 @@ namespace {
         const uint8_t RLE_STRATEGY_ID = 2;
         const uint8_t GZIP_STRATEGY_ID = 3;
         const uint8_t QUANT_STRATEGY_ID = 4;
+        const uint8_t HSDR_STRATEGY_ID = 5;  ///< V4b hierarchical binary SDR
 
         auto adaptiveStrategy = std::make_shared<AdaptiveSDRStrategy>(sparsity);
         decompressor->registerStrategy(SDR_STRATEGY_ID, adaptiveStrategy);
@@ -287,6 +289,7 @@ namespace {
         decompressor->registerStrategy(RLE_STRATEGY_ID, std::make_shared<NumericalRLEStrategy>());
         decompressor->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
         decompressor->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());
+        decompressor->registerStrategy(HSDR_STRATEGY_ID, std::make_shared<HierarchicalSDRStrategy>());
 
         return decompressor;
     }
@@ -305,6 +308,7 @@ CortexError cortex_compression_options_init(CortexCompressionOptions* options) {
         options->compression_level = 6; 
         options->use_quantization = 1;
         options->quantization_bits = 8;
+        options->use_hsdr = 0;  // V4b: opt-in, fitting is slow at TinyLlama scale
         options->sparsity = 0.02f; 
         return {nullptr, 0};
     } catch (const std::exception& e) {
@@ -357,6 +361,7 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
         const uint8_t RLE_STRATEGY_ID = 2;
         const uint8_t GZIP_STRATEGY_ID = 3;
         const uint8_t QUANT_STRATEGY_ID = 4;
+        const uint8_t HSDR_STRATEGY_ID = 5;  ///< V4b hierarchical binary SDR
 
         // Create compression strategies
         auto gzipStrategy = std::make_shared<GzipStrategy>(options->compression_level);
@@ -383,7 +388,21 @@ CortexError cortex_compressor_create(const char* model_path, const char* format,
             ai_compressor->registerStrategy(SegmentType::SPARSE_INDICES, 2, SDR_STRATEGY_ID, adaptiveStrategy);
         }
 
-        // Quantization is the primary lossy compressor for weight tensors.
+        // V4b hierarchical binary SDR is the new primary lossy compressor for FP32
+        // weight tensors. It fails fast on non-FP32 dtypes and on shapes not divisible
+        // by the tile size, so the chain falls through to Quant / Gzip cleanly.
+        // OPT-IN: fitting is slow (~minutes per MLP layer on CPU). See
+        // research/step0/results/STEP0_REPORT.md for the design rationale.
+        if (options->use_hsdr) {
+            auto hsdrStrategy = std::make_shared<HierarchicalSDRStrategy>();
+            ai_compressor->registerStrategy(SegmentType::WEIGHTS_FP32, 1, HSDR_STRATEGY_ID, hsdrStrategy);
+            ai_compressor->registerStrategy(SegmentType::ATTENTION_WEIGHTS, 1, HSDR_STRATEGY_ID, hsdrStrategy);
+            ai_compressor->registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 1, HSDR_STRATEGY_ID, hsdrStrategy);
+            ai_compressor->registerStrategy(SegmentType::EMBEDDING_WEIGHTS, 1, HSDR_STRATEGY_ID, hsdrStrategy);
+            ai_compressor->registerStrategy(SegmentType::LAYER_NORM_WEIGHTS, 1, HSDR_STRATEGY_ID, hsdrStrategy);
+        }
+
+        // Quantization is the broadly-applicable lossy compressor for weight tensors.
         // It throws on non-FP32 input (already-quantized GGUF, FP16, etc.) so those
         // segments fall through to the Gzip lossless fallback below.
         if (options->use_quantization) {

@@ -51,6 +51,7 @@
 #include "strategies/GzipStrategy.hpp"
 #include "strategies/NumericalRLE.hpp"
 #include "strategies/QuantizedTensorStrategy.hpp"
+#include "strategies/HierarchicalSDRStrategy.hpp"
 #include "strategies/SDRIndexStorage.hpp"
 
 #ifdef ENABLE_ONNX_PROTOBUF
@@ -729,13 +730,15 @@ SDRModelLoader::SDRModelLoader(const std::string& archive_path) : archive_path_(
     const uint8_t RLE_STRATEGY_ID = 2;
     const uint8_t GZIP_STRATEGY_ID = 3;
     const uint8_t QUANT_STRATEGY_ID = 4;
-    
+    const uint8_t HSDR_STRATEGY_ID = 5;  ///< V4b hierarchical binary SDR
+
     // Register compression strategies
     auto adaptiveStrategy = std::make_shared<AdaptiveSDRStrategy>(0.02f);
     decompressor_->registerStrategy(SDR_STRATEGY_ID, adaptiveStrategy);
     decompressor_->registerStrategy(RLE_STRATEGY_ID, std::make_shared<NumericalRLEStrategy>());
     decompressor_->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
     decompressor_->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());
+    decompressor_->registerStrategy(HSDR_STRATEGY_ID, std::make_shared<HierarchicalSDRStrategy>());
 
     // Legacy compatibility support
     auto legacySdrStrategy = std::make_shared<SDRIndexStorageStrategy>();

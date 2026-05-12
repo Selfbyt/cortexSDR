@@ -38,6 +38,7 @@ typedef struct {
     int compression_level;
     int use_quantization;      // Whether to use quantization for floating-point tensors
     int quantization_bits;     // Number of bits for quantization (e.g., 8 for int8)
+    int use_hsdr;              // Whether to enable V4b hierarchical binary SDR for FP32 weights (lossy, slow fit)
     float sparsity;           // Fraction of active bits in SDR encoding (default 0.02 = 2%)
 } CortexCompressionOptions;
 

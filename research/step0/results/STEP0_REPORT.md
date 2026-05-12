@@ -464,6 +464,81 @@ The Numenta-inspired vision survives intact and is in fact *stronger* than the o
 - **BitNet matmul-free inner loop reachable** via one-shot calibration — the deployment-novelty angle
 - **The dictionary must be fit jointly with the multi-stage binary codes** — this is the technical insight from A.v2/A.v3
 
+## C++ implementation note — the 2D-vs-1D tile finding (post-impl)
+
+While porting V4b to C++ and writing the fused-inference matmul, the FLOP accounting was re-derived from first principles and surfaced a critical correction to Exp C.
+
+### The Exp C benchmark used 1D row tiles implicitly
+
+The `impl_fused_real` benchmark in `research/step0/exp_c_kernel/benchmark.py` constructed atoms as flat row vectors of length `tile_cols` (shape `(K, TILE_COLS)`), and the synthetic weight matrix replicated those row vectors `TILE_ROWS` times. That is mathematically a **1D row-tile** structure dressed up as 2D for shape-counting purposes. The 74.6% FLOP-reduction headline therefore corresponds to 1D row tiles, not the 2D tiles that V4b actually stores.
+
+### Doing the math with real 2D tiles
+
+For genuine 2D tiles (each atom a `(tile_rows, tile_cols)` matrix), the fused inference cost is:
+
+```
+precompute Dx for every atom and every input column block:
+  2 · K · tile_rows · C · batch   FLOPs
+
+per-tile gather (real-valued or binary):
+  ~ n_active · tile_rows · batch · n_tiles
+```
+
+For Llama-2-7B MLP (R=4096, C=11008, K=512, tile=128×128, n_active=24, batch=1):
+- Dense: 2·R·C·batch ≈ **90 M FLOPs**
+- 2D fused precompute alone: 2·512·128·11008 ≈ **1.45 G FLOPs**
+- 2D fused total: ≈ **1.46 G FLOPs (16× MORE than dense)** — fused inference is **worse** at 2D tiles.
+
+### Why 1D row tiles fix it
+
+For 1D row tiles (`tile_rows = 1`, `tile_cols = C`), each atom is a row vector of length C and each row of W has its own sparse code:
+
+```
+precompute Dx (K, batch):  2 · K · C · batch  FLOPs   (one-time per token block)
+per-row gather:            n_active · R · batch       (binary: adds-only)
+```
+
+For Llama-7B MLP at the same K=512, n_active=24, batch=1:
+- Precompute: 2·512·11008 ≈ **11.3 M FLOPs**
+- Per-row gather: 24·4096 ≈ **0.1 M FLOPs**
+- Total fused: **≈ 11.4 M FLOPs → 87% reduction vs 90 M dense.** Speed story restored.
+
+### Storage too
+
+1D row tiles also store *less* per tensor at the same K and n_active:
+
+| Mode | Dictionary | Codes | Total (Llama-7B MLP) |
+|---|---|---|---|
+| 2D 128×128, K=512 | 32 MB | 132 KB | ~32 MB |
+| 1D rows,    K=512 | 22 MB | 196 KB | **~22 MB** |
+
+And the C++ smoke test confirmed reconstruction quality is at least as good (NMSE 0.37 at K=32, k=12 with 1D rows vs 0.47 with 32×32 2D tiles at matching budget).
+
+### Verified end-to-end in C++
+
+The smoke test [src/test_hsdr_roundtrip.cpp](src/test_hsdr_roundtrip.cpp) now exercises both modes plus a fused-matmul correctness/speed check:
+
+```
+=== Fused matmul (1D row tiles) ===
+  W shape=(256, 512)   batch=4
+  dense path (decompress + matmul): 0.62 ms
+  fused path (no materialisation):  0.12 ms          ← ~5× wall-time
+  max |dense - fused| = 2.6e-6 (FP32 noise)
+  PASS (dense and fused outputs agree)
+```
+
+The wall-time win grows with shape because the precompute (the costly part) amortises across more output rows. For Llama-7B MLP shapes, the speedup is expected to be ~8-10×.
+
+### Implication for the architecture
+
+**1D row tiles should be the default for Cortex-SDR** going forward. They:
+
+- Make the matmul-free fused-inference claim actually hold
+- Reduce dictionary size at typical LLM shapes
+- Reconstruct at least as well per fitting budget
+
+The C++ implementation supports both modes; `HierarchicalSDRConfig::forRow1D(row_width)` selects the 1D variant. Existing 2D-encoded archives (e.g. the research/step0 checkpoints) still decode correctly via the materialisation path.
+
 ## What to run next (Step 1 outline — revised after D.1's catastrophic scaling result)
 
 D.1's +89 ppl makes it clear: more protection alone won't get us to ship-ready quality without major compression sacrifice. Two paths forward, in priority order:

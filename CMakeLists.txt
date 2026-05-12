@@ -59,6 +59,7 @@ set(COMMON_SOURCES
     src/ai_compression/strategies/MetadataSDRStrategy.cpp
     src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
     src/ai_compression/strategies/QuantizedTensorStrategy.cpp
+    src/ai_compression/strategies/HierarchicalSDRStrategy.cpp
     src/ai_compression/streaming/StreamingCompressor.cpp
     src/ai_compression/parsers/GGUFModelParser.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp
@@ -468,6 +469,7 @@ set(SDK_SOURCES
     src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
     src/ai_compression/strategies/MetadataSDRStrategy.cpp
     src/ai_compression/strategies/QuantizedTensorStrategy.cpp
+    src/ai_compression/strategies/HierarchicalSDRStrategy.cpp
     src/ai_compression/strategies/SDRIndexStorage.cpp
     src/ai_compression/strategies/SparseWeightReconstruction.cpp
     src/ai_compression/kernels/blas_kernels.cpp
@@ -561,6 +563,11 @@ target_compile_definitions(cortexsdr_text_cli PRIVATE CORTEXSDR_STATIC=1)
 add_executable(cortexsdr_bench src/cortexsdr_bench.cpp)
 target_link_libraries(cortexsdr_bench PRIVATE ${PROJECT_NAME} ${PROJECT_NAME}_sdk ${EXTRA_LIBS})
 target_compile_definitions(cortexsdr_bench PRIVATE CORTEXSDR_STATIC=1)
+
+# HSDR (V4b) round-trip smoke test
+add_executable(test_hsdr_roundtrip src/test_hsdr_roundtrip.cpp)
+target_link_libraries(test_hsdr_roundtrip PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_roundtrip PRIVATE CORTEXSDR_STATIC=1)
 
 # SDR Size Analyzer Tool
 add_executable(analyze_sdr_size analyze_sdr_size.cpp)
