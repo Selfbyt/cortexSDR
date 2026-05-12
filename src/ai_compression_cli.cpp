@@ -11,6 +11,10 @@
 #include "ai_compression/api/c_api.hpp"
 #include "ai_compression/SparseInferenceEngine.hpp"
 #include "ai_compression/strategies/HierarchicalSDRStrategy.hpp"
+#include "ai_compression/strategies/QuantizedTensorStrategy.hpp"
+#include "ai_compression/strategies/GzipStrategy.hpp"
+#include "ai_compression/strategies/DequantToFP32Strategy.hpp"
+#include "ai_compression/core/AICompressor.hpp"
 #include "ai_compression/parsers/ModelParserFactory.hpp"
 #include "ai_compression/core/ModelSegment.hpp"
 #include <cstring>
@@ -304,7 +308,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         const char* model_path = argv[2];
-        const char* format = argv[3];
+        std::string format_str = argv[3];
+        // Format auto-detect from extension when user passes "auto" or just
+        // the model path twice. Recognised extensions: .gguf (and any shard
+        // variant like *-00001-of-00002.gguf), .onnx.
+        if (format_str == "auto" || format_str == model_path) {
+            std::string lower(model_path);
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            if (lower.find(".gguf") != std::string::npos) {
+                format_str = "gguf";
+            } else if (lower.size() >= 5 && lower.substr(lower.size() - 5) == ".onnx") {
+                format_str = "onnx";
+            } else {
+                std::cerr << "Format auto-detect failed; pass 'gguf' or 'onnx' explicitly.\n";
+                return 1;
+            }
+            std::cout << "  format auto-detected: " << format_str << "\n";
+        }
+        const char* format = format_str.c_str();
         const char* output_hsda_path = argv[4];
         int protect_boundary = 0;
         int total_layers = 0;
@@ -569,21 +591,114 @@ int runInference(const char* archive_path, const char* input_indices_file) {
     return 0;
 }
 
-int compressModelHSDR(const char* model_path, const char* format, const char* output_hsda_path,
+int compressModelHSDR(const char* model_path, const char* format, const char* output_sdr_path,
                       int protect_boundary, int total_layers_hint,
                       bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters) {
     using namespace CortexAICompression;
-    std::cout << "HSDR shared-dictionary compression\n";
+    (void)protect_boundary;  // boundary-protect predicate is a per-tensor concept
+    (void)total_layers_hint; // currently not threaded through per-tensor path
+    (void)max_tiles;         // per-tensor mode uses the segment's own tile pool
+
+    std::cout << "HSDR compression (unified .sdr format)\n";
     std::cout << "  model:  " << model_path << "  (format: " << format << ")\n";
-    std::cout << "  output: " << output_hsda_path << "\n";
-    if (fast_preset) std::cout << "  preset: --fast (small K, few iters, capped tile pool)\n";
-    if (max_tiles >= 0)  std::cout << "  override: max-tiles=" << max_tiles << "\n";
+    std::cout << "  output: " << output_sdr_path << "\n";
+    if (fast_preset)     std::cout << "  preset: --fast (small K, few iters)\n";
     if (n_atoms >= 0)    std::cout << "  override: n-atoms="   << n_atoms   << "\n";
     if (ksvd_iters >= 0) std::cout << "  override: ksvd-iters=" << ksvd_iters << "\n";
-    if (protect_boundary > 0) {
-        std::cout << "  protect-boundary: " << protect_boundary
-                  << "  (total-layers hint: " << total_layers_hint << ")\n";
+
+    try {
+        // 1. Build the per-tensor HSDR strategy with the user's config.
+        //    Each weight tensor gets its own dictionary embedded in its
+        //    compressed payload, so the .sdr archive is fully self-contained
+        //    (no separate dictionary table) — works with cortex_inference_
+        //    engine_create + matmulHSDR out of the box.
+        HierarchicalSDRConfig cfg = fast_preset
+            ? HierarchicalSDRConfig::forFast(/*row_width sentinel*/1)
+            : HierarchicalSDRConfig{};
+        if (n_atoms >= 0)    cfg.n_atoms    = static_cast<uint16_t>(n_atoms);
+        if (ksvd_iters >= 0) cfg.ksvd_iters = static_cast<uint8_t>(ksvd_iters);
+        auto hsdrStrategy = std::make_shared<HierarchicalSDRStrategy>(cfg, cfg);
+        std::cout << "  config: K=" << cfg.n_atoms
+                  << "  k=" << static_cast<int>(cfg.active_bits_per_stage)
+                  << "x" << static_cast<int>(cfg.n_stages)
+                  << "  iters=" << static_cast<int>(cfg.ksvd_iters) << "\n";
+
+        // 2. Wire it into the standard AICompressor pipeline. HSDR is primary;
+        //    Quantization + Gzip are fallbacks so non-FP-like or rank-<2
+        //    segments still land in the archive losslessly.
+        auto parser = ModelParserFactory::createParserForFormat(format);
+        AICompressor compressor(std::move(parser));
+        constexpr uint8_t HSDR_STRATEGY_ID  = 5;
+        constexpr uint8_t QUANT_STRATEGY_ID = 4;
+        constexpr uint8_t GZIP_STRATEGY_ID  = 3;
+        compressor.registerStrategy(SegmentType::WEIGHTS_FP32,         1, HSDR_STRATEGY_ID, hsdrStrategy);
+        compressor.registerStrategy(SegmentType::ATTENTION_WEIGHTS,    1, HSDR_STRATEGY_ID, hsdrStrategy);
+        compressor.registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 1, HSDR_STRATEGY_ID, hsdrStrategy);
+        compressor.registerStrategy(SegmentType::EMBEDDING_WEIGHTS,    1, HSDR_STRATEGY_ID, hsdrStrategy);
+        auto quantStrategy = std::make_shared<QuantizedTensorStrategy>(8);
+        compressor.registerStrategy(SegmentType::WEIGHTS_FP32,         2, QUANT_STRATEGY_ID, quantStrategy);
+        compressor.registerStrategy(SegmentType::ATTENTION_WEIGHTS,    2, QUANT_STRATEGY_ID, quantStrategy);
+        compressor.registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 2, QUANT_STRATEGY_ID, quantStrategy);
+        // Dequant-to-FP32 fallback. Sits BELOW HSDR/Quant but ABOVE Gzip so
+        // quantised mid-size weight segments come out as FP32 the inference
+        // engine can read directly, instead of stored raw as opaque Q4_K
+        // bytes. Excluded from EMBEDDING_WEIGHTS on purpose — the 150k-vocab
+        // embedding dequants to >2 GB FP32 and OOMs on-demand load. Embedding
+        // needs a per-row lazy-dequant path (separate workstream); for now
+        // it falls through to the original Q4_K_M passthrough, which the
+        // legacy decode path handles even if the native path can't.
+        constexpr uint8_t DEQUANT_FP32_STRATEGY_ID = 6;
+        auto dequantStrategy = std::make_shared<DequantToFP32Strategy>(6);
+        compressor.registerStrategy(SegmentType::WEIGHTS_FP16,         2, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
+        compressor.registerStrategy(SegmentType::WEIGHTS_INT8,         2, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
+        compressor.registerStrategy(SegmentType::WEIGHTS_FP32,         3, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
+        compressor.registerStrategy(SegmentType::ATTENTION_WEIGHTS,    3, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
+        compressor.registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 3, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
+        auto gzipStrategy = std::make_shared<GzipStrategy>(6);
+        compressor.registerStrategy(SegmentType::WEIGHTS_FP32,        3, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::WEIGHTS_FP16,        3, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::WEIGHTS_INT8,        3, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::METADATA_JSON,       1, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::CONFIG,              1, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::TOKENIZER_VOCAB,     1, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::TOKENIZER_MODEL,     1, GZIP_STRATEGY_ID, gzipStrategy);
+        compressor.registerStrategy(SegmentType::GRAPH_STRUCTURE_PROTO, 1, GZIP_STRATEGY_ID, gzipStrategy);
+
+        // 3. Stream to .sdr file.
+        auto t0 = std::chrono::steady_clock::now();
+        std::ofstream out(output_sdr_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            std::cerr << "Cannot open output: " << output_sdr_path << "\n";
+            return 1;
+        }
+        compressor.compressModel(model_path, out);
+        out.close();
+        auto t1 = std::chrono::steady_clock::now();
+        const double total_s = std::chrono::duration<double>(t1 - t0).count();
+        const auto archive_bytes = std::filesystem::file_size(output_sdr_path);
+        std::cout << "  wrote " << archive_bytes << " bytes to " << output_sdr_path
+                  << " in " << total_s << " s\n";
+        std::cout << "HSDR compression complete.\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in HSDR mode: " << e.what() << "\n";
+        return 1;
     }
+}
+
+// --- Old shared-dict (.hsda) entry point kept for reference / future revival.
+// The unified .sdr format above embeds per-tensor dictionaries, which works
+// out of the box with the SDK's inference path. The shared-dict pipeline
+// (compressGroupedSegments) is still available as a library API; it's not
+// reachable from the CLI any more because integrating it cleanly into .sdr
+// requires a "shared resources" archive section we don't have yet.
+int compressModelHSDR_legacy_hsda(const char* model_path, const char* format, const char* output_hsda_path,
+                                  int protect_boundary, int total_layers_hint,
+                                  bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters) {
+    using namespace CortexAICompression;
+    std::cout << "[legacy hsda] HSDR shared-dictionary compression\n";
+    std::cout << "  model:  " << model_path << "  (format: " << format << ")\n";
+    std::cout << "  output: " << output_hsda_path << "\n";
 
     try {
         // 1. Parse the model into segments.
@@ -709,8 +824,11 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
                 if (it == by_name.end()) { ++skip_other; continue; }
                 const auto& s = segments[it->second];
                 if (!s.isWeightTensor()) { ++skip_not_weight; continue; }
+                // HSDR now accepts any rank ≥ 2 (flattens dims[1..] into cols).
+                // Rank < 2 (norms, biases, scalar metadata) is genuinely
+                // unsuitable.
                 if (!s.tensor_metadata.has_value() ||
-                    s.tensor_metadata.value().dimensions.size() != 2) {
+                    s.tensor_metadata.value().dimensions.size() < 2) {
                     ++skip_not_2d;
                     if (sample_not_2d.size() < SAMPLE_CAP) sample_not_2d.push_back(name);
                     continue;
@@ -731,7 +849,7 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
             std::cout << "  skipped " << skipped.size() << " segments:\n";
             std::cout << "    " << skip_not_weight << " not a weight tensor\n";
             std::cout << "    " << skip_not_2d
-                      << " not 2-D (norms, biases, etc.)\n";
+                      << " rank < 2 (1-D norms / biases / scalars)\n";
             for (const auto& n : sample_not_2d) std::cout << "      e.g. " << n << "\n";
             std::cout << "    " << skip_unsupported_dtype
                       << " unsupported dtype (f32/f16/bf16/i8/q4_0/q8_0/q4_k/q5_k/q6_k supported)\n";

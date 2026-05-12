@@ -31,6 +31,10 @@
 
 namespace CortexAICompression {
 
+// Forward declaration so member functions defined before the helper itself
+// can still call it. Definition (inline) lives further down in this file.
+std::pair<size_t, size_t> effective2DShape_impl(const std::vector<size_t>& dims);
+
 namespace {
 
 // --------------------------------------------------------------------------
@@ -1023,11 +1027,19 @@ HierarchicalSDRConfig HierarchicalSDRStrategy::configFor(const ModelSegment& seg
     // each shape is grouped/encoded against a dictionary sized to its real
     // input dim. Segments with different C end up in different buckets in
     // compressGroupedSegments — exactly what we want.
+    //
+    // For N-D tensors (e.g. ONNX conv weights of shape (O, I, kH, kW)), we
+    // flatten to 2-D by treating dims[0] as rows and the product of remaining
+    // dims as columns. This keeps each output channel as a single tile.
     auto adjustRowWidth = [&](HierarchicalSDRConfig cfg) -> HierarchicalSDRConfig {
         if (cfg.tile_rows == 1 && segment.tensor_metadata.has_value()) {
             const auto& dims = segment.tensor_metadata.value().dimensions;
-            if (dims.size() == 2 && dims[1] > 0 && dims[1] <= 0xFFFFu) {
-                cfg.tile_cols = static_cast<uint16_t>(dims[1]);
+            if (dims.size() >= 2) {
+                size_t C = 1;
+                for (size_t i = 1; i < dims.size(); ++i) C *= dims[i];
+                if (C > 0 && C <= 0xFFFFu) {
+                    cfg.tile_cols = static_cast<uint16_t>(C);
+                }
             }
         }
         return cfg;
@@ -1067,18 +1079,29 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
 
     // Dequantise to FP32. Throws CompressionError for unsupported dtypes
     // (the strategy chain in AICompressor then falls through to the next
-    // priority — typically QuantizedTensorStrategy or Gzip).
-    std::vector<float> fp32_view = dequantizeSegmentToFP32(segment);
+    // priority — typically QuantizedTensorStrategy or Gzip). std::bad_alloc
+    // can fire on very large tensors (e.g. 150k-vocab embeddings →  2+ GB
+    // FP32); we translate it to CompressionError so the chain falls through
+    // gracefully instead of aborting the whole archive.
+    std::vector<float> fp32_view;
+    try {
+        fp32_view = dequantizeSegmentToFP32(segment);
+    } catch (const std::bad_alloc&) {
+        throw CompressionError("HSDR: segment '" + segment.name
+            + "' dequant exhausted memory (likely an embedding-scale tensor); "
+              "deferring to lossless fallback");
+    }
     const size_t num_elements = fp32_view.size();
 
-    // Need a 2-D shape; pull from tensor metadata.
+    // Pull dimensions; flatten rank ≥ 2 to a 2-D (rows, cols) view.
     if (!segment.tensor_metadata.has_value() ||
-        segment.tensor_metadata.value().dimensions.size() != 2) {
-        throw CompressionError("HSDR: tensor_metadata.dimensions must be 2-D (rows, cols)");
+        segment.tensor_metadata.value().dimensions.size() < 2) {
+        throw CompressionError("HSDR: tensor_metadata.dimensions must have rank ≥ 2");
     }
     const auto& dims = segment.tensor_metadata.value().dimensions;
-    const uint32_t R = static_cast<uint32_t>(dims[0]);
-    const uint32_t C = static_cast<uint32_t>(dims[1]);
+    const auto rc = effective2DShape_impl(dims);
+    const uint32_t R = static_cast<uint32_t>(rc.first);
+    const uint32_t C = static_cast<uint32_t>(rc.second);
     if (static_cast<size_t>(R) * C != num_elements) {
         throw CompressionError("HSDR: tensor_metadata dims don't match data size");
     }
@@ -1423,12 +1446,13 @@ std::vector<std::byte> HierarchicalSDRStrategy::compressWithExternalDictionary(
         throw CompressionError("compressWithExternalDictionary: weight tensor required");
     }
     if (!segment.tensor_metadata.has_value()
-        || segment.tensor_metadata.value().dimensions.size() != 2) {
-        throw CompressionError("compressWithExternalDictionary: 2-D tensor_metadata required");
+        || segment.tensor_metadata.value().dimensions.size() < 2) {
+        throw CompressionError("compressWithExternalDictionary: rank-<2 tensor not supported");
     }
     const auto& dims = segment.tensor_metadata.value().dimensions;
-    const uint32_t R = static_cast<uint32_t>(dims[0]);
-    const uint32_t C = static_cast<uint32_t>(dims[1]);
+    const auto rc = effective2DShape_impl(dims);
+    const uint32_t R = static_cast<uint32_t>(rc.first);
+    const uint32_t C = static_cast<uint32_t>(rc.second);
     // Dequantise to FP32 if needed; delegate to the FP32 variant.
     std::vector<float> fp32_view = dequantizeSegmentToFP32(segment);
     if (fp32_view.size() != static_cast<size_t>(R) * C) {
@@ -1889,6 +1913,13 @@ bool segmentDtypeSupported(const ModelSegment& seg) {
         || fmt == "q4_k" || fmt == "q5_k" || fmt == "q6_k";
 }
 
+inline std::pair<size_t, size_t> effective2DShape(const std::vector<size_t>& dims) {
+    if (dims.size() < 2) return {0, 0};
+    size_t cols = 1;
+    for (size_t i = 1; i < dims.size(); ++i) cols *= dims[i];
+    return {dims[0], cols};
+}
+
 bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
                      std::string* reason = nullptr) {
     if (!seg.isWeightTensor()) {
@@ -1896,8 +1927,8 @@ bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
         return false;
     }
     if (!seg.tensor_metadata.has_value() ||
-        seg.tensor_metadata.value().dimensions.size() != 2) {
-        if (reason) *reason = "missing 2-D tensor_metadata";
+        seg.tensor_metadata.value().dimensions.size() < 2) {
+        if (reason) *reason = "missing tensor_metadata or rank < 2";
         return false;
     }
     if (!segmentDtypeSupported(seg)) {
@@ -1905,8 +1936,11 @@ bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
         return false;
     }
     const auto& dims = seg.tensor_metadata.value().dimensions;
-    const size_t R = dims[0];
-    const size_t C = dims[1];
+    const auto [R, C] = effective2DShape(dims);
+    if (R == 0 || C == 0) {
+        if (reason) *reason = "zero-sized effective 2-D shape";
+        return false;
+    }
     // Each supported dtype has a fixed byte-per-element width. The dequant
     // helper does precise validation; here we just want to catch obviously
     // mismatched shapes without doing the full conversion.
@@ -1935,6 +1969,19 @@ bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
 }
 
 }  // anonymous namespace
+
+// Flatten an N-D weight to a 2-D (rows, cols) view. Rule: dims[0] becomes
+// rows; remaining dims collapse into cols. This is the conventional flatten
+// for conv weights (out_ch, in_ch, kH, kW) → (out_ch, in_ch*kH*kW). For 2-D
+// weights it's a no-op. For 1-D / 0-D it returns (0,0) — treated as
+// unsuitable upstream. Public-namespace version of the inline helper used
+// inside the anonymous namespace above.
+inline std::pair<size_t, size_t> effective2DShape_impl(const std::vector<size_t>& dims) {
+    if (dims.size() < 2) return {0, 0};
+    size_t cols = 1;
+    for (size_t i = 1; i < dims.size(); ++i) cols *= dims[i];
+    return {dims[0], cols};
+}
 
 HierarchicalSDRStrategy::SharedDictArchive
 HierarchicalSDRStrategy::compressGroupedSegments(
@@ -1983,8 +2030,9 @@ HierarchicalSDRStrategy::compressGroupedSegments(
         for (size_t idx : seg_indices) {
             const auto& s = segments[idx];
             const auto& dims = s.tensor_metadata.value().dimensions;
-            const uint64_t R = static_cast<uint64_t>(dims[0]);
-            const uint64_t C = static_cast<uint64_t>(dims[1]);
+            const auto rc = effective2DShape_impl(dims);
+            const uint64_t R = static_cast<uint64_t>(rc.first);
+            const uint64_t C = static_cast<uint64_t>(rc.second);
             total_tiles_64 += (R / cfg.tile_rows) * (C / cfg.tile_cols);
         }
         const uint32_t pooled_count = (total_tiles_64 > 0xFFFFFFFFu)
@@ -2022,8 +2070,9 @@ HierarchicalSDRStrategy::compressGroupedSegments(
         for (size_t idx : seg_indices) {
             const auto& s = segments[idx];
             const auto& dims = s.tensor_metadata.value().dimensions;
-            const uint32_t R = static_cast<uint32_t>(dims[0]);
-            const uint32_t C = static_cast<uint32_t>(dims[1]);
+            const auto rc = effective2DShape_impl(dims);
+            const uint32_t R = static_cast<uint32_t>(rc.first);
+            const uint32_t C = static_cast<uint32_t>(rc.second);
 
             // For 1D row-tile mode (tile_rows == 1, tile_cols == C) the segment's
             // FP32 view is already laid out as (R) tiles of width C — no second
@@ -2188,8 +2237,9 @@ HierarchicalSDRStrategy::compressGroupedSegments(
             entry.dict_index = dict_index;
             try {
                 const auto& dims = s.tensor_metadata.value().dimensions;
-                const uint32_t R = static_cast<uint32_t>(dims[0]);
-                const uint32_t C = static_cast<uint32_t>(dims[1]);
+                const auto rc = effective2DShape_impl(dims);
+                const uint32_t R = static_cast<uint32_t>(rc.first);
+                const uint32_t C = static_cast<uint32_t>(rc.second);
                 if (!cached_fp32[ki].empty()) {
                     entry.codes_bytes = compressFP32WithExternalDictionary(
                         cached_fp32[ki].data(), R, C, dict_ref, s.type, s.name);
@@ -2209,11 +2259,13 @@ HierarchicalSDRStrategy::compressGroupedSegments(
             // original_size is the FP32 reconstruction byte size, NOT the
             // on-disk source size. The decompressor reconstructs into FP32
             // and validates against this field. Source dtype is preserved
-            // separately in original_type for ratio reporting.
+            // separately in original_type for ratio reporting. For N-D
+            // tensors we use the product of all dimensions (the bytes are
+            // the same; only the logical shape is flattened for tiling).
             const auto& dims = s.tensor_metadata.value().dimensions;
-            entry.original_size = static_cast<size_t>(dims[0])
-                                * static_cast<size_t>(dims[1])
-                                * sizeof(float);
+            size_t elem_count = 1;
+            for (size_t d : dims) elem_count *= d;
+            entry.original_size = elem_count * sizeof(float);
             entry.original_type = s.type;
             archive.segments.push_back(std::move(entry));
         }

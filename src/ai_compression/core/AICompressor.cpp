@@ -179,6 +179,17 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
                               << ". Trying next strategy..." << std::endl;
                     std::cerr << "  Segment diagnostics: " << segmentDiagnostics(segment) << std::endl;
                     // Continue to the next strategy in the list
+                } catch (const std::bad_alloc&) {
+                    // Treat OOM like a CompressionError: the strategy can't
+                    // handle this segment at its current size, so we fall
+                    // through to the next priority (Gzip is usually safe
+                    // because it doesn't dequantise). Without this, a
+                    // single 2 GB embedding bad_alloc aborts the whole
+                    // archive — happens routinely on 7B-scale models.
+                    std::cerr << "Warning: Compression OOM for segment '" << segment.name
+                              << "' with strategy ID " << static_cast<int>(stratInfo.id)
+                              << " (Priority: " << stratInfo.priority
+                              << "). Trying next strategy..." << std::endl;
                 }
             }
         }

@@ -52,6 +52,7 @@
 #include "strategies/NumericalRLE.hpp"
 #include "strategies/QuantizedTensorStrategy.hpp"
 #include "strategies/HierarchicalSDRStrategy.hpp"
+#include "strategies/DequantToFP32Strategy.hpp"
 #include "strategies/SDRIndexStorage.hpp"
 
 #ifdef ENABLE_ONNX_PROTOBUF
@@ -739,6 +740,8 @@ SDRModelLoader::SDRModelLoader(const std::string& archive_path) : archive_path_(
     decompressor_->registerStrategy(GZIP_STRATEGY_ID, std::make_shared<GzipStrategy>());
     decompressor_->registerStrategy(QUANT_STRATEGY_ID, std::make_shared<QuantizedTensorStrategy>());
     decompressor_->registerStrategy(HSDR_STRATEGY_ID, std::make_shared<HierarchicalSDRStrategy>());
+    constexpr uint8_t DEQUANT_FP32_STRATEGY_ID = 6;  // matches CLI -h registration
+    decompressor_->registerStrategy(DEQUANT_FP32_STRATEGY_ID, std::make_shared<DequantToFP32Strategy>());
 
     // Legacy compatibility support
     auto legacySdrStrategy = std::make_shared<SDRIndexStorageStrategy>();

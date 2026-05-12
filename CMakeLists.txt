@@ -71,6 +71,7 @@ set(COMMON_SOURCES
     src/ai_compression/strategies/AdaptiveSDRStrategy.cpp
     src/ai_compression/strategies/QuantizedTensorStrategy.cpp
     src/ai_compression/strategies/HierarchicalSDRStrategy.cpp
+    src/ai_compression/strategies/DequantToFP32Strategy.cpp
     src/ai_compression/streaming/StreamingCompressor.cpp
     src/ai_compression/parsers/GGUFModelParser.cpp
     src/ai_compression/parsers/ONNXModelParser.cpp
