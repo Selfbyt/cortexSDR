@@ -569,6 +569,21 @@ add_executable(test_hsdr_roundtrip src/test_hsdr_roundtrip.cpp)
 target_link_libraries(test_hsdr_roundtrip PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 target_compile_definitions(test_hsdr_roundtrip PRIVATE CORTEXSDR_STATIC=1)
 
+# HSDR archive end-to-end test (compress → write archive → read back → fused matmul)
+add_executable(test_hsdr_archive_e2e src/test_hsdr_archive_e2e.cpp)
+target_link_libraries(test_hsdr_archive_e2e PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_archive_e2e PRIVATE CORTEXSDR_STATIC=1)
+
+# HSDR shared-dictionary test (cross-layer dict, encode + decode + fused matmul)
+add_executable(test_hsdr_shared_dict src/test_hsdr_shared_dict.cpp)
+target_link_libraries(test_hsdr_shared_dict PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_shared_dict PRIVATE CORTEXSDR_STATIC=1)
+
+# HSDR protection-policy test (hybrid FP16 orchestration, boundary-MLP rule)
+add_executable(test_hsdr_protection src/test_hsdr_protection.cpp)
+target_link_libraries(test_hsdr_protection PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_protection PRIVATE CORTEXSDR_STATIC=1)
+
 # SDR Size Analyzer Tool
 add_executable(analyze_sdr_size analyze_sdr_size.cpp)
 # No dependencies needed - standalone tool

@@ -169,6 +169,12 @@ int main() {
     run_case("1D row-tile mode", SegmentType::ATTENTION_WEIGHTS,
              64, 256, 0xDEFACED, row1d);
 
+    // Edge case: shape not divisible by tile size. Exercises the edge-strip
+    // serialisation that V2 of the wire format added.
+    // 290 = 9 * 32 + 2 (edge rows), 257 = 8 * 32 + 1 (edge col).
+    run_case("2D tiles with non-aligned shape (edges)", SegmentType::ATTENTION_WEIGHTS,
+             290, 257, 0xEDF0001, tiny);
+
     // ----------------------------------------------------------------------
     // Fused matmul: verify Y_fused (W·x without materialising W) matches
     // Y_dense (W·x from decompressed W) and report rough speed comparison.

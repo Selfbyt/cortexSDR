@@ -25,6 +25,9 @@
 #include "CompressionStrategy.hpp"
 #include "../core/ModelSegment.hpp"
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace CortexAICompression {
@@ -99,12 +102,22 @@ struct HierarchicalSDRConfig {
  */
 class HierarchicalSDRStrategy : public ICompressionStrategy {
 public:
+    /// Returns true if the segment should be PROTECTED (HSDR refuses to compress
+    /// it, strategy chain falls through to the next-priority strategy such as
+    /// Quant or Gzip — typically lossless FP16/FP32 storage). Used to implement
+    /// the C.2 / D.1 finding that boundary-layer MLPs must stay lossless.
+    using ProtectionPredicate = std::function<bool(const ModelSegment&)>;
+
     explicit HierarchicalSDRStrategy(const HierarchicalSDRConfig& attn_default = {})
         : attn_default_(attn_default), mlp_default_(HierarchicalSDRConfig::forMLP()) {}
 
     HierarchicalSDRStrategy(const HierarchicalSDRConfig& attn_default,
                             const HierarchicalSDRConfig& mlp_default)
         : attn_default_(attn_default), mlp_default_(mlp_default) {}
+
+    /// Install a predicate that decides which segments to skip (force fallback).
+    /// Pass an empty std::function to disable.
+    void setProtectionPredicate(ProtectionPredicate pred) { protection_ = std::move(pred); }
 
     std::vector<std::byte> compress(const ModelSegment& segment) const override;
 
@@ -132,13 +145,102 @@ public:
                                       const float* x,
                                       size_t batch) const;
 
+    // ---------------------------------------------------------------------
+    // Shared-dictionary mode (cross-layer / cross-role sharing).
+    //
+    // Building blocks for a multi-pass compression pipeline that fits one
+    // dictionary on tiles drawn from many weight tensors, then encodes each
+    // tensor's codes against that single shared dictionary. Amortises the
+    // dictionary cost across all participating tensors — at Llama-scale this
+    // is where the storage ratio actually wins.
+    // ---------------------------------------------------------------------
+
+    /// Shared dictionary trained across multiple sources.
+    struct SharedDictionary {
+        HierarchicalSDRConfig config; ///< (tile_rows, tile_cols, n_atoms, n_stages, k_per_stage)
+        std::vector<float>    atoms;   ///< (n_atoms × tile_rows*tile_cols) row-major
+        std::vector<float>    stage_scales; ///< n_stages entries
+    };
+
+    /**
+     * @brief Fit a shared dictionary from tile data pooled across many tensors.
+     *
+     * Caller stacks tiles from all participating tensors into one big
+     * (n_total_tiles × tile_dim) array and passes it in. The result is the
+     * dictionary + stage scales matching `cfg`; encode() / matmul() against
+     * this dictionary works for any tensor whose tile geometry matches `cfg`.
+     */
+    SharedDictionary fitSharedDictionary(const std::vector<float>& pooled_tiles,
+                                         uint32_t n_total_tiles,
+                                         const HierarchicalSDRConfig& cfg) const;
+
+    /**
+     * @brief Encode a single segment's tiles against a pre-fit shared dictionary.
+     *
+     * Output bytes contain only the per-tile (index, sign) codes plus a small
+     * header — the dictionary is NOT embedded. Pair with a separately-stored
+     * SharedDictionary to decode.
+     */
+    std::vector<std::byte> compressWithExternalDictionary(
+        const ModelSegment& segment, const SharedDictionary& dict) const;
+
+    /**
+     * @brief Decompress a codes-only stream using an external shared dictionary.
+     *
+     * Output is the FP32 weight matrix bytes, identical in layout to what
+     * decompress() returns for a per-tensor encoding.
+     */
+    std::vector<std::byte> decompressWithExternalDictionary(
+        const std::vector<std::byte>& codes_bytes,
+        const SharedDictionary& dict,
+        size_t originalSize) const;
+
+    /**
+     * @brief Fused matmul using a codes-only stream + external shared dictionary.
+     *
+     * Same speedup characteristics as matmulRowMajor() — requires 1D row tiles.
+     */
+    std::vector<float> matmulWithExternalDictionary(
+        const std::vector<std::byte>& codes_bytes,
+        const SharedDictionary& dict,
+        const float* x,
+        size_t batch) const;
+
 private:
     HierarchicalSDRConfig attn_default_;
     HierarchicalSDRConfig mlp_default_;
+    ProtectionPredicate   protection_;
 
     /** Pick attn vs mlp config from segment role / type. */
     HierarchicalSDRConfig configFor(const ModelSegment& segment) const;
 };
+
+// --------------------------------------------------------------------------
+// Helper factories for common protection policies.
+// --------------------------------------------------------------------------
+namespace ProtectionPolicies {
+
+/**
+ * @brief Protect MLP segments in the first and last `n_boundary` decoder layers.
+ *
+ * Encodes the C.2 Regime F finding: V4b'ing early-decoder MLPs is the main
+ * source of super-linear perplexity compounding (Exp D.1). The C.2 sample
+ * (5 sampled depths) showed best results at n_boundary in {2, 3} for TinyLlama.
+ *
+ * Reads `segment.layer_index` to identify decoder depth and `segment.type`
+ * to detect MLP roles (FEED_FORWARD_WEIGHTS or names containing mlp/ffn).
+ */
+HierarchicalSDRStrategy::ProtectionPredicate boundaryMLPs(
+    size_t n_boundary, size_t total_layers);
+
+/**
+ * @brief Protect any segment whose `name` appears in the supplied set.
+ *        Useful for one-off overrides (e.g. embeddings, lm_head).
+ */
+HierarchicalSDRStrategy::ProtectionPredicate byName(
+    std::unordered_set<std::string> names);
+
+}  // namespace ProtectionPolicies
 
 } // namespace CortexAICompression
 

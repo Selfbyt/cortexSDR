@@ -27,7 +27,7 @@ namespace {
 // Kept packed and explicit so the byte stream is parser-friendly across
 // platforms; field order MUST match the writer and reader.
 constexpr char kHSDRMagic[4] = {'H', 'S', 'D', 'R'};
-constexpr uint32_t kHSDRVersion = 1;
+constexpr uint32_t kHSDRVersion = 2;  // v2 adds edge_bytes_count for non-aligned shapes
 
 #pragma pack(push, 1)
 struct HSDRHeader {
@@ -42,10 +42,17 @@ struct HSDRHeader {
     uint8_t  n_stages;
     uint8_t  active_bits_per_stage;
     float    stage_decay;
+    uint32_t edge_bytes_count;  // v2: FP32 bytes for the un-tileable edge strips (0 if aligned)
 };
 #pragma pack(pop)
-static_assert(sizeof(HSDRHeader) == 4 + 4 + 4 + 4 + 4 + 2 + 2 + 2 + 1 + 1 + 4,
+static_assert(sizeof(HSDRHeader) == 4 + 4 + 4 + 4 + 4 + 2 + 2 + 2 + 1 + 1 + 4 + 4,
               "HSDRHeader size mismatch — packing broken");
+
+// Edge-strip layout (when the tensor isn't a clean multiple of (tile_rows, tile_cols)):
+//   • top-right strip:  rows [0..R_full),    cols [C_full..C),  row-major FP32
+//   • bottom strip:     rows [R_full..R),    cols [0..C),       row-major FP32
+//   total edge bytes = R_full*(C-C_full)*4 + (R-R_full)*C*4
+// Both strips are stored verbatim. V4b only sees the aligned (R_full × C_full) block.
 
 // Pack (atom_index, sign) into one uint16: high bit = sign (0=+, 1=-), low 15 bits = index.
 // Supports K up to 32767; our designs use 256-512 so plenty of headroom.
@@ -399,6 +406,48 @@ void readBuffer(const std::byte*& cursor, const std::byte* end, T* out, size_t c
     cursor += bytes;
 }
 
+// --------------------------------------------------------------------------
+// Codes-only stream header — used by the shared-dictionary path. The
+// dictionary is stored externally so it's not embedded here, but everything
+// else (shape, tile geometry, stage scales, packed codes) is.
+// --------------------------------------------------------------------------
+constexpr char kHSDRCodesMagic[4] = {'H', 'S', 'D', 'C'};
+constexpr uint32_t kHSDRCodesVersion = 1;
+
+#pragma pack(push, 1)
+struct HSDRCodesHeader {
+    char     magic[4];
+    uint32_t version;
+    uint32_t original_rows;
+    uint32_t original_cols;
+    uint32_t n_tiles;
+    uint16_t tile_rows;
+    uint16_t tile_cols;
+    uint16_t n_atoms;          // dictionary size (must match external dict)
+    uint8_t  n_stages;
+    uint8_t  active_bits_per_stage;
+    float    stage_decay;
+};
+#pragma pack(pop)
+
+/// Drive the encode step (greedy MP) for a whole tensor against an external
+/// dictionary. Used by both `compressWithExternalDictionary` (single-tile-row
+/// encoding) and as a helper for full segment encoding.
+void encodeAllTilesAgainstDictionary(const float* tiles, uint32_t n_tiles, uint32_t C,
+                                     const float* D, uint16_t K,
+                                     uint8_t n_stages, uint8_t k_per_stage,
+                                     const float* stage_scales,
+                                     uint16_t* indices_out, int8_t* signs_out) {
+    const uint32_t slots_per_tile = static_cast<uint32_t>(n_stages) * k_per_stage;
+    for (uint32_t i = 0; i < n_tiles; ++i) {
+        const float* tile = tiles + static_cast<size_t>(i) * C;
+        uint16_t* idx_dst = indices_out + static_cast<size_t>(i) * slots_per_tile;
+        int8_t*   sgn_dst = signs_out   + static_cast<size_t>(i) * slots_per_tile;
+        hierarchicalBinaryCode(tile, D, K, C, n_stages, k_per_stage,
+                                stage_scales, idx_dst, sgn_dst);
+    }
+}
+
 } // anonymous namespace
 
 // --------------------------------------------------------------------------
@@ -429,6 +478,13 @@ HierarchicalSDRConfig HierarchicalSDRStrategy::configFor(const ModelSegment& seg
 std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& segment) const {
     if (!segment.isWeightTensor()) {
         throw CompressionError("HierarchicalSDRStrategy: only weight tensors are supported");
+    }
+    // Hybrid FP16 protection (followup #4): a configurable predicate can mark
+    // certain segments as "protected" — HSDR throws here, the AICompressor
+    // chain then falls through to the next-priority strategy (Quant/Gzip).
+    if (protection_ && protection_(segment)) {
+        throw CompressionError("HSDR: segment '" + segment.name +
+                               "' is protected; deferring to lossless fallback");
     }
 
     // Only FP32 input. Other dtypes fall through to the lower-priority strategy.
@@ -463,22 +519,39 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
     }
 
     const HierarchicalSDRConfig cfg = configFor(segment);
-    if (R % cfg.tile_rows != 0 || C % cfg.tile_cols != 0) {
-        throw CompressionError("HSDR: tensor shape not divisible by tile size "
-                               "(edge handling not implemented yet)");
+    const uint32_t R_full = (R / cfg.tile_rows) * cfg.tile_rows;
+    const uint32_t C_full = (C / cfg.tile_cols) * cfg.tile_cols;
+    if (R_full == 0 || C_full == 0) {
+        throw CompressionError("HSDR: tensor too small to hold even one full tile");
     }
-    const uint32_t n_row_tiles = R / cfg.tile_rows;
-    const uint32_t n_col_tiles = C / cfg.tile_cols;
+    const uint32_t n_row_tiles = R_full / cfg.tile_rows;
+    const uint32_t n_col_tiles = C_full / cfg.tile_cols;
     const uint32_t n_tiles = n_row_tiles * n_col_tiles;
     const uint32_t tile_dim = cfg.tileSize();
     if (n_tiles < cfg.n_atoms) {
         throw CompressionError("HSDR: not enough tiles to fit the requested dictionary size");
     }
 
-    // Extract tiles into a contiguous (n_tiles, tile_dim) array.
     const float* weight = reinterpret_cast<const float*>(segment.data.data());
+
+    // Slice out the aligned (R_full × C_full) top-left block into a contiguous
+    // buffer so extractTiles' stride matches. Edge strips outside this block
+    // get stored as raw FP32 after the packed codes (see header comment).
+    std::vector<float> aligned;
+    aligned.reserve(static_cast<size_t>(R_full) * C_full);
+    if (R_full == R && C_full == C) {
+        aligned.assign(weight, weight + static_cast<size_t>(R) * C);
+    } else {
+        aligned.resize(static_cast<size_t>(R_full) * C_full);
+        for (uint32_t r = 0; r < R_full; ++r) {
+            std::memcpy(aligned.data() + static_cast<size_t>(r) * C_full,
+                        weight + static_cast<size_t>(r) * C,
+                        sizeof(float) * C_full);
+        }
+    }
     uint32_t n_tiles_check = 0;
-    std::vector<float> tiles = extractTiles(weight, R, C, cfg.tile_rows, cfg.tile_cols, n_tiles_check);
+    std::vector<float> tiles = extractTiles(aligned.data(), R_full, C_full,
+                                             cfg.tile_rows, cfg.tile_cols, n_tiles_check);
     if (n_tiles_check != n_tiles) {
         throw CompressionError("HSDR: internal tile-count mismatch");
     }
@@ -488,6 +561,23 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
     std::vector<uint16_t> indices;
     std::vector<int8_t>   signs;
     fitHierarchicalKSVD(tiles.data(), n_tiles, tile_dim, cfg, D, indices, signs, stage_scales);
+
+    // Build edge-strip bytes (top-right + bottom). 0 bytes if shape is aligned.
+    std::vector<float> edge_buffer;
+    const uint32_t top_right_floats = R_full * (C - C_full);
+    const uint32_t bottom_floats    = (R - R_full) * C;
+    edge_buffer.reserve(static_cast<size_t>(top_right_floats) + bottom_floats);
+    for (uint32_t r = 0; r < R_full; ++r) {
+        for (uint32_t c = C_full; c < C; ++c) {
+            edge_buffer.push_back(weight[static_cast<size_t>(r) * C + c]);
+        }
+    }
+    for (uint32_t r = R_full; r < R; ++r) {
+        for (uint32_t c = 0; c < C; ++c) {
+            edge_buffer.push_back(weight[static_cast<size_t>(r) * C + c]);
+        }
+    }
+    const uint32_t edge_bytes_count = static_cast<uint32_t>(edge_buffer.size() * sizeof(float));
 
     // Serialize.
     HSDRHeader header{};
@@ -502,6 +592,7 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
     header.n_stages = cfg.n_stages;
     header.active_bits_per_stage = cfg.active_bits_per_stage;
     header.stage_decay = cfg.stage_decay;
+    header.edge_bytes_count = edge_bytes_count;
 
     const uint32_t slots_per_tile = static_cast<uint32_t>(cfg.n_stages) * cfg.active_bits_per_stage;
     const size_t packed_codes = static_cast<size_t>(n_tiles) * slots_per_tile;
@@ -510,7 +601,8 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
     out.reserve(sizeof(HSDRHeader)
                 + sizeof(float) * stage_scales.size()
                 + sizeof(float) * D.size()
-                + sizeof(uint16_t) * packed_codes);
+                + sizeof(uint16_t) * packed_codes
+                + edge_bytes_count);
 
     appendPOD(out, header);
     appendBuffer(out, stage_scales.data(), stage_scales.size());
@@ -522,6 +614,10 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
         packed[i] = packIndexSign(indices[i], signs[i]);
     }
     appendBuffer(out, packed.data(), packed.size());
+
+    if (edge_bytes_count > 0) {
+        appendBuffer(out, edge_buffer.data(), edge_buffer.size());
+    }
 
     return out;
 }
@@ -650,6 +746,8 @@ std::vector<std::byte> HierarchicalSDRStrategy::decompress(
     const uint32_t n_tiles = header.n_tiles;
     const uint32_t tile_dim = static_cast<uint32_t>(header.tile_rows) * header.tile_cols;
     const uint32_t slots_per_tile = static_cast<uint32_t>(S) * k;
+    const uint32_t R_full = (R / header.tile_rows) * header.tile_rows;
+    const uint32_t C_full = (C / header.tile_cols) * header.tile_cols;
 
     if (static_cast<size_t>(R) * C * sizeof(float) != originalSize) {
         throw CompressionError("HSDR decompress: originalSize does not match shape");
@@ -664,8 +762,12 @@ std::vector<std::byte> HierarchicalSDRStrategy::decompress(
     std::vector<uint16_t> packed(static_cast<size_t>(n_tiles) * slots_per_tile);
     readBuffer(cursor, end, packed.data(), packed.size());
 
+    // Read edge strips (v2). 0 bytes if shape was aligned.
+    std::vector<float> edge_buffer(header.edge_bytes_count / sizeof(float));
+    if (header.edge_bytes_count > 0) {
+        readBuffer(cursor, end, edge_buffer.data(), edge_buffer.size());
+    }
     if (cursor != end) {
-        // Not fatal — just diagnostic.
         std::cerr << "[HSDR] decompress: " << (end - cursor) << " trailing bytes ignored\n";
     }
 
@@ -676,15 +778,296 @@ std::vector<std::byte> HierarchicalSDRStrategy::decompress(
         unpackIndexSign(packed[i], indices[i], signs[i]);
     }
 
-    // Decode all tiles, then reassemble into the original matrix.
+    // V4b-decode the aligned (R_full × C_full) block.
     std::vector<float> recon_tiles(static_cast<size_t>(n_tiles) * tile_dim);
     decodeAllTiles(D.data(), K, tile_dim, indices.data(), signs.data(),
                    n_tiles, S, k, stage_scales.data(), recon_tiles.data());
 
     std::vector<std::byte> out(originalSize);
     float* out_f = reinterpret_cast<float*>(out.data());
-    reassembleTiles(recon_tiles.data(), R, C, header.tile_rows, header.tile_cols, out_f);
+
+    if (R_full == R && C_full == C) {
+        // Fast path: aligned, no edge strips.
+        reassembleTiles(recon_tiles.data(), R, C, header.tile_rows, header.tile_cols, out_f);
+    } else {
+        // Reassemble the aligned block into a contiguous buffer then splice into
+        // the output, with the edge strips copied back into their original
+        // positions (top-right + bottom).
+        std::vector<float> aligned_block(static_cast<size_t>(R_full) * C_full);
+        reassembleTiles(recon_tiles.data(), R_full, C_full,
+                        header.tile_rows, header.tile_cols, aligned_block.data());
+        // Top-left aligned region
+        for (uint32_t r = 0; r < R_full; ++r) {
+            std::memcpy(out_f + static_cast<size_t>(r) * C,
+                        aligned_block.data() + static_cast<size_t>(r) * C_full,
+                        sizeof(float) * C_full);
+        }
+        // Top-right edge: rows [0..R_full), cols [C_full..C)
+        size_t edge_cursor = 0;
+        for (uint32_t r = 0; r < R_full; ++r) {
+            for (uint32_t c = C_full; c < C; ++c) {
+                out_f[static_cast<size_t>(r) * C + c] = edge_buffer[edge_cursor++];
+            }
+        }
+        // Bottom edge: rows [R_full..R), cols [0..C)
+        for (uint32_t r = R_full; r < R; ++r) {
+            for (uint32_t c = 0; c < C; ++c) {
+                out_f[static_cast<size_t>(r) * C + c] = edge_buffer[edge_cursor++];
+            }
+        }
+    }
     return out;
 }
+
+// --------------------------------------------------------------------------
+// Shared-dictionary path implementations.
+// --------------------------------------------------------------------------
+
+HierarchicalSDRStrategy::SharedDictionary
+HierarchicalSDRStrategy::fitSharedDictionary(
+    const std::vector<float>& pooled_tiles, uint32_t n_total_tiles,
+    const HierarchicalSDRConfig& cfg) const
+{
+    const uint32_t tile_dim = cfg.tileSize();
+    if (pooled_tiles.size() != static_cast<size_t>(n_total_tiles) * tile_dim) {
+        throw CompressionError("fitSharedDictionary: pooled tile size mismatch");
+    }
+    if (n_total_tiles < cfg.n_atoms) {
+        throw CompressionError("fitSharedDictionary: pooled tile count below n_atoms");
+    }
+
+    SharedDictionary shared;
+    shared.config = cfg;
+
+    // Reuse the same fitter — it doesn't care that tiles came from many tensors.
+    std::vector<uint16_t> indices_throwaway;
+    std::vector<int8_t>   signs_throwaway;
+    fitHierarchicalKSVD(pooled_tiles.data(), n_total_tiles, tile_dim, cfg,
+                        shared.atoms, indices_throwaway, signs_throwaway,
+                        shared.stage_scales);
+    return shared;
+}
+
+std::vector<std::byte> HierarchicalSDRStrategy::compressWithExternalDictionary(
+    const ModelSegment& segment, const SharedDictionary& dict) const
+{
+    if (!segment.isWeightTensor()) {
+        throw CompressionError("compressWithExternalDictionary: weight tensor required");
+    }
+    if (!segment.tensor_metadata.has_value()
+        || segment.tensor_metadata.value().dimensions.size() != 2) {
+        throw CompressionError("compressWithExternalDictionary: 2-D tensor_metadata required");
+    }
+    const auto& dims = segment.tensor_metadata.value().dimensions;
+    const uint32_t R = static_cast<uint32_t>(dims[0]);
+    const uint32_t C = static_cast<uint32_t>(dims[1]);
+    const auto& cfg = dict.config;
+    if (R % cfg.tile_rows != 0 || C % cfg.tile_cols != 0) {
+        throw CompressionError("compressWithExternalDictionary: shape not divisible by tile size");
+    }
+    const uint32_t tile_dim = cfg.tileSize();
+    if (dict.atoms.size() != static_cast<size_t>(cfg.n_atoms) * tile_dim) {
+        throw CompressionError("compressWithExternalDictionary: dictionary size doesn't match config");
+    }
+
+    uint32_t n_tiles = 0;
+    const float* weight = reinterpret_cast<const float*>(segment.data.data());
+    std::vector<float> tiles = extractTiles(weight, R, C, cfg.tile_rows, cfg.tile_cols, n_tiles);
+
+    const uint32_t slots_per_tile = static_cast<uint32_t>(cfg.n_stages) * cfg.active_bits_per_stage;
+    std::vector<uint16_t> indices(static_cast<size_t>(n_tiles) * slots_per_tile);
+    std::vector<int8_t>   signs(static_cast<size_t>(n_tiles) * slots_per_tile);
+    encodeAllTilesAgainstDictionary(tiles.data(), n_tiles, tile_dim,
+                                     dict.atoms.data(), cfg.n_atoms,
+                                     cfg.n_stages, cfg.active_bits_per_stage,
+                                     dict.stage_scales.data(),
+                                     indices.data(), signs.data());
+
+    HSDRCodesHeader header{};
+    std::memcpy(header.magic, kHSDRCodesMagic, 4);
+    header.version = kHSDRCodesVersion;
+    header.original_rows = R;
+    header.original_cols = C;
+    header.n_tiles = n_tiles;
+    header.tile_rows = cfg.tile_rows;
+    header.tile_cols = cfg.tile_cols;
+    header.n_atoms = cfg.n_atoms;
+    header.n_stages = cfg.n_stages;
+    header.active_bits_per_stage = cfg.active_bits_per_stage;
+    header.stage_decay = cfg.stage_decay;
+
+    std::vector<std::byte> out;
+    out.reserve(sizeof(header) + indices.size() * sizeof(uint16_t));
+    appendPOD(out, header);
+
+    std::vector<uint16_t> packed(indices.size());
+    for (size_t i = 0; i < indices.size(); ++i) {
+        packed[i] = packIndexSign(indices[i], signs[i]);
+    }
+    appendBuffer(out, packed.data(), packed.size());
+    return out;
+}
+
+namespace {
+/// Read a codes-only header and packed codes, validate against the supplied
+/// external dictionary. Returns (header, unpacked indices, unpacked signs).
+struct CodesStreamView {
+    HSDRCodesHeader header;
+    std::vector<uint16_t> indices;
+    std::vector<int8_t>   signs;
+};
+
+CodesStreamView parseCodesStream(
+    const std::vector<std::byte>& codes_bytes,
+    const HierarchicalSDRStrategy::SharedDictionary& dict)
+{
+    const std::byte* cursor = codes_bytes.data();
+    const std::byte* end = cursor + codes_bytes.size();
+
+    CodesStreamView view{};
+    readPOD(cursor, end, view.header);
+    if (std::memcmp(view.header.magic, kHSDRCodesMagic, 4) != 0) {
+        throw CompressionError("HSDR shared: bad codes-stream magic");
+    }
+    if (view.header.version != kHSDRCodesVersion) {
+        throw CompressionError("HSDR shared: unsupported codes-stream version");
+    }
+    if (view.header.tile_rows != dict.config.tile_rows ||
+        view.header.tile_cols != dict.config.tile_cols ||
+        view.header.n_atoms != dict.config.n_atoms ||
+        view.header.n_stages != dict.config.n_stages ||
+        view.header.active_bits_per_stage != dict.config.active_bits_per_stage) {
+        throw CompressionError("HSDR shared: stream geometry doesn't match dictionary config");
+    }
+
+    const uint32_t slots_per_tile = static_cast<uint32_t>(view.header.n_stages)
+                                     * view.header.active_bits_per_stage;
+    const size_t total_slots = static_cast<size_t>(view.header.n_tiles) * slots_per_tile;
+    std::vector<uint16_t> packed(total_slots);
+    readBuffer(cursor, end, packed.data(), packed.size());
+
+    view.indices.assign(total_slots, 0);
+    view.signs.assign(total_slots, 0);
+    for (size_t i = 0; i < total_slots; ++i) {
+        unpackIndexSign(packed[i], view.indices[i], view.signs[i]);
+    }
+    return view;
+}
+} // anonymous namespace
+
+std::vector<std::byte> HierarchicalSDRStrategy::decompressWithExternalDictionary(
+    const std::vector<std::byte>& codes_bytes,
+    const SharedDictionary& dict,
+    size_t originalSize) const
+{
+    CodesStreamView view = parseCodesStream(codes_bytes, dict);
+    const uint32_t R = view.header.original_rows;
+    const uint32_t C = view.header.original_cols;
+    if (static_cast<size_t>(R) * C * sizeof(float) != originalSize) {
+        throw CompressionError("decompressWithExternalDictionary: originalSize mismatch");
+    }
+    const uint32_t tile_dim = static_cast<uint32_t>(view.header.tile_rows) * view.header.tile_cols;
+    const uint32_t n_tiles = view.header.n_tiles;
+
+    std::vector<float> recon_tiles(static_cast<size_t>(n_tiles) * tile_dim);
+    decodeAllTiles(dict.atoms.data(), view.header.n_atoms, tile_dim,
+                   view.indices.data(), view.signs.data(),
+                   n_tiles, view.header.n_stages, view.header.active_bits_per_stage,
+                   dict.stage_scales.data(), recon_tiles.data());
+
+    std::vector<std::byte> out(originalSize);
+    float* out_f = reinterpret_cast<float*>(out.data());
+    reassembleTiles(recon_tiles.data(), R, C, view.header.tile_rows, view.header.tile_cols, out_f);
+    return out;
+}
+
+std::vector<float> HierarchicalSDRStrategy::matmulWithExternalDictionary(
+    const std::vector<std::byte>& codes_bytes,
+    const SharedDictionary& dict,
+    const float* x,
+    size_t batch) const
+{
+    CodesStreamView view = parseCodesStream(codes_bytes, dict);
+    if (view.header.tile_rows != 1) {
+        throw CompressionError("matmulWithExternalDictionary: requires 1D row tiles");
+    }
+    if (view.header.tile_cols != view.header.original_cols) {
+        throw CompressionError("matmulWithExternalDictionary: tile_cols must == original_cols");
+    }
+    const uint32_t R = view.header.original_rows;
+    const uint32_t C = view.header.original_cols;
+    const uint16_t K = view.header.n_atoms;
+    const uint8_t  S = view.header.n_stages;
+    const uint8_t  k = view.header.active_bits_per_stage;
+    if (view.header.n_tiles != R) {
+        throw CompressionError("matmulWithExternalDictionary: tile count must equal row count");
+    }
+    const uint32_t slots_per_tile = static_cast<uint32_t>(S) * k;
+
+    // Precompute Dx[a, b] = dict.atoms[a] · x[:, b]
+    std::vector<float> Dx(static_cast<size_t>(K) * batch, 0.0f);
+    for (uint16_t a = 0; a < K; ++a) {
+        const float* atom = dict.atoms.data() + static_cast<size_t>(a) * C;
+        float* out_row = Dx.data() + static_cast<size_t>(a) * batch;
+        for (uint32_t c = 0; c < C; ++c) {
+            const float av = atom[c];
+            const float* xrow = x + static_cast<size_t>(c) * batch;
+            for (size_t b = 0; b < batch; ++b) out_row[b] += av * xrow[b];
+        }
+    }
+
+    std::vector<float> Y(static_cast<size_t>(R) * batch, 0.0f);
+    for (uint32_t r = 0; r < R; ++r) {
+        float* y_row = Y.data() + static_cast<size_t>(r) * batch;
+        for (uint8_t l = 0; l < S; ++l) {
+            const float gamma = dict.stage_scales[l];
+            for (uint8_t kk = 0; kk < k; ++kk) {
+                const size_t slot = static_cast<size_t>(r) * slots_per_tile
+                                    + static_cast<size_t>(l) * k + kk;
+                const uint16_t atom_idx = view.indices[slot];
+                const int8_t sign = view.signs[slot];
+                if (sign == 0) continue;
+                const float scale = gamma * static_cast<float>(sign);
+                const float* dx_row = Dx.data() + static_cast<size_t>(atom_idx) * batch;
+                for (size_t b = 0; b < batch; ++b) y_row[b] += scale * dx_row[b];
+            }
+        }
+    }
+    return Y;
+}
+
+// --------------------------------------------------------------------------
+// ProtectionPolicies — composable predicates for hybrid FP16 orchestration.
+// --------------------------------------------------------------------------
+namespace ProtectionPolicies {
+
+HierarchicalSDRStrategy::ProtectionPredicate boundaryMLPs(
+    size_t n_boundary, size_t total_layers)
+{
+    return [n_boundary, total_layers](const ModelSegment& seg) -> bool {
+        // Identify MLP segments. Trust SegmentType first; fall back to name.
+        bool is_mlp = (seg.type == SegmentType::FEED_FORWARD_WEIGHTS);
+        if (!is_mlp) {
+            const std::string& n = seg.name;
+            is_mlp = (n.find("mlp") != std::string::npos
+                      || n.find("ffn") != std::string::npos
+                      || n.find("feed_forward") != std::string::npos);
+        }
+        if (!is_mlp) return false;
+
+        const size_t depth = seg.layer_index;
+        const bool in_early = (depth < n_boundary);
+        const bool in_late  = (total_layers > n_boundary && depth >= total_layers - n_boundary);
+        return in_early || in_late;
+    };
+}
+
+HierarchicalSDRStrategy::ProtectionPredicate byName(std::unordered_set<std::string> names) {
+    return [names = std::move(names)](const ModelSegment& seg) -> bool {
+        return names.count(seg.name) > 0;
+    };
+}
+
+}  // namespace ProtectionPolicies
 
 } // namespace CortexAICompression

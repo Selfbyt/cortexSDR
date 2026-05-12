@@ -156,6 +156,40 @@ public:
      * @return Decompressed ModelSegment payload + metadata.
      */
     ModelSegment loadSegmentByName(const std::string& name) const;
+
+    /**
+     * @brief Load the raw compressed bytes for a segment without decompressing.
+     * @param name Exact segment name from archive index.
+     * @return Raw bytes from the archive (strategy-specific encoding, e.g. HSDR).
+     *
+     * @details Used by callers that want to operate directly on the compressed
+     * form — e.g. HSDR fused matmul that needs the dictionary + codes but never
+     * materialises the weight matrix.
+     */
+    std::vector<std::byte> loadCompressedBytesByName(const std::string& name) const;
+
+    /**
+     * @brief Look up the header (metadata only) for a named segment.
+     * @param name Exact segment name from archive index.
+     * @return Pointer to the header, or nullptr if not found. Lifetime tied to the loader.
+     */
+    const CompressedSegmentHeader* findSegmentHeader(const std::string& name) const;
+
+    /**
+     * @brief Fused HSDR matmul: Y = W·x where W is stored as an HSDR 1D row-tile segment.
+     * @param segment_name Name of the weight segment in the archive.
+     * @param x Input activation, row-major (cols × batch).
+     * @param batch Number of input columns (sequence positions, typically).
+     * @return Y of shape (segment_rows, batch), row-major.
+     *
+     * @throws std::runtime_error If the segment isn't HSDR-encoded or isn't 1D row tiles.
+     *
+     * Skips the materialisation of W entirely; per-token cost scales with the
+     * (small) precompute Dx plus per-row sparse gather.
+     */
+    std::vector<float> matmulHSDR(const std::string& segment_name,
+                                   const float* x,
+                                   size_t batch) const;
     
     /**
      * @brief Start asynchronous materialization of a single layer.

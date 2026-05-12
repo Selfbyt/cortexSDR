@@ -1049,6 +1049,44 @@ ModelSegment SDRModelLoader::loadSegmentByName(const std::string& name) const {
     return decompressor_->decompressSegment(archive_path_, *seg_it, seg_it->data_offset);
 }
 
+std::vector<std::byte> SDRModelLoader::loadCompressedBytesByName(const std::string& name) const {
+    auto seg_it = std::find_if(segments_.begin(), segments_.end(),
+        [&](const CompressedSegmentHeader& seg) {
+            return seg.name == name;
+        });
+    if (seg_it == segments_.end()) {
+        throw std::runtime_error("Segment not found: " + name);
+    }
+    return decompressor_->readCompressedBytes(archive_path_, *seg_it, seg_it->data_offset);
+}
+
+const CompressedSegmentHeader* SDRModelLoader::findSegmentHeader(const std::string& name) const {
+    auto seg_it = std::find_if(segments_.begin(), segments_.end(),
+        [&](const CompressedSegmentHeader& seg) {
+            return seg.name == name;
+        });
+    return (seg_it == segments_.end()) ? nullptr : &(*seg_it);
+}
+
+std::vector<float> SDRModelLoader::matmulHSDR(const std::string& segment_name,
+                                               const float* x,
+                                               size_t batch) const {
+    const CompressedSegmentHeader* header = findSegmentHeader(segment_name);
+    if (header == nullptr) {
+        throw std::runtime_error("matmulHSDR: segment not found: " + segment_name);
+    }
+    // Strategy ID 5 = HSDR per the compressor/loader registration table.
+    constexpr uint8_t HSDR_STRATEGY_ID = 5;
+    if (header->compression_strategy_id != HSDR_STRATEGY_ID) {
+        throw std::runtime_error("matmulHSDR: segment '" + segment_name +
+                                 "' is not HSDR-encoded (strategy_id=" +
+                                 std::to_string(header->compression_strategy_id) + ")");
+    }
+    auto raw_bytes = loadCompressedBytesByName(segment_name);
+    HierarchicalSDRStrategy strat;
+    return strat.matmulRowMajor(raw_bytes, x, batch);
+}
+
 /**
  * @brief Load a single layer by name asynchronously.
  * @param name Layer name to load.
