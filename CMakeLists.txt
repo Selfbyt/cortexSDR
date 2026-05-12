@@ -594,6 +594,11 @@ add_executable(test_hsdr_pipeline_disk src/test_hsdr_pipeline_disk.cpp)
 target_link_libraries(test_hsdr_pipeline_disk PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 target_compile_definitions(test_hsdr_pipeline_disk PRIVATE CORTEXSDR_STATIC=1)
 
+# HSDAReader end-to-end test (name-indexed lookup over .hsda)
+add_executable(test_hsda_reader src/test_hsda_reader.cpp)
+target_link_libraries(test_hsda_reader PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsda_reader PRIVATE CORTEXSDR_STATIC=1)
+
 # SDR Size Analyzer Tool
 add_executable(analyze_sdr_size analyze_sdr_size.cpp)
 # No dependencies needed - standalone tool

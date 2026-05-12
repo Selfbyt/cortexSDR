@@ -10,6 +10,9 @@
 #include <iomanip>
 #include "ai_compression/api/c_api.hpp"
 #include "ai_compression/SparseInferenceEngine.hpp"
+#include "ai_compression/strategies/HierarchicalSDRStrategy.hpp"
+#include "ai_compression/parsers/ModelParserFactory.hpp"
+#include "ai_compression/core/ModelSegment.hpp"
 #include <cstring>
 
 namespace fs = std::filesystem;
@@ -21,6 +24,8 @@ int compressMultipleFiles(const std::vector<std::string>& model_paths, const cha
 int decompressModel(const char* compressed_path, const char* output_path, float sparsity);
 int extractArchive(const char* compressed_path, const char* output_dir, float sparsity);
 int runInference(const char* archive_path, const char* input_indices_file);
+int compressModelHSDR(const char* model_path, const char* format, const char* output_hsda_path,
+                      int protect_boundary, int total_layers_hint);
 std::vector<size_t> loadInputIndices(const char* input_path);
 std::vector<std::string> findModelParts(const std::string& model_path);
 
@@ -32,6 +37,8 @@ void printUsage(const char* programName) {
     std::cout << "  " << programName << " -d <compressed_path> <output_dir> [sparsity]        (Extract bundle)\n";
     std::cout << "  " << programName << " -x <compressed_path> <output_dir> [sparsity]        (Extract archive)\n";
     std::cout << "  " << programName << " -i <archive_path> <input_indices_file>              (Inference)\n";
+    std::cout << "  " << programName << " -h <model_path> <format> <output.hsda>              (HSDR shared-dict pipeline)\n";
+    std::cout << "              [--protect-boundary N] [--total-layers M]\n";
     std::cout << "\nSupported formats:\n";
     std::cout << "  - onnx: ONNX models (direct support)\n";
     std::cout << "  - gguf: GGUF models (direct support, multi-part supported)\n";
@@ -286,6 +293,33 @@ int main(int argc, char** argv) {
             sparsity = std::stof(argv[4]);
         }
         return extractArchive(compressed_path, output_dir, sparsity);
+    } else if (mode == "-h") {
+        // HSDR shared-dictionary pipeline.
+        // Usage: -h <model_path> <format> <output.hsda>
+        //          [--protect-boundary N] [--total-layers M]
+        if (argc < 5) {
+            printUsage(argv[0]);
+            return 1;
+        }
+        const char* model_path = argv[2];
+        const char* format = argv[3];
+        const char* output_hsda_path = argv[4];
+        int protect_boundary = 0;
+        int total_layers = 0;
+        for (int i = 5; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--protect-boundary" && i + 1 < argc) {
+                protect_boundary = std::stoi(argv[i + 1]);
+                ++i;
+            } else if (arg == "--total-layers" && i + 1 < argc) {
+                total_layers = std::stoi(argv[i + 1]);
+                ++i;
+            } else {
+                std::cerr << "Warning: unknown option in -h mode: " << arg << "\n";
+            }
+        }
+        return compressModelHSDR(model_path, format, output_hsda_path,
+                                 protect_boundary, total_layers);
     } else {
         printUsage(argv[0]);
         return 1;
@@ -515,4 +549,91 @@ int runInference(const char* archive_path, const char* input_indices_file) {
         return 1;
     }
     return 0;
+}
+
+int compressModelHSDR(const char* model_path, const char* format, const char* output_hsda_path,
+                      int protect_boundary, int total_layers_hint) {
+    using namespace CortexAICompression;
+    std::cout << "HSDR shared-dictionary compression\n";
+    std::cout << "  model:  " << model_path << "  (format: " << format << ")\n";
+    std::cout << "  output: " << output_hsda_path << "\n";
+    if (protect_boundary > 0) {
+        std::cout << "  protect-boundary: " << protect_boundary
+                  << "  (total-layers hint: " << total_layers_hint << ")\n";
+    }
+
+    try {
+        // 1. Parse the model into segments.
+        auto parser = ModelParserFactory::createParserForFormat(format);
+        std::vector<ModelSegment> segments = parser->parse(model_path);
+        std::cout << "  parsed " << segments.size() << " segments\n";
+
+        // Count weight-tensor segments for stats.
+        size_t weight_count = 0, fp32_count = 0;
+        for (const auto& s : segments) {
+            if (s.isWeightTensor()) {
+                ++weight_count;
+                bool is_fp32 = (s.type == SegmentType::WEIGHTS_FP32);
+                if (!is_fp32) {
+                    std::string fmt;
+                    fmt.reserve(s.data_format.size());
+                    for (char c : s.data_format) {
+                        fmt.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                    }
+                    if (fmt == "f32" || fmt == "float32" || fmt == "fp32") is_fp32 = true;
+                }
+                if (is_fp32) ++fp32_count;
+            }
+        }
+        std::cout << "    weight tensors: " << weight_count << " (FP32: " << fp32_count << ")\n";
+
+        // 2. Build the strategy. Use the defaults from `HierarchicalSDRConfig`
+        //    for attention and MLP. Larger models will want explicit role
+        //    configs — a follow-up could expose --attn-* / --mlp-* flags.
+        HierarchicalSDRStrategy strat;
+        if (protect_boundary > 0) {
+            const size_t total = (total_layers_hint > 0)
+                                  ? static_cast<size_t>(total_layers_hint)
+                                  : 0;
+            if (total == 0) {
+                std::cerr << "  Warning: --protect-boundary requested but --total-layers not given;\n"
+                          << "           predicate will only protect layers near depth 0.\n";
+            }
+            strat.setProtectionPredicate(ProtectionPolicies::boundaryMLPs(
+                static_cast<size_t>(protect_boundary), total));
+        }
+
+        // 3. Run the multi-pass shared-dictionary pipeline.
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::string> skipped;
+        auto archive = strat.compressGroupedSegments(segments, &skipped);
+        auto t1 = std::chrono::steady_clock::now();
+        const double fit_s = std::chrono::duration<double>(t1 - t0).count();
+        std::cout << "  pipeline produced " << archive.dictionaries.size()
+                  << " dictionaries and " << archive.segments.size()
+                  << " compressed segments in " << fit_s << " s\n";
+        std::cout << "  skipped " << skipped.size() << " segments "
+                  << "(non-FP32, shape-too-small, or protected)\n";
+
+        // 4. Serialize to disk.
+        archive.writeToFile(output_hsda_path);
+        const auto archive_bytes = std::filesystem::file_size(output_hsda_path);
+        std::cout << "  wrote " << archive_bytes << " bytes to " << output_hsda_path << "\n";
+
+        // Stats: total original weight bytes vs archive bytes.
+        size_t total_weight_bytes = 0;
+        for (const auto& s : segments) {
+            if (s.isWeightTensor()) total_weight_bytes += s.data.size();
+        }
+        if (total_weight_bytes > 0) {
+            const double ratio = static_cast<double>(total_weight_bytes)
+                                 / static_cast<double>(archive_bytes);
+            std::cout << "  ratio (all-weights / archive): " << ratio << "x\n";
+        }
+        std::cout << "HSDR compression complete.\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in HSDR mode: " << e.what() << std::endl;
+        return 1;
+    }
 }

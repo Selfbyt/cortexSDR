@@ -1425,6 +1425,56 @@ HierarchicalSDRStrategy::compressGroupedSegments(
 }
 
 // --------------------------------------------------------------------------
+// HSDAReader implementation
+// --------------------------------------------------------------------------
+
+HSDAReader::HSDAReader(HierarchicalSDRStrategy::SharedDictArchive archive)
+    : archive_(std::move(archive))
+{
+    name_index_.reserve(archive_.segments.size());
+    for (size_t i = 0; i < archive_.segments.size(); ++i) {
+        name_index_[archive_.segments[i].name] = i;
+    }
+}
+
+HSDAReader HSDAReader::fromFile(const std::string& path) {
+    return HSDAReader(HierarchicalSDRStrategy::SharedDictArchive::readFromFile(path));
+}
+
+bool HSDAReader::hasSegment(const std::string& name) const {
+    return name_index_.find(name) != name_index_.end();
+}
+
+std::vector<std::byte> HSDAReader::decompress(const std::string& name) const {
+    auto it = name_index_.find(name);
+    if (it == name_index_.end()) {
+        throw std::runtime_error("HSDAReader::decompress: segment not found: " + name);
+    }
+    const auto& entry = archive_.segments[it->second];
+    if (entry.dict_index >= archive_.dictionaries.size()) {
+        throw std::runtime_error("HSDAReader::decompress: dangling dict_index for '" + name + "'");
+    }
+    const auto& dict = archive_.dictionaries[entry.dict_index];
+    return strat_.decompressWithExternalDictionary(entry.codes_bytes, dict, entry.original_size);
+}
+
+std::vector<float> HSDAReader::matmul(const std::string& name,
+                                      const float* x,
+                                      size_t batch) const
+{
+    auto it = name_index_.find(name);
+    if (it == name_index_.end()) {
+        throw std::runtime_error("HSDAReader::matmul: segment not found: " + name);
+    }
+    const auto& entry = archive_.segments[it->second];
+    if (entry.dict_index >= archive_.dictionaries.size()) {
+        throw std::runtime_error("HSDAReader::matmul: dangling dict_index for '" + name + "'");
+    }
+    const auto& dict = archive_.dictionaries[entry.dict_index];
+    return strat_.matmulWithExternalDictionary(entry.codes_bytes, dict, x, batch);
+}
+
+// --------------------------------------------------------------------------
 // ProtectionPolicies — composable predicates for hybrid FP16 orchestration.
 // --------------------------------------------------------------------------
 namespace ProtectionPolicies {

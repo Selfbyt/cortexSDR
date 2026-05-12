@@ -28,6 +28,7 @@
 #include <functional>
 #include <iosfwd>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -273,6 +274,60 @@ private:
 
     /** Pick attn vs mlp config from segment role / type. */
     HierarchicalSDRConfig configFor(const ModelSegment& segment) const;
+};
+
+// --------------------------------------------------------------------------
+// HSDAReader — name-indexed view over a SharedDictArchive.
+//
+// Wraps an in-memory SharedDictArchive (typically loaded from a .hsda file)
+// with a name → segment-index map and convenience methods for decompression
+// and fused matmul. This is the API the inference engine will use to fetch
+// weights / multiply activations without ever materialising the full FP32
+// weight matrices.
+// --------------------------------------------------------------------------
+class HSDAReader {
+public:
+    explicit HSDAReader(HierarchicalSDRStrategy::SharedDictArchive archive);
+
+    /** Convenience: load straight from a .hsda file on disk. */
+    static HSDAReader fromFile(const std::string& path);
+
+    /** Number of distinct dictionaries (one per role/group). */
+    size_t numDictionaries() const { return archive_.dictionaries.size(); }
+
+    /** Number of compressed segments addressable by name. */
+    size_t numSegments() const { return archive_.segments.size(); }
+
+    /** Underlying archive (for advanced inspection). */
+    const HierarchicalSDRStrategy::SharedDictArchive& archive() const { return archive_; }
+
+    /** True iff `name` resolves to a compressed segment. */
+    bool hasSegment(const std::string& name) const;
+
+    /**
+     * @brief Decompress a segment into FP32 bytes (row-major weight matrix).
+     * @throws std::runtime_error if `name` isn't in the archive.
+     */
+    std::vector<std::byte> decompress(const std::string& name) const;
+
+    /**
+     * @brief Fused matmul: Y = W · x for the named segment.
+     * @param x Input activation, row-major (cols × batch).
+     * @param batch Number of input columns.
+     * @return Y of shape (segment_rows, batch), row-major.
+     *
+     * @throws std::runtime_error If segment is missing or not 1D row-tile.
+     *
+     * No FP32 weight matrix is materialised; this is the speed-path.
+     */
+    std::vector<float> matmul(const std::string& name,
+                              const float* x,
+                              size_t batch) const;
+
+private:
+    HierarchicalSDRStrategy::SharedDictArchive archive_;
+    HierarchicalSDRStrategy                    strat_;  // stateless decode/matmul
+    std::unordered_map<std::string, size_t>    name_index_;
 };
 
 // --------------------------------------------------------------------------
