@@ -28,6 +28,17 @@ else()
     add_compile_options(-O3 -ffast-math)
 endif()
 
+# OpenMP — used for the per-tile encode in HSDR fit. Each tile's MP encode is
+# independent, so scattering tiles across cores gives near-linear speedup.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found — enabling parallel encode")
+    set(CORTEXSDR_OPENMP_TARGET OpenMP::OpenMP_CXX)
+else()
+    message(STATUS "OpenMP not found — falling back to single-threaded encode")
+    set(CORTEXSDR_OPENMP_TARGET "")
+endif()
+
 # Firmware specific settings
 if(BUILD_FIRMWARE)
     # Disable desktop dependencies
@@ -543,6 +554,7 @@ target_link_libraries(${PROJECT_NAME}
         ZLIB::ZLIB
         ${PROTOBUF_LINK_LIBS}
         ${EXTRA_LIBS}
+        ${CORTEXSDR_OPENMP_TARGET}
 )
 
 # CLI Tool executable removed (moved to sdr_core)
@@ -608,6 +620,43 @@ target_compile_definitions(test_hsdr_dtypes PRIVATE CORTEXSDR_STATIC=1)
 add_executable(test_inference_matmul_routing src/test_inference_matmul_routing.cpp)
 target_link_libraries(test_inference_matmul_routing PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 target_compile_definitions(test_inference_matmul_routing PRIVATE CORTEXSDR_STATIC=1)
+
+# K-quant hand-computed unit tests (Q4_K / Q5_K / Q6_K bit-layout validation)
+add_executable(test_hsdr_kquants src/test_hsdr_kquants.cpp)
+target_link_libraries(test_hsdr_kquants PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(test_hsdr_kquants PRIVATE CORTEXSDR_STATIC=1)
+
+# HSDR fit-speed benchmark (default vs --fast vs tile-cap; sanity tuning data)
+add_executable(bench_hsdr_fit_speed src/bench_hsdr_fit_speed.cpp)
+target_link_libraries(bench_hsdr_fit_speed PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(bench_hsdr_fit_speed PRIVATE CORTEXSDR_STATIC=1)
+
+# HSDA archive inspector — open .hsda, list dicts/segments, sanity matmul
+add_executable(tool_hsda_inspect src/tool_hsda_inspect.cpp)
+target_link_libraries(tool_hsda_inspect PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(tool_hsda_inspect PRIVATE CORTEXSDR_STATIC=1)
+
+# Dequant-stats tool: dumps first Q4_K block of a chosen weight to validate parser/dequant
+add_executable(tool_dequant_stats src/tool_dequant_stats.cpp)
+target_link_libraries(tool_dequant_stats PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(tool_dequant_stats PRIVATE CORTEXSDR_STATIC=1)
+
+# K-SVD per-tensor diagnostic: compress one named weight + report W stats
+add_executable(tool_ksvd_diag src/tool_ksvd_diag.cpp)
+target_link_libraries(tool_ksvd_diag PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(tool_ksvd_diag PRIVATE CORTEXSDR_STATIC=1)
+
+# Shared-dict synthetic repro — exercises the pooled K-SVD path on synthetic
+# Qwen-shaped tensors to isolate the NaN-atom bug from real-data noise.
+add_executable(tool_shared_dict_diag src/tool_shared_dict_diag.cpp)
+target_link_libraries(tool_shared_dict_diag PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(tool_shared_dict_diag PRIVATE CORTEXSDR_STATIC=1)
+
+# Reconstruction-quality tool: per-segment NMSE / cosine between original
+# weights and HSDR-decompressed weights. Layer-level inference-readiness check.
+add_executable(tool_recon_quality src/tool_recon_quality.cpp)
+target_link_libraries(tool_recon_quality PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
+target_compile_definitions(tool_recon_quality PRIVATE CORTEXSDR_STATIC=1)
 
 # SDR Size Analyzer Tool
 add_executable(analyze_sdr_size analyze_sdr_size.cpp)

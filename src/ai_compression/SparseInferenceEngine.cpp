@@ -1640,9 +1640,43 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
         return {};
     }
     
+    // ----- HSDR fast path (forward-pass migration) -----
+    // If the layer's weight segment is HSDR-encoded AND in 1-D row-tile mode,
+    // route through the fused matmul (no FP32 W materialisation). The matmul
+    // signature is Y = W·x with x shaped (input_size, batch) row-major, so we
+    // require effective_batch == 1 here to skip a transpose. Larger batches
+    // still fall through to the dense BLAS path until a transpose-or-batched
+    // matmul variant lands.
+    {
+        constexpr uint8_t HSDR_STRATEGY_ID = 5;
+        const auto* header = loader_.findSegmentHeader(layer.name);
+        if (header && header->compression_strategy_id == HSDR_STRATEGY_ID
+            && effective_batch == 1) {
+            try {
+                auto Y = loader_.matmulHSDR(layer.name, input.data(), /*batch=*/1);
+                if (Y.size() == output_size) {
+                    if (!layer.biases.empty() && layer.biases.size() == output_size) {
+                        for (size_t r = 0; r < output_size; ++r) Y[r] += layer.biases[r];
+                    }
+                    last_layer_used_compressed_ = true;
+                    // Move into a ping-pong buffer to match the existing
+                    // return-by-reference shape downstream consumers expect.
+                    std::vector<float>& buf = getNextPingPongBuffer(output_size);
+                    buf = std::move(Y);
+                    return buf;
+                }
+                std::cerr << "[SDRInferenceEngine] WARN: HSDR matmul returned wrong size "
+                          << Y.size() << " (expected " << output_size << "); falling back to dense\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[SDRInferenceEngine] WARN: HSDR matmul threw on '"
+                          << layer.name << "': " << e.what() << " — falling back to dense\n";
+            }
+        }
+    }
+
     // Use ping-pong buffer to reduce allocations
     std::vector<float>& output = getNextPingPongBuffer(effective_batch * output_size);
-    
+
     // Use BLAS-accelerated linear forward: output = input * weights^T + bias
     CortexAICompression::Kernels::linear_forward(
         input.data(),
@@ -1653,7 +1687,7 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
         input_size,
         output_size
     );
-    
+
     return output;
 }
 

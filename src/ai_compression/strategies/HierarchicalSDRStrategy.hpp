@@ -50,6 +50,13 @@ struct HierarchicalSDRConfig {
     uint8_t  reserved_pad = 0;          ///< Keeps the struct 32-bit aligned in the stream.
     float    stage_decay = 0.5f;        ///< γ_l = stage_decay^l.
 
+    /// Cap on the number of tiles used for K-SVD fitting (0 = unbounded).
+    /// The fit cost grows with pool size; subsampling to a few thousand tiles
+    /// is usually enough to converge to a good shared dictionary at LLM scale.
+    /// Encoding still runs on the full tile set, regardless of this cap.
+    /// Not persisted in the wire format — purely a fitting-time hint.
+    uint32_t max_tiles_for_fit = 0;
+
     /** Auto-pick MLP-flavoured hyperparameters; matches research/step0 exp_b2. */
     static HierarchicalSDRConfig forMLP() {
         HierarchicalSDRConfig c;
@@ -78,6 +85,32 @@ struct HierarchicalSDRConfig {
         c.n_stages = 3;
         c.ksvd_iters = 12;
         c.stage_decay = 0.5f;
+        return c;
+    }
+
+    /**
+     * @brief Fast preset for big-model compression.
+     *
+     * Trades reconstruction NMSE for fit wall-time. 1-D row tiles, small
+     * dictionary (K=128), short K-SVD (4 iters), and a tight tile-pool cap
+     * (4K tiles) so a 7B model's role-groups fit in seconds rather than
+     * minutes. Use this when you want any compression on Llama-class models;
+     * later tighten with `forRow1D` or per-role custom configs for quality.
+     */
+    static HierarchicalSDRConfig forFast(uint16_t row_width,
+                                         uint16_t n_atoms = 128,
+                                         uint8_t k_per_stage = 4,
+                                         uint8_t ksvd_iters = 4,
+                                         uint32_t max_tiles_for_fit = 4096) {
+        HierarchicalSDRConfig c;
+        c.tile_rows = 1;
+        c.tile_cols = row_width;
+        c.n_atoms = n_atoms;
+        c.active_bits_per_stage = k_per_stage;
+        c.n_stages = 3;
+        c.ksvd_iters = ksvd_iters;
+        c.stage_decay = 0.5f;
+        c.max_tiles_for_fit = max_tiles_for_fit;
         return c;
     }
 
@@ -187,6 +220,26 @@ public:
         const ModelSegment& segment, const SharedDictionary& dict) const;
 
     /**
+     * @brief Encode-only variant that takes already-dequantised FP32 bytes.
+     *
+     * Skips the dequant + extractTiles copy that compressWithExternalDictionary
+     * performs internally. The shared-dict pipeline uses this to avoid
+     * dequantising every segment twice (once for pool fill, once for encode).
+     *
+     * @param fp32          Row-major FP32 weights, size = R * C.
+     * @param R             Row count.
+     * @param C             Column count (must equal dict.config.tile_cols in 1D mode).
+     * @param dict          Shared dictionary previously fit on a pooled tile set.
+     * @param original_type Source dtype tag, stored in the codes header for round-trip.
+     * @param name          Diagnostic name (used in error messages only).
+     */
+    std::vector<std::byte> compressFP32WithExternalDictionary(
+        const float* fp32, uint32_t R, uint32_t C,
+        const SharedDictionary& dict,
+        SegmentType original_type,
+        const std::string& name) const;
+
+    /**
      * @brief Decompress a codes-only stream using an external shared dictionary.
      *
      * Output is the FP32 weight matrix bytes, identical in layout to what
@@ -251,6 +304,19 @@ public:
         /** Convenience: read from file at the given path. */
         static SharedDictArchive readFromFile(const std::string& path);
     };
+
+    /**
+     * @brief Dequantise an arbitrary supported segment to FP32, byte-by-byte.
+     *
+     * Public entry point for the helper that the three compress paths use
+     * internally. Exposed here so unit tests can validate dequantisation in
+     * isolation from V4b fitting/reconstruction. Returns an FP32 vector of
+     * length R*C; throws CompressionError on unsupported dtype or bad size.
+     *
+     * Supported formats: f32, f16, bf16, i8 (uniform + metadata),
+     * q4_0, q8_0, q4_k, q5_k, q6_k.
+     */
+    static std::vector<float> dequantizeToFP32(const ModelSegment& segment);
 
     /**
      * @brief Compress a batch of segments using one shared dictionary per role.

@@ -117,6 +117,24 @@ inference_stdout.txt
 inference_stderr.txt
 inference_output/
 
+# Ad-hoc compression / debug logs and archives dropped at repo root
+qwen_*.txt
+qwen_*.log
+qwen_*.hsda
+*.hsda
+
+# Claude Code workspace state
+.claude/
+
+# Per-session diagnostic source files — exploration scripts (NaN scanners,
+# K-SVD probes, archive inspectors) used during compression tuning. Not
+# intended for the public source tree. Remove an entry if any becomes durable.
+src/tool_dequant_stats.cpp
+src/tool_hsda_inspect.cpp
+src/tool_ksvd_diag.cpp
+src/tool_recon_quality.cpp
+src/tool_shared_dict_diag.cpp
+
 # Research scratch (Python venvs, caches, large artefact dumps)
 research/**/.venv/
 research/**/__pycache__/

@@ -25,7 +25,8 @@ int decompressModel(const char* compressed_path, const char* output_path, float 
 int extractArchive(const char* compressed_path, const char* output_dir, float sparsity);
 int runInference(const char* archive_path, const char* input_indices_file);
 int compressModelHSDR(const char* model_path, const char* format, const char* output_hsda_path,
-                      int protect_boundary, int total_layers_hint);
+                      int protect_boundary, int total_layers_hint,
+                      bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters);
 std::vector<size_t> loadInputIndices(const char* input_path);
 std::vector<std::string> findModelParts(const std::string& model_path);
 
@@ -297,6 +298,7 @@ int main(int argc, char** argv) {
         // HSDR shared-dictionary pipeline.
         // Usage: -h <model_path> <format> <output.hsda>
         //          [--protect-boundary N] [--total-layers M]
+        //          [--fast] [--max-tiles N] [--n-atoms K] [--ksvd-iters N]
         if (argc < 5) {
             printUsage(argv[0]);
             return 1;
@@ -306,6 +308,10 @@ int main(int argc, char** argv) {
         const char* output_hsda_path = argv[4];
         int protect_boundary = 0;
         int total_layers = 0;
+        bool fast_preset = false;
+        int max_tiles = -1;   // -1 = "use config default"
+        int n_atoms = -1;
+        int ksvd_iters = -1;
         for (int i = 5; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--protect-boundary" && i + 1 < argc) {
@@ -314,12 +320,24 @@ int main(int argc, char** argv) {
             } else if (arg == "--total-layers" && i + 1 < argc) {
                 total_layers = std::stoi(argv[i + 1]);
                 ++i;
+            } else if (arg == "--fast") {
+                fast_preset = true;
+            } else if (arg == "--max-tiles" && i + 1 < argc) {
+                max_tiles = std::stoi(argv[i + 1]);
+                ++i;
+            } else if (arg == "--n-atoms" && i + 1 < argc) {
+                n_atoms = std::stoi(argv[i + 1]);
+                ++i;
+            } else if (arg == "--ksvd-iters" && i + 1 < argc) {
+                ksvd_iters = std::stoi(argv[i + 1]);
+                ++i;
             } else {
                 std::cerr << "Warning: unknown option in -h mode: " << arg << "\n";
             }
         }
         return compressModelHSDR(model_path, format, output_hsda_path,
-                                 protect_boundary, total_layers);
+                                 protect_boundary, total_layers,
+                                 fast_preset, max_tiles, n_atoms, ksvd_iters);
     } else {
         printUsage(argv[0]);
         return 1;
@@ -552,11 +570,16 @@ int runInference(const char* archive_path, const char* input_indices_file) {
 }
 
 int compressModelHSDR(const char* model_path, const char* format, const char* output_hsda_path,
-                      int protect_boundary, int total_layers_hint) {
+                      int protect_boundary, int total_layers_hint,
+                      bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters) {
     using namespace CortexAICompression;
     std::cout << "HSDR shared-dictionary compression\n";
     std::cout << "  model:  " << model_path << "  (format: " << format << ")\n";
     std::cout << "  output: " << output_hsda_path << "\n";
+    if (fast_preset) std::cout << "  preset: --fast (small K, few iters, capped tile pool)\n";
+    if (max_tiles >= 0)  std::cout << "  override: max-tiles=" << max_tiles << "\n";
+    if (n_atoms >= 0)    std::cout << "  override: n-atoms="   << n_atoms   << "\n";
+    if (ksvd_iters >= 0) std::cout << "  override: ksvd-iters=" << ksvd_iters << "\n";
     if (protect_boundary > 0) {
         std::cout << "  protect-boundary: " << protect_boundary
                   << "  (total-layers hint: " << total_layers_hint << ")\n";
@@ -587,10 +610,47 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
         }
         std::cout << "    weight tensors: " << weight_count << " (FP32: " << fp32_count << ")\n";
 
-        // 2. Build the strategy. Use the defaults from `HierarchicalSDRConfig`
-        //    for attention and MLP. Larger models will want explicit role
-        //    configs — a follow-up could expose --attn-* / --mlp-* flags.
+        // 2. Build the strategy. Honour --fast / --max-tiles / --n-atoms /
+        //    --ksvd-iters CLI overrides on top of the defaults. The shape of
+        //    the *first* FP32 weight tensor we see decides the row width used
+        //    for the 1-D row-tile fast preset; explicit row-mode customisation
+        //    per-role is a future follow-up.
         HierarchicalSDRStrategy strat;
+        if (fast_preset) {
+            // We don't need to pin row_width here — the strategy's configFor()
+            // auto-adjusts tile_cols to each segment's actual column count
+            // (in 1-D row-tile mode), and the pipeline buckets segments by
+            // matching config so different shapes get their own dictionaries.
+            // Seed with a sentinel; configFor will override per-segment.
+            HierarchicalSDRConfig fast_cfg = HierarchicalSDRConfig::forFast(/*row_width=*/1);
+            if (n_atoms >= 0) fast_cfg.n_atoms = static_cast<uint16_t>(n_atoms);
+            if (ksvd_iters >= 0) fast_cfg.ksvd_iters = static_cast<uint8_t>(ksvd_iters);
+            if (max_tiles >= 0) fast_cfg.max_tiles_for_fit = static_cast<uint32_t>(max_tiles);
+            strat = HierarchicalSDRStrategy(fast_cfg, fast_cfg);
+            std::cout << "  fast config: tile=" << fast_cfg.tile_rows << "x" << fast_cfg.tile_cols
+                      << "  K=" << fast_cfg.n_atoms
+                      << "  k=" << static_cast<int>(fast_cfg.active_bits_per_stage)
+                      << "x" << static_cast<int>(fast_cfg.n_stages)
+                      << "  iters=" << static_cast<int>(fast_cfg.ksvd_iters)
+                      << "  max_tiles_for_fit=" << fast_cfg.max_tiles_for_fit << "\n";
+        } else if (n_atoms >= 0 || ksvd_iters >= 0 || max_tiles >= 0) {
+            // Override individual knobs against the default attn/mlp configs.
+            HierarchicalSDRConfig attn = {};  // strategy defaults
+            HierarchicalSDRConfig mlp  = HierarchicalSDRConfig::forMLP();
+            if (n_atoms >= 0) {
+                attn.n_atoms = static_cast<uint16_t>(n_atoms);
+                mlp.n_atoms  = static_cast<uint16_t>(n_atoms);
+            }
+            if (ksvd_iters >= 0) {
+                attn.ksvd_iters = static_cast<uint8_t>(ksvd_iters);
+                mlp.ksvd_iters  = static_cast<uint8_t>(ksvd_iters);
+            }
+            if (max_tiles >= 0) {
+                attn.max_tiles_for_fit = static_cast<uint32_t>(max_tiles);
+                mlp.max_tiles_for_fit  = static_cast<uint32_t>(max_tiles);
+            }
+            strat = HierarchicalSDRStrategy(attn, mlp);
+        }
         if (protect_boundary > 0) {
             const size_t total = (total_layers_hint > 0)
                                   ? static_cast<size_t>(total_layers_hint)
@@ -635,7 +695,8 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
                     || fmt == "f16" || fmt == "fp16" || fmt == "float16" || fmt == "half"
                     || fmt == "bf16" || fmt == "bfloat16"
                     || fmt == "i8"  || fmt == "int8"
-                    || fmt == "q4_0" || fmt == "q8_0";
+                    || fmt == "q4_0" || fmt == "q8_0"
+                    || fmt == "q4_k" || fmt == "q5_k" || fmt == "q6_k";
             };
 
             size_t skip_not_weight = 0, skip_unsupported_dtype = 0, skip_not_2d = 0;
@@ -673,7 +734,7 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
                       << " not 2-D (norms, biases, etc.)\n";
             for (const auto& n : sample_not_2d) std::cout << "      e.g. " << n << "\n";
             std::cout << "    " << skip_unsupported_dtype
-                      << " unsupported dtype (f32/f16/bf16/i8 supported)\n";
+                      << " unsupported dtype (f32/f16/bf16/i8/q4_0/q8_0/q4_k/q5_k/q6_k supported)\n";
             for (const auto& kv : unsupported_format_counts) {
                 std::cout << "      • format='" << kv.first << "': " << kv.second << " tensors\n";
             }

@@ -10,8 +10,14 @@
 #include "HierarchicalSDRStrategy.hpp"
 #include "../utils/fp16_convert.hpp"
 
+#if defined(__AVX2__) || defined(CORTEXSDR_SIMD_AVX2)
+#include <immintrin.h>
+#define CORTEXSDR_HSDR_HAVE_AVX2 1
+#endif
+
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <fstream>
@@ -19,6 +25,7 @@
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -138,6 +145,73 @@ void reassembleTiles(const float* tiles, uint32_t R, uint32_t C,
  * Within a stage we forbid re-selecting the same atom (set per-stage); across
  * stages the same atom may be picked again.
  */
+// --------------------------------------------------------------------------
+// SIMD helpers — AVX2 if available, scalar fallback otherwise. These two
+// kernels are the hottest in the whole encoder; everything else is fanout
+// over tiles + atoms.
+// --------------------------------------------------------------------------
+static inline float dot_product_simd(const float* a, const float* b, uint32_t n) {
+#ifdef CORTEXSDR_HSDR_HAVE_AVX2
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    uint32_t c = 0;
+    // Unroll x2 for IPC. Each iteration consumes 16 floats.
+    for (; c + 16 <= n; c += 16) {
+        __m256 av0 = _mm256_loadu_ps(a + c);
+        __m256 bv0 = _mm256_loadu_ps(b + c);
+        __m256 av1 = _mm256_loadu_ps(a + c + 8);
+        __m256 bv1 = _mm256_loadu_ps(b + c + 8);
+        acc0 = _mm256_fmadd_ps(av0, bv0, acc0);
+        acc1 = _mm256_fmadd_ps(av1, bv1, acc1);
+    }
+    for (; c + 8 <= n; c += 8) {
+        __m256 av = _mm256_loadu_ps(a + c);
+        __m256 bv = _mm256_loadu_ps(b + c);
+        acc0 = _mm256_fmadd_ps(av, bv, acc0);
+    }
+    __m256 acc = _mm256_add_ps(acc0, acc1);
+    // Horizontal sum.
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float s = _mm_cvtss_f32(sum);
+    for (; c < n; ++c) s += a[c] * b[c];
+    return s;
+#else
+    float s = 0.0f;
+    for (uint32_t c = 0; c < n; ++c) s += a[c] * b[c];
+    return s;
+#endif
+}
+
+static inline void axpy_subtract_simd(float* r, const float* atom, float scale, uint32_t n) {
+#ifdef CORTEXSDR_HSDR_HAVE_AVX2
+    const __m256 vs = _mm256_set1_ps(scale);
+    uint32_t c = 0;
+    for (; c + 16 <= n; c += 16) {
+        __m256 rv0 = _mm256_loadu_ps(r + c);
+        __m256 av0 = _mm256_loadu_ps(atom + c);
+        __m256 rv1 = _mm256_loadu_ps(r + c + 8);
+        __m256 av1 = _mm256_loadu_ps(atom + c + 8);
+        rv0 = _mm256_fnmadd_ps(av0, vs, rv0);  // r -= atom * scale
+        rv1 = _mm256_fnmadd_ps(av1, vs, rv1);
+        _mm256_storeu_ps(r + c, rv0);
+        _mm256_storeu_ps(r + c + 8, rv1);
+    }
+    for (; c + 8 <= n; c += 8) {
+        __m256 rv = _mm256_loadu_ps(r + c);
+        __m256 av = _mm256_loadu_ps(atom + c);
+        rv = _mm256_fnmadd_ps(av, vs, rv);
+        _mm256_storeu_ps(r + c, rv);
+    }
+    for (; c < n; ++c) r[c] -= scale * atom[c];
+#else
+    for (uint32_t c = 0; c < n; ++c) r[c] -= scale * atom[c];
+#endif
+}
+
 void hierarchicalBinaryCode(const float* tile, const float* dictionary,
                             uint16_t n_atoms, uint32_t C,
                             uint8_t n_stages, uint8_t k_per_stage,
@@ -154,11 +228,11 @@ void hierarchicalBinaryCode(const float* tile, const float* dictionary,
         std::fill(used_this_stage.begin(), used_this_stage.end(), 0);
 
         for (uint8_t step = 0; step < k_per_stage; ++step) {
-            // proj[j] = <D[j], r> = sum_c D[j,c] * r[c]
+            // proj[j] = <D[j], r>. SIMD inner loop; outer loop is small enough
+            // to leave serial (we want OpenMP parallelism at the tile level).
             for (uint16_t j = 0; j < n_atoms; ++j) {
                 const float* atom = dictionary + static_cast<size_t>(j) * C;
-                float s = 0.0f;
-                for (uint32_t c = 0; c < C; ++c) s += atom[c] * r[c];
+                const float s = dot_product_simd(atom, r.data(), C);
                 proj[j] = used_this_stage[j] ? 0.0f : s;
             }
 
@@ -178,7 +252,7 @@ void hierarchicalBinaryCode(const float* tile, const float* dictionary,
             // r -= gamma * sign * D[best]
             const float scale = gamma * static_cast<float>(sign);
             const float* atom = dictionary + static_cast<size_t>(best) * C;
-            for (uint32_t c = 0; c < C; ++c) r[c] -= scale * atom[c];
+            axpy_subtract_simd(r.data(), atom, scale, C);
         }
     }
 }
@@ -206,11 +280,16 @@ void atomUpdateStep(const float* tiles, uint32_t n_tiles, uint32_t C,
                     uint8_t n_stages, uint8_t k_per_stage,
                     const float* stage_scales,
                     std::mt19937& rng) {
+    const char* dbg = std::getenv("CORTEXSDR_HSDR_DEBUG");
+    const bool log_step = dbg && std::string_view(dbg) == std::string_view("1");
     const uint32_t slots_per_tile = static_cast<uint32_t>(n_stages) * k_per_stage;
 
-    // Full reconstruction for each tile, then residual = tile - recon
+    // Full reconstruction for each tile, then residual = tile - recon.
+    // Tiles are independent — parallelise across cores.
     std::vector<float> full_recon(static_cast<size_t>(n_tiles) * C, 0.0f);
-    for (uint32_t i = 0; i < n_tiles; ++i) {
+    const int32_t nt_for_recon = static_cast<int32_t>(n_tiles);
+    #pragma omp parallel for schedule(static)
+    for (int32_t i = 0; i < nt_for_recon; ++i) {
         float* r = full_recon.data() + static_cast<size_t>(i) * C;
         for (uint8_t l = 0; l < n_stages; ++l) {
             const float gamma = stage_scales[l];
@@ -228,7 +307,9 @@ void atomUpdateStep(const float* tiles, uint32_t n_tiles, uint32_t C,
     }
 
     std::vector<float> residual(static_cast<size_t>(n_tiles) * C);
-    for (size_t i = 0; i < residual.size(); ++i) {
+    const int64_t rsz = static_cast<int64_t>(residual.size());
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < rsz; ++i) {
         residual[i] = tiles[i] - full_recon[i];
     }
 
@@ -249,37 +330,157 @@ void atomUpdateStep(const float* tiles, uint32_t n_tiles, uint32_t C,
         }
     }
 
-    std::vector<float> correction(C);
-    std::uniform_int_distribution<uint32_t> tile_picker(0, n_tiles - 1);
+    // Accumulators are float64 to match the Python reference: with wide tiles
+    // (e.g. 3584/18944-element row tiles in LLM weights) the per-atom user
+    // sum runs over tens of thousands of contributions; float32 accumulation
+    // catastrophically loses precision. Each parallel atom-update iteration
+    // declares its own thread-local `correction` buffer below.
 
-    for (uint16_t j = 0; j < n_atoms; ++j) {
+    // Snapshot pre-update atom + residual magnitudes for debugging.
+    if (log_step) {
+        double rmax = 0.0, rsum = 0.0;
+        size_t rbad = 0;
+        for (size_t i = 0; i < residual.size(); ++i) {
+            const float v = residual[i];
+            if (!std::isfinite(v)) { ++rbad; continue; }
+            rmax = std::max(rmax, std::fabs(static_cast<double>(v)));
+            rsum += std::fabs(static_cast<double>(v));
+        }
+        double amax = 0.0, asum = 0.0;
+        size_t abad = 0;
+        for (size_t i = 0; i < static_cast<size_t>(n_atoms) * C; ++i) {
+            const float v = D[i];
+            if (!std::isfinite(v)) { ++abad; continue; }
+            amax = std::max(amax, std::fabs(static_cast<double>(v)));
+            asum += std::fabs(static_cast<double>(v));
+        }
+        const size_t total_a = static_cast<size_t>(n_atoms) * C;
+        std::cerr << "  [step] pre-update  residual: max=" << rmax << " mean="
+                  << (rsum / residual.size()) << " bad=" << rbad
+                  << "  D: max=" << amax << " mean=" << (asum / total_a)
+                  << " bad=" << abad << "\n";
+    }
+
+    // Compute a tile-magnitude cap used to detect/recover from runaway atoms.
+    // Binary-MP with fixed γ_l + greedy ±1 codes has no inherent step-size
+    // control: if an atom drifts past the tile magnitude range, the encode
+    // step's residual update overshoots, the next atom-update overshoots
+    // further, and within a handful of iterations every atom is 1e+07 or NaN.
+    // Capping at a multiple of the mean tile norm keeps the loop stable.
+    double tile_norm_sum = 0.0;
+    const int32_t nt_norm = static_cast<int32_t>(n_tiles);
+    #pragma omp parallel for reduction(+:tile_norm_sum) schedule(static)
+    for (int32_t i = 0; i < nt_norm; ++i) {
+        const float* t = tiles + static_cast<size_t>(i) * C;
+        double sq = 0.0;
+        for (uint32_t c = 0; c < C; ++c) sq += static_cast<double>(t[c]) * t[c];
+        tile_norm_sum += std::sqrt(sq);
+    }
+    const double tile_norm_mean = tile_norm_sum / std::max<uint32_t>(1u, n_tiles);
+    // Target atom magnitude. With ±1 binary signs + fixed stage scales, the
+    // sum of slots_per_tile ±atoms reconstructs each tile, so each atom's
+    // contribution should sit around tile_norm / √slots — same scale as
+    // init_scale at line ~333 in fitHierarchicalKSVD. We cap to this scale
+    // rather than to several × tile_norm_mean; tighter cap = stable encode
+    // step (no MP overshoot regardless of input distribution).
+    const double atom_target_norm = std::max(1e-6, tile_norm_mean
+                                                    / std::sqrt(static_cast<double>(slots_per_tile)));
+    const double atom_norm_cap = 1.5 * atom_target_norm;
+
+    // Damped step. K-SVD's textbook update is the SVD of the residual
+    // restricted to users; the ±1-binary variant we use here doesn't satisfy
+    // SVD's optimality bounds, so a step size < 1 prevents the LMS-style
+    // increment from overshooting on tiles with sparse spikes.
+    constexpr double kStep = 0.5;
+
+    // Per-atom seed for thread-safe re-seeding. We mix the iteration's rng
+    // state once, then derive a per-atom seed; this keeps the parallel loop
+    // deterministic and free of shared rng access.
+    const uint64_t base_seed = static_cast<uint64_t>(rng()) ^ 0xA0B1C2D3u;
+
+    const int32_t na = static_cast<int32_t>(n_atoms);
+    #pragma omp parallel for schedule(static)
+    for (int32_t j = 0; j < na; ++j) {
+        std::vector<double> correction(C, 0.0);  // thread-local
         const auto& u = users[j];
+        float* atom = D + static_cast<size_t>(j) * C;
         if (u.empty()) {
-            // Dead atom — re-seed with a random tile.
-            const uint32_t rid = tile_picker(rng);
-            std::memcpy(D + static_cast<size_t>(j) * C,
-                        tiles + static_cast<size_t>(rid) * C,
-                        sizeof(float) * C);
+            // Dead atom — re-seed with a random tile (rescaled to target).
+            std::mt19937 local_rng(static_cast<uint32_t>(base_seed ^ (j * 0x9E3779B1u)));
+            std::uniform_int_distribution<uint32_t> picker(0, n_tiles - 1);
+            const uint32_t rid = picker(local_rng);
+            const float* src = tiles + static_cast<size_t>(rid) * C;
+            double sq = 0.0;
+            for (uint32_t c = 0; c < C; ++c) sq += static_cast<double>(src[c]) * src[c];
+            const double n = std::sqrt(std::max(sq, 1e-30));
+            const double s = atom_target_norm / n;
+            for (uint32_t c = 0; c < C; ++c) atom[c] = static_cast<float>(src[c] * s);
             continue;
         }
 
-        std::fill(correction.begin(), correction.end(), 0.0f);
-        float weight_sum = 0.0f;
+        double weight_sum = 0.0;
         for (uint32_t enc : u) {
             const uint32_t i = enc >> 16;
             const uint16_t loc = static_cast<uint16_t>(enc & 0xFFFFu);
             const uint8_t l = static_cast<uint8_t>(loc / k_per_stage);
             const size_t slot = static_cast<size_t>(i) * slots_per_tile + loc;
-            const float gamma = stage_scales[l];
-            const float sg = static_cast<float>(signs[slot]) * gamma;
+            const double gamma = static_cast<double>(stage_scales[l]);
+            const double sg = static_cast<double>(signs[slot]) * gamma;
             const float* res_i = residual.data() + static_cast<size_t>(i) * C;
-            for (uint32_t c = 0; c < C; ++c) correction[c] += sg * res_i[c];
+            for (uint32_t c = 0; c < C; ++c) {
+                correction[c] += sg * static_cast<double>(res_i[c]);
+            }
             weight_sum += gamma * gamma;
         }
-        if (weight_sum <= 1e-12f) continue;
-        const float inv_w = 1.0f / weight_sum;
-        float* atom = D + static_cast<size_t>(j) * C;
-        for (uint32_t c = 0; c < C; ++c) atom[c] += correction[c] * inv_w;
+        if (weight_sum <= 1e-12) continue;
+        const double inv_w = kStep / weight_sum;
+
+        // Apply correction and compute new magnitude. NaN/Inf-safe at TWO
+        // levels: (a) the double-precision update can overflow → NaN/Inf;
+        // (b) even if the double is finite, |v| may exceed FLT_MAX (3.4e+38)
+        // so static_cast<float>(v) silently stores +Inf. We must check the
+        // float we actually wrote, not the pre-cast double, or renormalize
+        // can't recover the atom (Inf * anything = Inf).
+        double new_sq = 0.0;
+        bool any_nonfinite = false;
+        for (uint32_t c = 0; c < C; ++c) {
+            const double v = static_cast<double>(atom[c]) + correction[c] * inv_w;
+            const float vf = static_cast<float>(v);
+            if (!std::isfinite(v) || !std::isfinite(vf)) {
+                any_nonfinite = true;
+                break;
+            }
+            atom[c] = vf;
+            new_sq += static_cast<double>(vf) * static_cast<double>(vf);
+        }
+
+        if (any_nonfinite || !std::isfinite(new_sq)) {
+            // Re-seed from a random tile (rescaled to target). Thread-safe
+            // per-atom rng.
+            std::mt19937 local_rng(static_cast<uint32_t>(base_seed ^ (j * 0xB7E15163u)));
+            std::uniform_int_distribution<uint32_t> picker(0, n_tiles - 1);
+            const uint32_t rid = picker(local_rng);
+            const float* src = tiles + static_cast<size_t>(rid) * C;
+            double sq = 0.0;
+            for (uint32_t c = 0; c < C; ++c) sq += static_cast<double>(src[c]) * src[c];
+            const double nrm = std::sqrt(std::max(sq, 1e-30));
+            const double s = atom_target_norm / nrm;
+            for (uint32_t c = 0; c < C; ++c) atom[c] = static_cast<float>(src[c] * s);
+            continue;
+        }
+
+        const double new_norm = std::sqrt(new_sq);
+        // Renormalize if atom drifted past the cap. Preserves the direction
+        // K-SVD has been refining instead of throwing it away (re-seed loses
+        // progress; renormalize keeps it). This is the key change that makes
+        // the loop converge on any input distribution: binding the magnitude
+        // breaks the encode-overshoot → bigger-residual → bigger-atom loop.
+        if (new_norm > atom_norm_cap) {
+            const double s = atom_target_norm / new_norm;
+            for (uint32_t c = 0; c < C; ++c) {
+                atom[c] = static_cast<float>(static_cast<double>(atom[c]) * s);
+            }
+        }
     }
 }
 
@@ -335,20 +536,70 @@ void fitHierarchicalKSVD(const float* tiles, uint32_t n_tiles, uint32_t C,
     indices_out.assign(static_cast<size_t>(n_tiles) * slots_per_tile, 0);
     signs_out.assign(static_cast<size_t>(n_tiles) * slots_per_tile, 0);
 
-    for (uint8_t iter = 0; iter < cfg.ksvd_iters; ++iter) {
-        // Code step: independent per tile.
-        for (uint32_t i = 0; i < n_tiles; ++i) {
+    // Optional per-iter logging — enable by setting CORTEXSDR_HSDR_DEBUG=1
+    // in the environment. Prints atom-magnitude / NaN stats so we can see
+    // divergence (or convergence) in real time without ad-hoc instrumentation.
+    const char* dbg = std::getenv("CORTEXSDR_HSDR_DEBUG");
+    const bool log_iter = dbg && std::string_view(dbg) == std::string_view("1");
+
+    // Always run one initial encode against the random-tile-init dictionary,
+    // then optionally refine via (atom update + re-encode) iterations.
+    // ksvd_iters=0 means "skip the K-SVD refinement entirely" — useful when the
+    // refinement cost dominates and we want a fast-compress-only mode.
+    auto encode_all = [&]() {
+        // Tiles are encoded independently — parallelise across cores. With
+        // OpenMP this is ~Ncores× speedup. The thread-local scratch inside
+        // hierarchicalBinaryCode (residual, projection scores) keeps each
+        // iteration self-contained, so no shared state to guard.
+        const int32_t nt = static_cast<int32_t>(n_tiles);
+        #pragma omp parallel for schedule(static)
+        for (int32_t i = 0; i < nt; ++i) {
             const float* tile = tiles + static_cast<size_t>(i) * C;
             uint16_t* idx_dst = indices_out.data() + static_cast<size_t>(i) * slots_per_tile;
-            int8_t*   sgn_dst = signs_out.data()   + static_cast<size_t>(i) * slots_per_tile;
+            int8_t* sgn_dst = signs_out.data() + static_cast<size_t>(i) * slots_per_tile;
             hierarchicalBinaryCode(tile, D_out.data(), K, C, S, k,
                                    stage_scales_out.data(), idx_dst, sgn_dst);
         }
-        // Atom update step.
+    };
+    encode_all();
+
+    for (uint8_t iter = 0; iter < cfg.ksvd_iters; ++iter) {
         atomUpdateStep(tiles, n_tiles, C, D_out.data(), K,
                        indices_out.data(), signs_out.data(),
                        S, k, stage_scales_out.data(), rng);
+        encode_all();
+
+        if (log_iter) {
+            double max_abs = 0.0, sum_abs = 0.0;
+            size_t nan_n = 0;
+            for (float v : D_out) {
+                if (std::isnan(v) || std::isinf(v)) { ++nan_n; continue; }
+                const double a = std::fabs(static_cast<double>(v));
+                max_abs = std::max(max_abs, a);
+                sum_abs += a;
+            }
+            std::cerr << "[hsdr-debug] fit C=" << C << " K=" << K
+                      << " iter " << static_cast<int>(iter)
+                      << "/" << static_cast<int>(cfg.ksvd_iters)
+                      << "  max|a|=" << max_abs
+                      << "  mean|a|=" << (sum_abs / D_out.size())
+                      << "  non_finite=" << nan_n << "\n";
+        }
     }
+
+    // Final sanitization. atomUpdateStep already re-seeds on NaN, but if any
+    // non-finite value somehow survives (e.g. via an encoding path we haven't
+    // instrumented), zero it out rather than ship a poisoned dictionary that
+    // produces NaN matmul outputs downstream. This is a safety net, not an
+    // expected code path — if it ever fires, audit atomUpdateStep.
+    size_t sanitized = 0;
+    for (size_t i = 0; i < D_out.size(); ++i) {
+        if (!std::isfinite(D_out[i])) {
+            D_out[i] = 0.0f;
+            ++sanitized;
+        }
+    }
+    (void)sanitized;  // hook for future logging if needed
 }
 
 // --------------------------------------------------------------------------
@@ -534,6 +785,156 @@ std::vector<float> dequantizeSegmentToFP32(const ModelSegment& segment) {
         return out;
     }
 
+    // -----------------------------------------------------------------------
+    // GGUF k-quants: super-block formats. QK_K = 256 elements per super-block.
+    // Layouts implemented from the public GGUF spec
+    // (https://github.com/ggerganov/ggml/blob/master/docs/gguf.md). No
+    // llama.cpp source is imported. Bit layouts are sensitive — see the
+    // hand-computed test cases in test_hsdr_kquants for validation.
+    // -----------------------------------------------------------------------
+
+    // Helper: unpack the 12-byte packed scales/mins block used by Q4_K and Q5_K
+    // into 8 6-bit scales and 8 6-bit mins.
+    auto unpack_k_scales_mins = [](const uint8_t* scales12, uint8_t* sc_out, uint8_t* m_out) {
+        for (int is = 0; is < 4; ++is) {
+            sc_out[is] = scales12[is] & 0x3F;
+            m_out[is]  = scales12[is + 4] & 0x3F;
+        }
+        for (int is = 4; is < 8; ++is) {
+            // High 4 bits of sc/m come from the top 2 bits of scales[is-4]/scales[is].
+            sc_out[is] = (scales12[is + 4] & 0x0F)
+                         | ((scales12[is - 4] >> 6) << 4);
+            m_out[is]  = (scales12[is + 4] >> 4)
+                         | ((scales12[is]     >> 6) << 4);
+        }
+    };
+
+    if (fmt == "q4_k") {
+        constexpr size_t QK_K = 256;
+        constexpr size_t BLOCK_BYTES = 2 + 2 + 12 + QK_K / 2;  // 144
+        static_assert(BLOCK_BYTES == 144, "Q4_K block size");
+        if (segment.data.size() % BLOCK_BYTES != 0) {
+            throw CompressionError("HSDR dequant: Q4_K byte size not a multiple of 144");
+        }
+        const size_t n_blocks = segment.data.size() / BLOCK_BYTES;
+        std::vector<float> out(n_blocks * QK_K);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(segment.data.data());
+        uint8_t sc[8], mn[8];
+        for (size_t b = 0; b < n_blocks; ++b) {
+            uint16_t d_bits, dmin_bits;
+            std::memcpy(&d_bits,    p,     2);
+            std::memcpy(&dmin_bits, p + 2, 2);
+            const float d    = fp16_to_fp32(d_bits);
+            const float dmin = fp16_to_fp32(dmin_bits);
+            const uint8_t* scales12 = p + 4;
+            const uint8_t* qs       = p + 16;  // 4 + 12
+            unpack_k_scales_mins(scales12, sc, mn);
+            for (int is = 0; is < 8; ++is) {
+                const float ds = d * static_cast<float>(sc[is]);
+                const float dm = dmin * static_cast<float>(mn[is]);
+                for (int j = 0; j < 32; ++j) {
+                    const int idx = is * 32 + j;
+                    const uint8_t byte = qs[idx / 2];
+                    const uint8_t q = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+                    out[b * QK_K + idx] = static_cast<float>(q) * ds - dm;
+                }
+            }
+            p += BLOCK_BYTES;
+        }
+        return out;
+    }
+
+    if (fmt == "q5_k") {
+        constexpr size_t QK_K = 256;
+        constexpr size_t BLOCK_BYTES = 2 + 2 + 12 + QK_K / 8 + QK_K / 2;  // 176
+        static_assert(BLOCK_BYTES == 176, "Q5_K block size");
+        if (segment.data.size() % BLOCK_BYTES != 0) {
+            throw CompressionError("HSDR dequant: Q5_K byte size not a multiple of 176");
+        }
+        const size_t n_blocks = segment.data.size() / BLOCK_BYTES;
+        std::vector<float> out(n_blocks * QK_K);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(segment.data.data());
+        uint8_t sc[8], mn[8];
+        for (size_t b = 0; b < n_blocks; ++b) {
+            uint16_t d_bits, dmin_bits;
+            std::memcpy(&d_bits,    p,     2);
+            std::memcpy(&dmin_bits, p + 2, 2);
+            const float d    = fp16_to_fp32(d_bits);
+            const float dmin = fp16_to_fp32(dmin_bits);
+            const uint8_t* scales12 = p + 4;
+            const uint8_t* qh       = p + 16;          // 32 bytes — 1 high bit per element
+            const uint8_t* qs       = qh + QK_K / 8;   // 128 bytes — 4 low bits per element
+            unpack_k_scales_mins(scales12, sc, mn);
+            for (int is = 0; is < 8; ++is) {
+                const float ds = d * static_cast<float>(sc[is]);
+                const float dm = dmin * static_cast<float>(mn[is]);
+                for (int j = 0; j < 32; ++j) {
+                    const int idx = is * 32 + j;
+                    const uint8_t byte = qs[idx / 2];
+                    const uint8_t q_lo = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+                    const uint8_t q_hi = (qh[idx / 8] >> (idx % 8)) & 1;
+                    const uint8_t q = (q_hi << 4) | q_lo;  // 5-bit unsigned [0..31]
+                    out[b * QK_K + idx] = static_cast<float>(q) * ds - dm;
+                }
+            }
+            p += BLOCK_BYTES;
+        }
+        return out;
+    }
+
+    if (fmt == "q6_k") {
+        constexpr size_t QK_K = 256;
+        // Layout (per spec):
+        //   ql[QK_K/2]      — 128 bytes (lower 4 bits, 2 per byte)
+        //   qh[QK_K/4]      —  64 bytes (upper 2 bits, 4 per byte)
+        //   scales[QK_K/16] —  16 bytes (one signed int8 per 16-element sub-block)
+        //   d (fp16)        —   2 bytes (super-scale, at the END of the struct)
+        // total = 210 bytes
+        constexpr size_t BLOCK_BYTES = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+        static_assert(BLOCK_BYTES == 210, "Q6_K block size");
+        if (segment.data.size() % BLOCK_BYTES != 0) {
+            throw CompressionError("HSDR dequant: Q6_K byte size not a multiple of 210");
+        }
+        const size_t n_blocks = segment.data.size() / BLOCK_BYTES;
+        std::vector<float> out(n_blocks * QK_K);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(segment.data.data());
+        for (size_t b = 0; b < n_blocks; ++b) {
+            const uint8_t* ql     = p;
+            const uint8_t* qh     = p + QK_K / 2;
+            const int8_t*  scales = reinterpret_cast<const int8_t*>(p + QK_K / 2 + QK_K / 4);
+            uint16_t d_bits;
+            std::memcpy(&d_bits, p + QK_K / 2 + QK_K / 4 + QK_K / 16, 2);
+            const float d = fp16_to_fp32(d_bits);
+
+            // 16 sub-blocks of 16 elements each. ql/qh are laid out in two halves
+            // of 128 elements; within each half, ql packs 2 nibbles per byte and
+            // qh packs 4 2-bit pairs per byte, both indexed by the within-half
+            // position of the element.
+            for (int half = 0; half < 2; ++half) {
+                const int half_base = half * 128;
+                const uint8_t* ql_h = ql + half * 64;
+                const uint8_t* qh_h = qh + half * 32;
+                for (int sub = 0; sub < 8; ++sub) {
+                    const int8_t scale = scales[half * 8 + sub];
+                    const float ds = d * static_cast<float>(scale);
+                    for (int j = 0; j < 16; ++j) {
+                        const int elem_in_half = sub * 16 + j;
+                        const int idx = half_base + elem_in_half;
+                        const uint8_t ql_byte = ql_h[elem_in_half / 2];
+                        const uint8_t q_lo = (elem_in_half & 1) ? (ql_byte >> 4) : (ql_byte & 0x0F);
+                        const uint8_t qh_byte = qh_h[elem_in_half / 4];
+                        const uint8_t q_hi = (qh_byte >> ((elem_in_half % 4) * 2)) & 0x03;
+                        const int q_unsigned = (q_hi << 4) | q_lo;  // [0..63]
+                        const int q_signed = q_unsigned - 32;        // [-32..31]
+                        out[b * QK_K + idx] = static_cast<float>(q_signed) * ds;
+                    }
+                }
+            }
+            p += BLOCK_BYTES;
+        }
+        return out;
+    }
+
     // FP32 fast path — copy bytes into a float vector.
     if (segment.type == SegmentType::WEIGHTS_FP32 ||
         fmt == "f32" || fmt == "fp32" || fmt == "float32") {
@@ -576,12 +977,11 @@ std::vector<float> dequantizeSegmentToFP32(const ModelSegment& segment) {
         return out;
     }
 
-    // Everything else (Q4_K, Q5_K, Q6_K, Q8_K, IQ*-, AWQ, GPTQ, etc.) requires
-    // format-specific block-dequant code with super-block + sub-block layouts.
-    // Carry-overs to a future round; documented in STEP0 followups.
+    // Everything else (Q8_K, IQ*-, AWQ, GPTQ, etc.) requires format-specific
+    // block-dequant code. Carry-overs to future rounds.
     throw CompressionError("HSDR dequant: unsupported input dtype '" + segment.data_format
                             + "' (type=" + std::to_string(static_cast<int>(segment.type))
-                            + "); supported: f32, f16, bf16, i8, q4_0, q8_0");
+                            + "); supported: f32, f16, bf16, i8, q4_0, q8_0, q4_k, q5_k, q6_k");
 }
 
 /// Drive the encode step (greedy MP) for a whole tensor against an external
@@ -593,7 +993,9 @@ void encodeAllTilesAgainstDictionary(const float* tiles, uint32_t n_tiles, uint3
                                      const float* stage_scales,
                                      uint16_t* indices_out, int8_t* signs_out) {
     const uint32_t slots_per_tile = static_cast<uint32_t>(n_stages) * k_per_stage;
-    for (uint32_t i = 0; i < n_tiles; ++i) {
+    const int32_t nt = static_cast<int32_t>(n_tiles);
+    #pragma omp parallel for schedule(static)
+    for (int32_t i = 0; i < nt; ++i) {
         const float* tile = tiles + static_cast<size_t>(i) * C;
         uint16_t* idx_dst = indices_out + static_cast<size_t>(i) * slots_per_tile;
         int8_t*   sgn_dst = signs_out   + static_cast<size_t>(i) * slots_per_tile;
@@ -608,11 +1010,33 @@ void encodeAllTilesAgainstDictionary(const float* tiles, uint32_t n_tiles, uint3
 // Strategy implementation
 // --------------------------------------------------------------------------
 
+std::vector<float> HierarchicalSDRStrategy::dequantizeToFP32(const ModelSegment& segment) {
+    // Public passthrough so tests / external callers can validate the
+    // dequant in isolation from V4b fitting. Implementation lives in the
+    // anonymous namespace at the top of this file.
+    return dequantizeSegmentToFP32(segment);
+}
+
 HierarchicalSDRConfig HierarchicalSDRStrategy::configFor(const ModelSegment& segment) const {
+    // Helper: in 1-D row-tile mode (tile_rows == 1) the row width is the
+    // segment's actual column count, not a fixed knob. Adjust the config so
+    // each shape is grouped/encoded against a dictionary sized to its real
+    // input dim. Segments with different C end up in different buckets in
+    // compressGroupedSegments — exactly what we want.
+    auto adjustRowWidth = [&](HierarchicalSDRConfig cfg) -> HierarchicalSDRConfig {
+        if (cfg.tile_rows == 1 && segment.tensor_metadata.has_value()) {
+            const auto& dims = segment.tensor_metadata.value().dimensions;
+            if (dims.size() == 2 && dims[1] > 0 && dims[1] <= 0xFFFFu) {
+                cfg.tile_cols = static_cast<uint16_t>(dims[1]);
+            }
+        }
+        return cfg;
+    };
+
     // Match the B.2 adaptive role-aware allocation: MLP gets the bigger config.
     switch (segment.type) {
         case SegmentType::FEED_FORWARD_WEIGHTS:
-            return mlp_default_;
+            return adjustRowWidth(mlp_default_);
         case SegmentType::EMBEDDING_WEIGHTS:
         case SegmentType::ATTENTION_WEIGHTS:
         case SegmentType::LAYER_NORM_WEIGHTS:
@@ -624,9 +1048,9 @@ HierarchicalSDRConfig HierarchicalSDRStrategy::configFor(const ModelSegment& seg
     const std::string& n = segment.name;
     if (n.find("mlp") != std::string::npos || n.find("ffn") != std::string::npos
         || n.find("feed_forward") != std::string::npos) {
-        return mlp_default_;
+        return adjustRowWidth(mlp_default_);
     }
-    return attn_default_;
+    return adjustRowWidth(attn_default_);
 }
 
 std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& segment) const {
@@ -1005,30 +1429,52 @@ std::vector<std::byte> HierarchicalSDRStrategy::compressWithExternalDictionary(
     const auto& dims = segment.tensor_metadata.value().dimensions;
     const uint32_t R = static_cast<uint32_t>(dims[0]);
     const uint32_t C = static_cast<uint32_t>(dims[1]);
-    const auto& cfg = dict.config;
-    if (R % cfg.tile_rows != 0 || C % cfg.tile_cols != 0) {
-        throw CompressionError("compressWithExternalDictionary: shape not divisible by tile size");
-    }
-    const uint32_t tile_dim = cfg.tileSize();
-    if (dict.atoms.size() != static_cast<size_t>(cfg.n_atoms) * tile_dim) {
-        throw CompressionError("compressWithExternalDictionary: dictionary size doesn't match config");
-    }
-
-    // Dequantise to FP32 if needed (FP16/BF16/INT8 input is now supported).
+    // Dequantise to FP32 if needed; delegate to the FP32 variant.
     std::vector<float> fp32_view = dequantizeSegmentToFP32(segment);
     if (fp32_view.size() != static_cast<size_t>(R) * C) {
         throw CompressionError(
             "compressWithExternalDictionary: dequantised element count doesn't match shape");
     }
+    return compressFP32WithExternalDictionary(fp32_view.data(), R, C, dict,
+                                              segment.type, segment.name);
+}
+
+std::vector<std::byte> HierarchicalSDRStrategy::compressFP32WithExternalDictionary(
+    const float* fp32, uint32_t R, uint32_t C,
+    const SharedDictionary& dict,
+    SegmentType /*original_type*/,
+    const std::string& name) const
+{
+    const auto& cfg = dict.config;
+    if (R % cfg.tile_rows != 0 || C % cfg.tile_cols != 0) {
+        throw CompressionError("compressFP32WithExternalDictionary: '" + name
+                               + "' shape not divisible by tile size");
+    }
+    const uint32_t tile_dim = cfg.tileSize();
+    if (dict.atoms.size() != static_cast<size_t>(cfg.n_atoms) * tile_dim) {
+        throw CompressionError("compressFP32WithExternalDictionary: dictionary size doesn't match config");
+    }
+
+    // 1D row-tile fast path: the FP32 view is already laid out as (R) tiles
+    // of width C — no extractTiles copy required. 2D mode still pays the
+    // extractTiles cost; that's the rare path for big-LLM weight shapes.
+    const bool is_1d_full_row = (cfg.tile_rows == 1) && (cfg.tile_cols == C);
 
     uint32_t n_tiles = 0;
-    std::vector<float> tiles = extractTiles(fp32_view.data(), R, C,
-                                             cfg.tile_rows, cfg.tile_cols, n_tiles);
+    std::vector<float> tiles_storage;
+    const float* tile_base = nullptr;
+    if (is_1d_full_row) {
+        n_tiles = R;
+        tile_base = fp32;
+    } else {
+        tiles_storage = extractTiles(fp32, R, C, cfg.tile_rows, cfg.tile_cols, n_tiles);
+        tile_base = tiles_storage.data();
+    }
 
     const uint32_t slots_per_tile = static_cast<uint32_t>(cfg.n_stages) * cfg.active_bits_per_stage;
     std::vector<uint16_t> indices(static_cast<size_t>(n_tiles) * slots_per_tile);
     std::vector<int8_t>   signs(static_cast<size_t>(n_tiles) * slots_per_tile);
-    encodeAllTilesAgainstDictionary(tiles.data(), n_tiles, tile_dim,
+    encodeAllTilesAgainstDictionary(tile_base, n_tiles, tile_dim,
                                      dict.atoms.data(), cfg.n_atoms,
                                      cfg.n_stages, cfg.active_bits_per_stage,
                                      dict.stage_scales.data(),
@@ -1439,7 +1885,8 @@ bool segmentDtypeSupported(const ModelSegment& seg) {
         || fmt == "f16" || fmt == "fp16" || fmt == "float16" || fmt == "half"
         || fmt == "bf16" || fmt == "bfloat16"
         || fmt == "i8" || fmt == "int8"
-        || fmt == "q4_0" || fmt == "q8_0";
+        || fmt == "q4_0" || fmt == "q8_0"
+        || fmt == "q4_k" || fmt == "q5_k" || fmt == "q6_k";
 }
 
 bool segmentSuitable(const ModelSegment& seg, const HierarchicalSDRConfig& cfg,
@@ -1525,65 +1972,248 @@ HierarchicalSDRStrategy::compressGroupedSegments(
         if (seg_indices.empty()) continue;
         const HierarchicalSDRConfig& cfg = per_segment_cfg[seg_indices.front()];
 
-        // 2a. Pool tiles. Per-segment tile extraction.
-        std::vector<float> pooled;
-        uint32_t pooled_count = 0;
+        // 2a. Pool tiles. Per-segment tile extraction with optional reservoir
+        // sampling, so the in-memory pool is bounded by max_tiles_for_fit
+        // regardless of total tile count. Crucial for big models — without it,
+        // a bucket of large MLP tensors easily allocates many GB before fit.
         const uint32_t tile_dim = cfg.tileSize();
 
-        // First pass: total size to reserve.
-        size_t total_tiles_floats = 0;
+        // First pass: total tile count (no allocation).
+        uint64_t total_tiles_64 = 0;
         for (size_t idx : seg_indices) {
             const auto& s = segments[idx];
             const auto& dims = s.tensor_metadata.value().dimensions;
-            const uint32_t R = static_cast<uint32_t>(dims[0]);
-            const uint32_t C = static_cast<uint32_t>(dims[1]);
-            const uint32_t nt = (R / cfg.tile_rows) * (C / cfg.tile_cols);
-            total_tiles_floats += static_cast<size_t>(nt) * tile_dim;
-            pooled_count += nt;
+            const uint64_t R = static_cast<uint64_t>(dims[0]);
+            const uint64_t C = static_cast<uint64_t>(dims[1]);
+            total_tiles_64 += (R / cfg.tile_rows) * (C / cfg.tile_cols);
         }
-        pooled.reserve(total_tiles_floats);
+        const uint32_t pooled_count = (total_tiles_64 > 0xFFFFFFFFu)
+                                       ? 0xFFFFFFFFu
+                                       : static_cast<uint32_t>(total_tiles_64);
 
-        // Second pass: actually extract. Dequantise each segment to FP32 (no-op
-        // for already-FP32) before tile extraction so the pool is dtype-uniform.
+        // Capacity for the pool (in tiles): unbounded → use total; capped →
+        // use the cap. Encoding still runs on every tile in step 2d.
+        const uint32_t pool_capacity_tiles =
+            (cfg.max_tiles_for_fit > 0 && total_tiles_64 > cfg.max_tiles_for_fit)
+                ? cfg.max_tiles_for_fit
+                : pooled_count;
+
+        std::vector<float> pooled(static_cast<size_t>(pool_capacity_tiles) * tile_dim);
+        bool use_reservoir = (pool_capacity_tiles < pooled_count);
+
+        // Second pass: dequantise per-segment (one segment's FP32 in memory
+        // at a time), iterate its tiles, and either append (no cap) or run
+        // reservoir sampling (cap).
+        std::mt19937 res_rng(0xC0DECAFE ^ pool_capacity_tiles);
+        uint64_t seen_tiles = 0;     // global counter for reservoir indexing
+        uint32_t pool_fill = 0;      // tiles currently in the pool (≤ capacity)
+
+        // Track which seg_indices were successfully pooled, so we only try to
+        // encode those in step 2d. (If a dequant OOMs we just skip the segment.)
+        std::vector<size_t> pooled_seg_indices;
+        pooled_seg_indices.reserve(seg_indices.size());
+        // Cache the dequantised FP32 view per pooled segment so step 2d doesn't
+        // re-dequantise. Parallel to pooled_seg_indices. Memory cost: the sum
+        // of all bucket weights as FP32 (bounded by the bucket's source size
+        // times the dtype expansion factor — typically 4-8x for Q4_K_M).
+        std::vector<std::vector<float>> cached_fp32;
+        cached_fp32.reserve(seg_indices.size());
+
         for (size_t idx : seg_indices) {
             const auto& s = segments[idx];
             const auto& dims = s.tensor_metadata.value().dimensions;
             const uint32_t R = static_cast<uint32_t>(dims[0]);
             const uint32_t C = static_cast<uint32_t>(dims[1]);
-            std::vector<float> fp32_view = dequantizeSegmentToFP32(s);
+
+            // For 1D row-tile mode (tile_rows == 1, tile_cols == C) the segment's
+            // FP32 view is already laid out as (R) tiles of width C — no second
+            // tile array is needed. For 2D mode we still call extractTiles, but
+            // big LLM tensors almost always hit the 1D path under --fast, so the
+            // peak heap is just one fp32_view rather than fp32_view + tiles.
+            const bool is_1d_full_row =
+                (cfg.tile_rows == 1) && (cfg.tile_cols == static_cast<uint32_t>(C));
+
+            // Guard against single-segment OOM (e.g. 150k-vocab embedding
+            // dequanting to 2+ GB FP32). The whole bucket survives a single
+            // bad-alloc — the offending segment is reported in out_skipped_names.
+            std::vector<float> fp32_view;
+            try {
+                fp32_view = dequantizeSegmentToFP32(s);
+            } catch (const std::bad_alloc&) {
+                if (out_skipped_names) out_skipped_names->push_back(s.name);
+                continue;
+            } catch (const std::exception&) {
+                if (out_skipped_names) out_skipped_names->push_back(s.name);
+                continue;
+            }
             if (fp32_view.size() != static_cast<size_t>(R) * C) {
                 throw CompressionError("compressGroupedSegments: dequant size mismatch on '"
                                        + s.name + "'");
             }
+
+            // Per-segment NaN/Inf gate. Real-world quantised tensors occasionally
+            // have degenerate block scales (e.g. fp16 super-scale with exponent=31
+            // → Inf, or upstream parser bugs reading wrong bytes for a shard).
+            // Even a small fraction of NaN tiles corrupts the K-SVD fit because
+            // residuals propagate NaN to every atom. Sanitize NaN/Inf to zero
+            // and skip the whole segment if it's mostly bad.
+            //
+            // Two-stage check: first a sparse probe (1-in-256) bailing
+            // immediately for clean tensors (the common case). Only fall back
+            // to a full parallel sweep when the probe hits a non-finite value.
+            {
+                const size_t n = fp32_view.size();
+                bool any_bad = false;
+                constexpr size_t kProbeStride = 256;
+                for (size_t i = 0; i < n; i += kProbeStride) {
+                    if (!std::isfinite(fp32_view[i])) { any_bad = true; break; }
+                }
+                if (any_bad) {
+                    // Full parallel sweep: count + sanitise non-finite values.
+                    size_t bad = 0;
+                    const int64_t ns = static_cast<int64_t>(n);
+                    #pragma omp parallel for reduction(+:bad) schedule(static)
+                    for (int64_t i = 0; i < ns; ++i) {
+                        if (!std::isfinite(fp32_view[i])) {
+                            fp32_view[i] = 0.0f;
+                            ++bad;
+                        }
+                    }
+                    const double bad_ratio = static_cast<double>(bad) / std::max<size_t>(1, n);
+                    if (bad_ratio > 1e-3) {
+                        if (out_skipped_names) out_skipped_names->push_back(s.name);
+                        continue;
+                    }
+                }
+            }
             uint32_t nt_check = 0;
-            std::vector<float> tiles = extractTiles(fp32_view.data(), R, C,
-                                                     cfg.tile_rows, cfg.tile_cols, nt_check);
-            pooled.insert(pooled.end(), tiles.begin(), tiles.end());
+            std::vector<float> tiles_storage;
+            const float* tile_base = nullptr;
+            if (is_1d_full_row) {
+                nt_check = R;
+                tile_base = fp32_view.data();
+            } else {
+                tiles_storage = extractTiles(fp32_view.data(), R, C,
+                                              cfg.tile_rows, cfg.tile_cols, nt_check);
+                tile_base = tiles_storage.data();
+                std::vector<float>().swap(fp32_view);  // free early in 2D path
+            }
+
+            if (!use_reservoir) {
+                std::memcpy(pooled.data() + static_cast<size_t>(pool_fill) * tile_dim,
+                            tile_base,
+                            static_cast<size_t>(nt_check) * tile_dim * sizeof(float));
+                pool_fill += nt_check;
+                seen_tiles += nt_check;
+                pooled_seg_indices.push_back(idx);
+                cached_fp32.push_back(std::move(fp32_view));
+                continue;
+            }
+            // Reservoir sampling: each incoming tile either lands in the
+            // reservoir directly (until full) or replaces a random existing
+            // entry with probability (capacity / seen_so_far).
+            for (uint32_t i = 0; i < nt_check; ++i) {
+                const float* src = tile_base + static_cast<size_t>(i) * tile_dim;
+                if (pool_fill < pool_capacity_tiles) {
+                    std::memcpy(pooled.data() + static_cast<size_t>(pool_fill) * tile_dim,
+                                src, tile_dim * sizeof(float));
+                    ++pool_fill;
+                } else {
+                    std::uniform_int_distribution<uint64_t> dist(0, seen_tiles);
+                    const uint64_t j = dist(res_rng);
+                    if (j < pool_capacity_tiles) {
+                        std::memcpy(pooled.data() + static_cast<size_t>(j) * tile_dim,
+                                    src, tile_dim * sizeof(float));
+                    }
+                }
+                ++seen_tiles;
+            }
+            pooled_seg_indices.push_back(idx);
+            // In 1D mode fp32_view is still alive (we streamed tiles from it
+            // directly without an extractTiles copy). Keep it for encode reuse.
+            // 2D mode already freed it above; cache an empty placeholder so
+            // indices stay aligned.
+            cached_fp32.push_back(std::move(fp32_view));
+        }
+        // Trim the pool buffer to actual fill (rare in capped path; usual in
+        // the uncapped path where pool_fill == pooled_count). Also make
+        // pooled_count reflect the in-pool count from this point forward.
+        if (pool_fill != pooled.size() / tile_dim) {
+            pooled.resize(static_cast<size_t>(pool_fill) * tile_dim);
         }
 
-        if (pooled_count < cfg.n_atoms) {
+        // Pool integrity check. If any non-finite values made it into the
+        // pool, the K-SVD fit will produce NaN atoms regardless of how
+        // robust the update is. Scan, count, and sanitize.
+        {
+            size_t nan_n = 0, inf_n = 0;
+            const size_t pool_n = static_cast<size_t>(pool_fill) * tile_dim;
+            for (size_t i = 0; i < pool_n; ++i) {
+                const float v = pooled[i];
+                if (std::isnan(v)) { pooled[i] = 0.0f; ++nan_n; }
+                else if (std::isinf(v)) { pooled[i] = 0.0f; ++inf_n; }
+            }
+            if (nan_n + inf_n > 0) {
+                std::cerr << "[hsdr-pool] sanitized " << nan_n << " NaN + "
+                          << inf_n << " Inf values in pool (size " << pool_n
+                          << " floats, " << pool_fill << " tiles)\n";
+            }
+        }
+
+        if (pool_fill < cfg.n_atoms) {
             // Pool too small to fit the requested dictionary — skip the whole bucket
-            // and mark every member as skipped.
-            for (size_t idx : seg_indices) {
+            // and mark every successfully-pooled member as skipped (segments that
+            // already failed dequant were pushed to out_skipped_names above).
+            for (size_t idx : pooled_seg_indices) {
                 if (out_skipped_names) out_skipped_names->push_back(segments[idx].name);
             }
             continue;
         }
 
-        // 2b. Fit shared dictionary on the pool.
-        SharedDictionary shared = fitSharedDictionary(pooled, pooled_count, cfg);
+        // 2c. Fit shared dictionary on the reservoir-sampled pool.
+        SharedDictionary shared = fitSharedDictionary(pooled, pool_fill, cfg);
         const size_t dict_index = archive.dictionaries.size();
         archive.dictionaries.push_back(std::move(shared));
 
-        // 2c. Encode each segment in the bucket against the new shared dict.
+        // 2d. Encode each successfully-pooled segment against the new shared dict.
+        // Reuse the FP32 view cached during pool fill so we don't pay a second
+        // dequant. For segments whose fp32_view was freed early (2D mode),
+        // fall back to the dequant-internal path.
         const SharedDictionary& dict_ref = archive.dictionaries[dict_index];
-        for (size_t idx : seg_indices) {
+        for (size_t ki = 0; ki < pooled_seg_indices.size(); ++ki) {
+            const size_t idx = pooled_seg_indices[ki];
             const auto& s = segments[idx];
             SharedDictArchive::SegmentEntry entry;
             entry.name = s.name;
             entry.dict_index = dict_index;
-            entry.codes_bytes = compressWithExternalDictionary(s, dict_ref);
-            entry.original_size = s.data.size();
+            try {
+                const auto& dims = s.tensor_metadata.value().dimensions;
+                const uint32_t R = static_cast<uint32_t>(dims[0]);
+                const uint32_t C = static_cast<uint32_t>(dims[1]);
+                if (!cached_fp32[ki].empty()) {
+                    entry.codes_bytes = compressFP32WithExternalDictionary(
+                        cached_fp32[ki].data(), R, C, dict_ref, s.type, s.name);
+                    // Free the cached fp32 as soon as it's encoded — reduces
+                    // peak memory across the encode loop.
+                    std::vector<float>().swap(cached_fp32[ki]);
+                } else {
+                    entry.codes_bytes = compressWithExternalDictionary(s, dict_ref);
+                }
+            } catch (const std::bad_alloc&) {
+                if (out_skipped_names) out_skipped_names->push_back(s.name);
+                continue;
+            } catch (const std::exception&) {
+                if (out_skipped_names) out_skipped_names->push_back(s.name);
+                continue;
+            }
+            // original_size is the FP32 reconstruction byte size, NOT the
+            // on-disk source size. The decompressor reconstructs into FP32
+            // and validates against this field. Source dtype is preserved
+            // separately in original_type for ratio reporting.
+            const auto& dims = s.tensor_metadata.value().dimensions;
+            entry.original_size = static_cast<size_t>(dims[0])
+                                * static_cast<size_t>(dims[1])
+                                * sizeof(float);
             entry.original_type = s.type;
             archive.segments.push_back(std::move(entry));
         }
