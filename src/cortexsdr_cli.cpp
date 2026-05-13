@@ -681,11 +681,67 @@ static int sample_token_deterministic(
     return scored.empty() ? -1 : scored.front().second;
 }
 
+// Fast vocab scoring against lazy HSDR embedding: precompute (atom · hidden)
+// once for all K atoms, then each token's logit is a Σ over slots of
+// sign × γ × precomputed[atom_idx]. O(K·C + V·slots) instead of O(V·C).
+static int select_next_token_from_lazy_hsdr(
+    const std::vector<float>& hidden,
+    const std::vector<int>& already_generated,
+    float temperature) {
+    if (!g_lazy_emb.valid || hidden.size() != g_lazy_emb.C) return -1;
+    const uint32_t V = g_lazy_emb.R;
+    const uint32_t C = g_lazy_emb.C;
+    const uint16_t K = g_lazy_emb.K;
+    const uint8_t S = g_lazy_emb.S;
+    const uint8_t k = g_lazy_emb.k;
+    const size_t slots = static_cast<size_t>(S) * k;
+    // Precompute Atom·hidden for every atom.
+    std::vector<float> ah(K);
+    for (uint16_t a = 0; a < K; ++a) {
+        const float* atom = g_lazy_emb.atoms.data() + static_cast<size_t>(a) * C;
+        double s = 0.0;
+        for (uint32_t c = 0; c < C; ++c) s += static_cast<double>(atom[c]) * hidden[c];
+        ah[a] = static_cast<float>(s);
+    }
+    const float temp_scale = temperature > 0.0f ? (1.0f / temperature) : 1.0f;
+    int best_token = -1;
+    float best_score = -std::numeric_limits<float>::infinity();
+    for (uint32_t tok = 0; tok < V; ++tok) {
+        const uint16_t* slot_base = g_lazy_emb.packed.data() + static_cast<size_t>(tok) * slots;
+        float score = 0.0f;
+        for (uint8_t l = 0; l < S; ++l) {
+            const float gamma = g_lazy_emb.stage_scales[l];
+            for (uint8_t b = 0; b < k; ++b) {
+                const uint16_t pk = slot_base[static_cast<size_t>(l) * k + b];
+                const uint16_t idx = pk >> 1;
+                const float sgn = (pk & 1) ? -1.0f : +1.0f;
+                if (idx >= K) continue;
+                score += gamma * sgn * ah[idx];
+            }
+        }
+        score *= temp_scale;
+        if (token_is_repeated(already_generated, static_cast<int>(tok))) {
+            score -= 1.0f;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best_token = static_cast<int>(tok);
+        }
+    }
+    return best_token;
+}
+
 static int select_next_token_from_embedding_transpose(
     const std::vector<float>& hidden,
     const CortexAICompression::LayerInfo& token_embedding,
     const std::vector<int>& already_generated,
     float temperature = 0.8f) {
+    // Route through the lazy HSDR path when the embedding is HSDR-encoded —
+    // dereferencing token_embedding.weights.data() would segfault since the
+    // lazy path keeps weights empty.
+    if (g_lazy_emb.valid) {
+        return select_next_token_from_lazy_hsdr(hidden, already_generated, temperature);
+    }
     const EmbeddingLayout layout = infer_embedding_layout(token_embedding);
     if (!layout.valid() || hidden.size() != layout.embedding_dim) {
         return -1;
@@ -960,6 +1016,8 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                 throw std::runtime_error("Prompt tokenization produced no tokens");
             }
 
+            std::cerr << "[DBG] entering native decode block\n";
+            std::cerr.flush();
             // Try lazy HSDR row-decode first — skips the 2 GB FP32 materialisation
             // that would OOM on a 150k-vocab embedding. Fall back to eager
             // loadLayerByName only when the segment isn't HSDR-encoded.
@@ -1001,6 +1059,9 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                     std::cout << "  - Token embedding cache warmup: " << embed_load_ms << "ms" << std::endl;
                 }
             }
+            std::cerr << "[DBG] post-lazy-parse, valid=" << g_lazy_emb.valid
+                      << ", cached_present=" << (bool)g_cached_token_embedding << "\n";
+            std::cerr.flush();
             static CortexAICompression::LayerInfo empty_layer_info;
             const CortexAICompression::LayerInfo& token_embedding =
                 g_lazy_emb.valid ? empty_layer_info : *g_cached_token_embedding;
@@ -1009,9 +1070,13 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                 throw std::runtime_error("Token embedding layer has no accessible backing data");
             }
 
+            std::cerr << "[DBG] about to build_prompt_context_hidden, tokens=" << prompt_tokens.size() << "\n";
+            std::cerr.flush();
             std::vector<int> generated;
             generated.reserve(static_cast<size_t>(max_length));
             const std::vector<float> prompt_hidden = build_prompt_context_hidden(token_embedding, prompt_tokens);
+            std::cerr << "[DBG] prompt_hidden built, size=" << prompt_hidden.size() << "\n";
+            std::cerr.flush();
             int cur_token = prompt_tokens.back();
             const int step_limit = std::min(max_length, std::max(1, g_native_max_steps));
             std::string stop_reason = "max_steps";
@@ -1029,24 +1094,65 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                     if (prompt_hidden.empty()) {
                         throw std::runtime_error("Prompt context embedding failed");
                     }
-                    decoder_out = g_inference_engine->runPrefill(prompt_hidden, g_decoder_layer_order);
+                    std::cerr << "[DBG] step 0: calling runPrefill, decoder_layers=" << g_decoder_layer_order.size() << "\n";
+                    // Filter to only the layers we actually have segments for.
+                    // Try several name conventions because the execution order
+                    // and segment index don't always agree on the suffix.
+                    std::vector<std::string> safe_layers;
+                    safe_layers.reserve(g_decoder_layer_order.size());
+                    size_t missing_count = 0;
+                    for (const auto& name : g_decoder_layer_order) {
+                        if (g_model_loader->findSegmentHeader(name) != nullptr
+                            || g_model_loader->findSegmentHeader(name + ".weight") != nullptr) {
+                            safe_layers.push_back(name);
+                        } else {
+                            ++missing_count;
+                            if (missing_count <= 5) {
+                                std::cerr << "[DBG]  missing layer: '" << name << "'\n";
+                            }
+                        }
+                    }
+                    if (missing_count > 0) {
+                        std::cerr << "[DBG] skipping " << missing_count
+                                  << " layers with missing segments\n";
+                    }
+                    std::cerr << "[DBG] safe_layers=" << safe_layers.size() << " sample=";
+                    for (size_t i = 0; i < std::min<size_t>(5, safe_layers.size()); ++i) {
+                        std::cerr << safe_layers[i] << " ";
+                    }
+                    std::cerr << "\n";
+                    std::cerr.flush();
+                    decoder_out = g_inference_engine->runPrefill(prompt_hidden, safe_layers);
+                    std::cerr << "[DBG] runPrefill returned, size=" << decoder_out.size() << "\n";
+                    std::cerr.flush();
                 } else {
                     auto hidden = embedding_lookup(token_embedding, cur_token);
                     if (hidden.empty()) {
                         throw std::runtime_error("Token embedding lookup failed");
                     }
-                    decoder_out = g_inference_engine->runDecodeStep(hidden, g_decoder_layer_order);
+                    std::vector<std::string> safe_layers;
+                    safe_layers.reserve(g_decoder_layer_order.size());
+                    for (const auto& name : g_decoder_layer_order) {
+                        if (g_model_loader->findSegmentHeader(name) != nullptr) {
+                            safe_layers.push_back(name);
+                        }
+                    }
+                    decoder_out = g_inference_engine->runDecodeStep(hidden, safe_layers);
                 }
                 const auto decode_end = std::chrono::steady_clock::now();
                 if (decoder_out.empty()) {
                     throw std::runtime_error("Decoder stack returned empty output");
                 }
 
+                std::cerr << "[DBG] about to sample, decoder_out.size=" << decoder_out.size() << "\n";
+                std::cerr.flush();
                 const auto sample_start = std::chrono::steady_clock::now();
                 cur_token = g_fast_native_sampling
                     ? select_next_token_from_embedding_transpose(
                         decoder_out, token_embedding, generated, 0.8f)
                     : -1;
+                std::cerr << "[DBG] sampled token=" << cur_token << "\n";
+                std::cerr.flush();
                 const auto sample_end = std::chrono::steady_clock::now();
                 if (cur_token < 0) {
                     throw std::runtime_error("Failed to sample next token");

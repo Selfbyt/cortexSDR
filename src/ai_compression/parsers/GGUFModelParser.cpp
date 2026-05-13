@@ -13,6 +13,8 @@
 #include <iomanip>
 #include <limits>
 #include <filesystem>
+#include <iostream>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace CortexAICompression {
@@ -735,10 +737,15 @@ std::vector<ModelSegment> GGUFModelParser::parse(const std::string& modelPath) c
     shard_files.reserve(shard_paths.size());
     std::vector<GGUFHeaderInfo> shard_headers;
     shard_headers.reserve(shard_paths.size());
-    std::vector<GGUFTensorInfo> tensor_infos;
-    tensor_infos.reserve(1024);
-    std::unordered_set<std::string> seen_tensor_names;
-    seen_tensor_names.reserve(2048);
+
+    // Collect every shard's tensor metadata. Each GGUF shard typically lists
+    // the WHOLE tensor table; only one shard has the actual bytes for any
+    // given tensor (offset within that shard's data section is valid). We
+    // can't dedup by name before checking offsets — otherwise we drop the
+    // shard-2 entries that carry valid offsets for tensors actually in
+    // shard 2, leaving only shard-1's view which has bogus offsets for those.
+    std::vector<std::vector<GGUFTensorInfo>> per_shard_tensors;
+    per_shard_tensors.reserve(shard_paths.size());
 
     for (size_t shard_index = 0; shard_index < shard_paths.size(); ++shard_index) {
         shard_files.emplace_back(shard_paths[shard_index], std::ios::binary);
@@ -747,12 +754,12 @@ std::vector<ModelSegment> GGUFModelParser::parse(const std::string& modelPath) c
         }
         GGUFHeaderInfo header = readHeader(shard_files.back());
         auto shard_tensors = readTensorInfo(shard_files.back(), header, shard_index);
-        for (auto& tensor : shard_tensors) {
-            // Avoid duplicate tensor descriptors across shards.
-            if (seen_tensor_names.insert(tensor.name).second) {
-                tensor_infos.push_back(std::move(tensor));
-            }
+        std::cerr << "  shard " << shard_index << " sample tensor names:";
+        for (size_t i = 0; i < std::min<size_t>(5, shard_tensors.size()); ++i) {
+            std::cerr << " '" << shard_tensors[i].name << "'";
         }
+        std::cerr << " ... (" << shard_tensors.size() << " total)\n";
+        per_shard_tensors.push_back(std::move(shard_tensors));
         shard_headers.push_back(std::move(header));
     }
 
@@ -776,24 +783,27 @@ std::vector<ModelSegment> GGUFModelParser::parse(const std::string& modelPath) c
         }
     }
 
-    std::vector<GGUFTensorInfo> resolved_infos;
-    resolved_infos.reserve(tensor_infos.size());
     const auto resolveTensorOffsetForShards =
         [&shard_data_sizes, &shard_data_prefix](GGUFTensorInfo& info) -> bool {
+            // Primary: assume the tensor's metadata is listed in its OWN shard
+            // (which is the standard split-GGUF layout) — offset is local to
+            // that shard's data section.
             if (info.shard_index < shard_data_sizes.size()) {
                 const uint64_t shard_cap = shard_data_sizes[info.shard_index];
                 if (info.offset <= shard_cap && info.size <= (shard_cap - info.offset)) {
                     return true;
                 }
             }
-
-            // Fallback: some split GGUF variants encode offsets on the concatenated data stream.
+            // Fallback for linked-mode splits where shard 0's metadata is the
+            // master and offsets are cumulative across all shards' data. Only
+            // accept if the cumulative offset maps cleanly to a DIFFERENT
+            // shard than the metadata claimed (otherwise the primary check
+            // would have already accepted or rejected based on its own shard).
             for (size_t shard = 0; shard < shard_data_sizes.size(); ++shard) {
+                if (shard == info.shard_index) continue;
                 const uint64_t prefix = shard_data_prefix[shard];
                 const uint64_t cap = shard_data_sizes[shard];
-                if (info.offset < prefix) {
-                    continue;
-                }
+                if (info.offset < prefix) continue;
                 const uint64_t local = info.offset - prefix;
                 if (local <= cap && info.size <= (cap - local)) {
                     info.shard_index = shard;
@@ -804,9 +814,61 @@ std::vector<ModelSegment> GGUFModelParser::parse(const std::string& modelPath) c
             return false;
         };
 
-    for (auto info : tensor_infos) {
-        if (resolveTensorOffsetForShards(info)) {
-            resolved_infos.push_back(std::move(info));
+    // Merge per-shard tensor lists. Each shard may list ALL tensors in its
+    // metadata table, but only ONE shard actually has the bytes for any
+    // given tensor — the one whose recorded offset fits within that shard's
+    // data section. Iterate per-shard, keep the first valid resolution per
+    // tensor name.
+    std::vector<GGUFTensorInfo> resolved_infos;
+    std::unordered_map<std::string, size_t> resolved_index;  // name → resolved_infos idx
+    size_t total_seen = 0;
+    size_t failed_resolution = 0;
+    std::vector<std::string> failed_samples;
+    for (size_t shard_index = 0; shard_index < per_shard_tensors.size(); ++shard_index) {
+        for (auto& info : per_shard_tensors[shard_index]) {
+            ++total_seen;
+            if (resolved_index.count(info.name)) continue;
+            GGUFTensorInfo candidate = info;
+            if (resolveTensorOffsetForShards(candidate)) {
+                resolved_index[info.name] = resolved_infos.size();
+                resolved_infos.push_back(std::move(candidate));
+            } else {
+                ++failed_resolution;
+                if (failed_samples.size() < 5) {
+                    std::ostringstream oss;
+                    oss << info.name << " (shard=" << info.shard_index
+                        << " offset=" << info.offset << " size=" << info.size << ")";
+                    failed_samples.push_back(oss.str());
+                }
+            }
+        }
+    }
+    if (failed_resolution > 0) {
+        std::cerr << "GGUF parser: " << failed_resolution
+                  << " tensor entries failed to resolve. Samples:\n";
+        for (const auto& s : failed_samples) std::cerr << "    " << s << "\n";
+        std::cerr << "  shard sizes: ";
+        for (size_t i = 0; i < shard_data_sizes.size(); ++i) {
+            std::cerr << "shard" << i << "=" << shard_data_sizes[i] << " ";
+        }
+        std::cerr << "\n";
+    }
+    // Always log shard merge stats so we can see if both shards are
+    // contributing tensors or if one of them is silently empty.
+    {
+        std::vector<size_t> per_shard_won(shard_paths.size(), 0);
+        for (const auto& info : resolved_infos) {
+            if (info.shard_index < per_shard_won.size()) {
+                ++per_shard_won[info.shard_index];
+            }
+        }
+        std::cerr << "GGUF parser: resolved " << resolved_infos.size()
+                  << " unique tensors out of " << total_seen
+                  << " entries across " << shard_paths.size() << " shards\n";
+        for (size_t i = 0; i < per_shard_won.size(); ++i) {
+            std::cerr << "  shard " << i << " (" << shard_paths[i].filename().string()
+                      << ") contributed " << per_shard_won[i] << " tensors, listed "
+                      << per_shard_tensors[i].size() << "\n";
         }
     }
 

@@ -83,18 +83,25 @@ int main(int argc, char** argv) {
         rows.push_back(std::move(r));
     }
 
-    std::sort(rows.begin(), rows.end(),
+    bool show_all = false;
+    for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--all") show_all = true;
+
+    auto sorted = rows;
+    std::sort(sorted.begin(), sorted.end(),
               [](const Row& a, const Row& b){ return a.comp > b.comp; });
 
     uint64_t total = 0;
-    std::cout << "  top 25 segments by compressed size:\n";
+    const size_t limit = show_all ? rows.size() : std::min<size_t>(25, sorted.size());
+    std::cout << "  " << (show_all ? "all" : "top 25") << " segments"
+              << (show_all ? "" : " by compressed size") << ":\n";
     std::cout << "  strat_id  comp_size      orig_size     name\n";
-    for (size_t i = 0; i < std::min<size_t>(25, rows.size()); ++i) {
+    for (size_t i = 0; i < limit; ++i) {
+        const Row& r = show_all ? rows[i] : sorted[i];
         std::printf("    %2u      %12llu  %12llu   %s\n",
-            static_cast<unsigned>(rows[i].strat),
-            static_cast<unsigned long long>(rows[i].comp),
-            static_cast<unsigned long long>(rows[i].orig),
-            rows[i].name.c_str());
+            static_cast<unsigned>(r.strat),
+            static_cast<unsigned long long>(r.comp),
+            static_cast<unsigned long long>(r.orig),
+            r.name.c_str());
     }
     for (auto& r : rows) total += r.comp;
     std::cout << "\n  sum of compressed_size across " << rows.size()

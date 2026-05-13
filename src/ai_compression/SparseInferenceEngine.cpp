@@ -1479,6 +1479,47 @@ void SDRInferenceEngine::setForceCompressedCompute(bool enable) {
  * @return Output tensor after linear transformation
  */
 std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, const std::vector<float>& input) {
+    // HSDR fast-path early exit. If the segment is HSDR-encoded and the
+    // batch is 1, route through the fused matmul directly — skips both the
+    // FP32 weight materialisation in getPrefetchedLayer AND the dense O(R·C)
+    // matmul below. At Qwen-7B scale this is the difference between minutes
+    // and milliseconds per layer.
+    {
+        constexpr uint8_t HSDR_STRATEGY_ID_EARLY = 5;
+        std::string seg_name = layer.name;
+        const auto* hdr = loader_.findSegmentHeader(seg_name);
+        if (!hdr) {
+            seg_name = layer.name + ".weight";
+            hdr = loader_.findSegmentHeader(seg_name);
+        }
+        if (hdr && hdr->compression_strategy_id == HSDR_STRATEGY_ID_EARLY) {
+            // Need a 1-D row-tile shape: output_size rows, input_size cols.
+            size_t isz = productFromShape(layer.input_shape, true);
+            size_t osz = productFromShape(layer.output_shape, true);
+            if (isz == 0 || osz == 0) {
+                // Fall through to the normal path which has more elaborate
+                // shape inference. Most HSDR segments have valid metadata so
+                // this branch should be rare.
+            } else if (!input.empty() && input.size() % isz == 0) {
+                const size_t eff_batch = input.size() / isz;
+                if (eff_batch == 1) {
+                    try {
+                        auto Y = loader_.matmulHSDR(seg_name, input.data(), /*batch=*/1);
+                        if (Y.size() == osz) {
+                            if (!layer.biases.empty() && layer.biases.size() == osz) {
+                                for (size_t r = 0; r < osz; ++r) Y[r] += layer.biases[r];
+                            }
+                            last_layer_used_compressed_ = true;
+                            return Y;
+                        }
+                    } catch (const std::exception&) {
+                        // Fall through to dense path below.
+                    }
+                }
+            }
+        }
+    }
+
     // Debug: print shapes for first few layers BEFORE calculating
     static int debug_count = 0;
     if (debug_count < 5) {
@@ -1652,11 +1693,20 @@ std::vector<float> SDRInferenceEngine::applyLinearLayer(const LayerInfo& layer, 
     // matmul variant lands.
     {
         constexpr uint8_t HSDR_STRATEGY_ID = 5;
-        const auto* header = loader_.findSegmentHeader(layer.name);
+        // Try several name conventions because the execution-order machinery
+        // sometimes strips the ".weight" suffix that the archive uses as the
+        // segment key. Without this fallback the HSDR fast-path never fires
+        // for engines that pass logical layer names instead of segment names.
+        std::string resolved_segment_name = layer.name;
+        const auto* header = loader_.findSegmentHeader(resolved_segment_name);
+        if (!header) {
+            resolved_segment_name = layer.name + ".weight";
+            header = loader_.findSegmentHeader(resolved_segment_name);
+        }
         if (header && header->compression_strategy_id == HSDR_STRATEGY_ID
             && effective_batch == 1) {
             try {
-                auto Y = loader_.matmulHSDR(layer.name, input.data(), /*batch=*/1);
+                auto Y = loader_.matmulHSDR(resolved_segment_name, input.data(), /*batch=*/1);
                 if (Y.size() == output_size) {
                     if (!layer.biases.empty() && layer.biases.size() == output_size) {
                         for (size_t r = 0; r < output_size; ++r) Y[r] += layer.biases[r];
@@ -2877,12 +2927,40 @@ std::vector<float> SDRInferenceEngine::runLayersOnDemand(const std::vector<std::
         
         auto start_time = std::chrono::high_resolution_clock::now();
         LayerInfo current_layer;
-        
-        try {
-            current_layer = getPrefetchedLayer(layer_name);
-        } catch (const std::exception& e) {
-            std::cerr << "[SDRInferenceEngine] ERROR: Failed to load layer '" << layer_name << "': " << e.what() << std::endl;
-            continue;
+
+        // HSDR shortcut: if the layer's weight segment is HSDR-encoded,
+        // skip the full eager decompress (which would materialise the FP32
+        // weight matrix — minutes per Qwen-MLP layer) and build a stub
+        // LayerInfo carrying only the shape metadata. The HSDR fast-path
+        // inside applyLinearLayer will pick the weights up directly from
+        // the compressed bytes via matmulHSDR.
+        bool used_hsdr_stub = false;
+        {
+            constexpr uint8_t HSDR_STRATEGY_ID_STUB = 5;
+            std::string seg_name = layer_name;
+            const auto* hdr = loader_.findSegmentHeader(seg_name);
+            if (!hdr) {
+                seg_name = layer_name + ".weight";
+                hdr = loader_.findSegmentHeader(seg_name);
+            }
+            if (hdr && hdr->compression_strategy_id == HSDR_STRATEGY_ID_STUB) {
+                current_layer.name = layer_name;
+                current_layer.layer_type = hdr->layer_type.empty() ? std::string("LINEAR")
+                                                                    : hdr->layer_type;
+                current_layer.input_shape = hdr->input_shape;
+                current_layer.output_shape = hdr->output_shape;
+                // weights / raw_data intentionally left empty.
+                used_hsdr_stub = true;
+            }
+        }
+
+        if (!used_hsdr_stub) {
+            try {
+                current_layer = getPrefetchedLayer(layer_name);
+            } catch (const std::exception& e) {
+                std::cerr << "[SDRInferenceEngine] ERROR: Failed to load layer '" << layer_name << "': " << e.what() << std::endl;
+                continue;
+            }
         }
         
         auto load_time = std::chrono::high_resolution_clock::now();
