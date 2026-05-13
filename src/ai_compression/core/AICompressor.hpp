@@ -12,6 +12,7 @@
 #include "AIModelParser.hpp"
 #include "../strategies/CompressionStrategy.hpp"
 #include "ModelSegment.hpp"
+#include <functional>
 #include <string>
 #include <vector>
 #include <memory>
@@ -202,6 +203,18 @@ public:
     void setCompressionThreads(size_t numThreads) { numThreads_ = numThreads; }
 
     /**
+     * @brief Set a predicate to drop segments before compression.
+     *
+     * The predicate is called for each parsed segment; if it returns true,
+     * the segment is omitted from the archive entirely. Used by CLI flags
+     * like `--skip-embedding` to keep the archive small at the cost of
+     * needing the source model alongside for inference-time lookups.
+     */
+    void setSkipPredicate(std::function<bool(const ModelSegment&)> pred) {
+        skipPredicate_ = std::move(pred);
+    }
+
+    /**
      * @brief Access statistics accumulated during compression.
      */
     const CompressionStats& getCompressionStats() const { return stats_; }
@@ -225,6 +238,7 @@ private:
     uint8_t defaultStrategyId_;
     size_t numThreads_ = 1;  // Default to single-threaded
     CompressionStats stats_; // Store compression statistics
+    std::function<bool(const ModelSegment&)> skipPredicate_;
     std::unique_ptr<ThreadPool> threadPool_;
     std::unique_ptr<BufferPool> bufferPool_;
 

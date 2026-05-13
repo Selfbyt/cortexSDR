@@ -1077,6 +1077,30 @@ std::vector<std::byte> HierarchicalSDRStrategy::compress(const ModelSegment& seg
                                "' is protected; deferring to lossless fallback");
     }
 
+    // Route very-large Q4_K segments (embeddings, lm_heads) through the
+    // streaming path. The default compress() materialises the full FP32
+    // dequantisation which OOMs at ~2 GB on 150k-vocab embeddings. Threshold
+    // chosen at 256 MB FP32 — well below typical heap headroom but enough
+    // to catch every "this should never have materialised" tensor.
+    if (segment.tensor_metadata.has_value()) {
+        const auto& dims = segment.tensor_metadata.value().dimensions;
+        if (dims.size() >= 2) {
+            const auto rc = effective2DShape_impl(dims);
+            const size_t fp32_bytes = rc.first * rc.second * sizeof(float);
+            // 1 GB threshold so only embedding-scale tensors (typically 2+ GB
+            // FP32 for 100k+-vocab models) trigger streaming. Smaller MLPs
+            // (~250-500 MB FP32) stay on the standard path which respects
+            // the strategy's stored config.
+            constexpr size_t kStreamThreshold = 1024ULL * 1024 * 1024;
+            std::string fmt = segment.data_format;
+            for (auto& c : fmt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            const bool is_q4k = (fmt == "q4_k");
+            if (fp32_bytes >= kStreamThreshold && is_q4k) {
+                return compressStreaming(segment);
+            }
+        }
+    }
+
     // Dequantise to FP32. Throws CompressionError for unsupported dtypes
     // (the strategy chain in AICompressor then falls through to the next
     // priority — typically QuantizedTensorStrategy or Gzip). std::bad_alloc
@@ -1340,7 +1364,12 @@ std::vector<std::byte> HierarchicalSDRStrategy::decompress(
     const uint32_t R_full = (R / header.tile_rows) * header.tile_rows;
     const uint32_t C_full = (C / header.tile_cols) * header.tile_cols;
 
-    if (static_cast<size_t>(R) * C * sizeof(float) != originalSize) {
+    // originalSize comes from the archive header which records the SOURCE
+    // dtype size (e.g. Q4_K_M-packed bytes), not the FP32 reconstruction
+    // size. Accept either: the FP32 size we'll actually emit, OR a size
+    // smaller than that (we trust the embedded header for the real shape).
+    const size_t fp32_expected = static_cast<size_t>(R) * C * sizeof(float);
+    if (originalSize != 0 && originalSize > fp32_expected) {
         throw CompressionError("HSDR decompress: originalSize does not match shape");
     }
 
@@ -1437,6 +1466,202 @@ HierarchicalSDRStrategy::fitSharedDictionary(
                         shared.atoms, indices_throwaway, signs_throwaway,
                         shared.stage_scales);
     return shared;
+}
+
+namespace {
+using Utils::fp16_to_fp32;
+// Streaming Q4_K dequant: decode one row at a time into the caller-provided
+// FP32 buffer (sized C floats). Q4_K layout = 144 bytes / 256 elements per
+// block; one row of C elements consumes C/256 blocks. Block layout matches
+// the dequantizeSegmentToFP32 implementation at the top of this file.
+struct Q4KRowStreamer {
+    const uint8_t* base;
+    size_t bytes_per_row;
+    size_t blocks_per_row;
+    uint32_t C;
+
+    Q4KRowStreamer(const std::byte* data, uint32_t cols)
+        : base(reinterpret_cast<const uint8_t*>(data)),
+          C(cols)
+    {
+        constexpr size_t QK_K = 256;
+        constexpr size_t BLOCK_BYTES = 144;
+        if (cols % QK_K != 0) {
+            throw CompressionError("Q4KRowStreamer: row dim not multiple of 256");
+        }
+        blocks_per_row = cols / QK_K;
+        bytes_per_row = blocks_per_row * BLOCK_BYTES;
+    }
+
+    void decodeRow(size_t row_idx, float* out) const {
+        constexpr size_t QK_K = 256;
+        constexpr size_t BLOCK_BYTES = 144;
+        const uint8_t* p = base + row_idx * bytes_per_row;
+        uint8_t sc[8], mn[8];
+        for (size_t b = 0; b < blocks_per_row; ++b) {
+            const uint8_t* blk = p + b * BLOCK_BYTES;
+            uint16_t d_bits, dmin_bits;
+            std::memcpy(&d_bits, blk, 2);
+            std::memcpy(&dmin_bits, blk + 2, 2);
+            const float d    = fp16_to_fp32(d_bits);
+            const float dmin = fp16_to_fp32(dmin_bits);
+            // Unpack 6-bit scales + 6-bit mins from the 12-byte packed block.
+            const uint8_t* scales12 = blk + 4;
+            for (int is = 0; is < 4; ++is) {
+                sc[is] = scales12[is] & 0x3F;
+                mn[is] = scales12[is + 4] & 0x3F;
+            }
+            for (int is = 4; is < 8; ++is) {
+                sc[is] = (scales12[is + 4] & 0x0F) | ((scales12[is - 4] >> 6) << 4);
+                mn[is] = (scales12[is + 4] >> 4) | ((scales12[is] >> 6) << 4);
+            }
+            const uint8_t* qs = blk + 16;
+            float* dst = out + b * QK_K;
+            for (int is = 0; is < 8; ++is) {
+                const float ds = d * static_cast<float>(sc[is]);
+                const float dm = dmin * static_cast<float>(mn[is]);
+                for (int j = 0; j < 32; ++j) {
+                    const int idx = is * 32 + j;
+                    const uint8_t byte = qs[idx / 2];
+                    const uint8_t q = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+                    dst[idx] = static_cast<float>(q) * ds - dm;
+                }
+            }
+        }
+    }
+};
+
+bool isQ4KSegment(const ModelSegment& seg) {
+    std::string fmt = seg.data_format;
+    for (auto& c : fmt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return fmt == "q4_k";
+}
+}  // anonymous namespace
+
+std::vector<std::byte> HierarchicalSDRStrategy::compressStreaming(const ModelSegment& segment) const {
+    if (!segment.isWeightTensor()) {
+        throw CompressionError("compressStreaming: weight tensor required");
+    }
+    if (!segment.tensor_metadata.has_value()
+        || segment.tensor_metadata.value().dimensions.size() < 2) {
+        throw CompressionError("compressStreaming: rank-<2 tensor not supported");
+    }
+    if (!isQ4KSegment(segment)) {
+        // Fall back to the regular path for non-Q4_K inputs. The whole point
+        // of streaming is to avoid the 2 GB FP32 materialisation, which only
+        // matters for very large quantised tensors; small/non-Q4_K segments
+        // are happier on the standard path.
+        return compress(segment);
+    }
+    const auto& dims = segment.tensor_metadata.value().dimensions;
+    auto rc = effective2DShape_impl(dims);
+    // GGUF stores tensor dims with the fastest-varying axis first (ggml
+    // convention). For embeddings that gives dims=[hidden, vocab], which
+    // effective2DShape reads as R=hidden, C=vocab. We want the opposite:
+    // C should be the embedding dim (fits in uint16, what HSDR can tile),
+    // R the number of token rows. Swap if C exceeds uint16 and R fits.
+    if (rc.second > 0xFFFFu && rc.first <= 0xFFFFu) {
+        std::swap(rc.first, rc.second);
+    }
+    const uint32_t R = static_cast<uint32_t>(rc.first);
+    const uint32_t C = static_cast<uint32_t>(rc.second);
+    if (C == 0 || R == 0) {
+        throw CompressionError("compressStreaming: zero-sized shape");
+    }
+    if (C > 0xFFFFu) {
+        throw CompressionError("compressStreaming: row dim exceeds uint16 tile_cols");
+    }
+    if (C % 256 != 0) {
+        throw CompressionError("compressStreaming: Q4_K row dim must be multiple of 256");
+    }
+
+    // Start from the strategy's stored config (so --n-atoms, --ksvd-iters,
+    // etc. from the CLI are respected), then force 1D row-tile mode with
+    // tile_cols == C since streaming is only meaningful for that geometry.
+    HierarchicalSDRConfig cfg = configFor(segment);
+    cfg.tile_rows = 1;
+    cfg.tile_cols = static_cast<uint16_t>(C);
+    if (cfg.n_atoms == 0) {
+        cfg.n_atoms = 32;  // sentinel safety
+    }
+
+    const uint32_t pool_capacity =
+        cfg.max_tiles_for_fit > 0 ? std::min<uint32_t>(cfg.max_tiles_for_fit, R) : R;
+    Q4KRowStreamer stream(segment.data.data(), C);
+
+    // 1. Reservoir-sample R rows into a pool of pool_capacity rows, dequanting
+    //    row-by-row. Memory peak: pool_capacity × C × 4 bytes (e.g. 4096 ×
+    //    3584 × 4 = 56 MB for a Qwen embedding).
+    std::vector<float> pool(static_cast<size_t>(pool_capacity) * C);
+    uint64_t seen = 0;
+    uint32_t pool_fill = 0;
+    std::mt19937 rng(0xC0DECAFE);
+    std::vector<float> row(C);
+    for (uint32_t r = 0; r < R; ++r) {
+        stream.decodeRow(r, row.data());
+        if (pool_fill < pool_capacity) {
+            std::memcpy(pool.data() + static_cast<size_t>(pool_fill) * C,
+                        row.data(), C * sizeof(float));
+            ++pool_fill;
+        } else {
+            std::uniform_int_distribution<uint64_t> dist(0, seen);
+            const uint64_t j = dist(rng);
+            if (j < pool_capacity) {
+                std::memcpy(pool.data() + j * C, row.data(), C * sizeof(float));
+            }
+        }
+        ++seen;
+    }
+    if (pool_fill < cfg.n_atoms) {
+        throw CompressionError("compressStreaming: too few rows to fit dictionary");
+    }
+
+    // 2. Fit the dictionary on the pool.
+    SharedDictionary dict;
+    dict = fitSharedDictionary(pool, pool_fill, cfg);
+
+    // 3. Stream rows again, encode each against the dict, pack codes.
+    const uint32_t slots_per_tile = static_cast<uint32_t>(cfg.n_stages) * cfg.active_bits_per_stage;
+    std::vector<uint16_t> indices(static_cast<size_t>(R) * slots_per_tile);
+    std::vector<int8_t> signs(static_cast<size_t>(R) * slots_per_tile);
+    for (uint32_t r = 0; r < R; ++r) {
+        stream.decodeRow(r, row.data());
+        hierarchicalBinaryCode(row.data(), dict.atoms.data(),
+                                cfg.n_atoms, C, cfg.n_stages, cfg.active_bits_per_stage,
+                                dict.stage_scales.data(),
+                                indices.data() + static_cast<size_t>(r) * slots_per_tile,
+                                signs.data()   + static_cast<size_t>(r) * slots_per_tile);
+    }
+
+    // 4. Serialise: per-tensor HSDR header + embedded dictionary + packed codes.
+    //    Same format as compress()'s output so the existing decompress() path
+    //    works unchanged.
+    HSDRHeader header{};
+    std::memcpy(header.magic, kHSDRMagic, 4);
+    header.version = kHSDRVersion;
+    header.original_rows = R;
+    header.original_cols = C;
+    header.n_tiles = R;
+    header.tile_rows = cfg.tile_rows;
+    header.tile_cols = cfg.tile_cols;
+    header.n_atoms = cfg.n_atoms;
+    header.n_stages = cfg.n_stages;
+    header.active_bits_per_stage = cfg.active_bits_per_stage;
+    header.stage_decay = cfg.stage_decay;
+    header.edge_bytes_count = 0;
+
+    // Same byte order as compress(): header, stage_scales, atoms, packed codes.
+    std::vector<std::byte> out;
+    out.reserve(sizeof(header) + dict.stage_scales.size() * sizeof(float)
+                + dict.atoms.size() * sizeof(float)
+                + indices.size() * sizeof(uint16_t));
+    appendPOD(out, header);
+    appendBuffer(out, dict.stage_scales.data(), dict.stage_scales.size());
+    appendBuffer(out, dict.atoms.data(), dict.atoms.size());
+    std::vector<uint16_t> packed(indices.size());
+    for (size_t i = 0; i < indices.size(); ++i) packed[i] = packIndexSign(indices[i], signs[i]);
+    appendBuffer(out, packed.data(), packed.size());
+    return out;
 }
 
 std::vector<std::byte> HierarchicalSDRStrategy::compressWithExternalDictionary(

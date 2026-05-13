@@ -30,7 +30,8 @@ int extractArchive(const char* compressed_path, const char* output_dir, float sp
 int runInference(const char* archive_path, const char* input_indices_file);
 int compressModelHSDR(const char* model_path, const char* format, const char* output_hsda_path,
                       int protect_boundary, int total_layers_hint,
-                      bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters);
+                      bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters,
+                      bool skip_embedding = false);
 std::vector<size_t> loadInputIndices(const char* input_path);
 std::vector<std::string> findModelParts(const std::string& model_path);
 
@@ -334,9 +335,12 @@ int main(int argc, char** argv) {
         int max_tiles = -1;   // -1 = "use config default"
         int n_atoms = -1;
         int ksvd_iters = -1;
+        bool skip_embedding = false;
         for (int i = 5; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--protect-boundary" && i + 1 < argc) {
+            if (arg == "--skip-embedding") {
+                skip_embedding = true;
+            } else if (arg == "--protect-boundary" && i + 1 < argc) {
                 protect_boundary = std::stoi(argv[i + 1]);
                 ++i;
             } else if (arg == "--total-layers" && i + 1 < argc) {
@@ -359,7 +363,8 @@ int main(int argc, char** argv) {
         }
         return compressModelHSDR(model_path, format, output_hsda_path,
                                  protect_boundary, total_layers,
-                                 fast_preset, max_tiles, n_atoms, ksvd_iters);
+                                 fast_preset, max_tiles, n_atoms, ksvd_iters,
+                                 skip_embedding);
     } else {
         printUsage(argv[0]);
         return 1;
@@ -593,7 +598,8 @@ int runInference(const char* archive_path, const char* input_indices_file) {
 
 int compressModelHSDR(const char* model_path, const char* format, const char* output_sdr_path,
                       int protect_boundary, int total_layers_hint,
-                      bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters) {
+                      bool fast_preset, int max_tiles, int n_atoms, int ksvd_iters,
+                      bool skip_embedding) {
     using namespace CortexAICompression;
     (void)protect_boundary;  // boundary-protect predicate is a per-tensor concept
     (void)total_layers_hint; // currently not threaded through per-tensor path
@@ -605,6 +611,7 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
     if (fast_preset)     std::cout << "  preset: --fast (small K, few iters)\n";
     if (n_atoms >= 0)    std::cout << "  override: n-atoms="   << n_atoms   << "\n";
     if (ksvd_iters >= 0) std::cout << "  override: ksvd-iters=" << ksvd_iters << "\n";
+    if (skip_embedding)  std::cout << "  --skip-embedding: dropping token_embd and lm_head from archive\n";
 
     try {
         // 1. Build the per-tensor HSDR strategy with the user's config.
@@ -628,6 +635,20 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
         //    segments still land in the archive losslessly.
         auto parser = ModelParserFactory::createParserForFormat(format);
         AICompressor compressor(std::move(parser));
+        if (skip_embedding) {
+            compressor.setSkipPredicate([](const ModelSegment& s) {
+                if (s.type == SegmentType::EMBEDDING_WEIGHTS) return true;
+                // Common embedding / output-projection naming patterns across
+                // GGUF (Qwen, LLaMA, etc.) and ONNX. Output projection (lm_head)
+                // is typically tied to / sized like the embedding so it's
+                // dropped together unless the user shipped them separately.
+                const std::string& n = s.name;
+                return n == "token_embd.weight"
+                    || n == "output.weight"
+                    || n == "lm_head.weight"
+                    || n.find("embed_tokens") != std::string::npos;
+            });
+        }
         constexpr uint8_t HSDR_STRATEGY_ID  = 5;
         constexpr uint8_t QUANT_STRATEGY_ID = 4;
         constexpr uint8_t GZIP_STRATEGY_ID  = 3;
@@ -654,15 +675,32 @@ int compressModelHSDR(const char* model_path, const char* format, const char* ou
         compressor.registerStrategy(SegmentType::WEIGHTS_FP32,         3, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
         compressor.registerStrategy(SegmentType::ATTENTION_WEIGHTS,    3, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
         compressor.registerStrategy(SegmentType::FEED_FORWARD_WEIGHTS, 3, DEQUANT_FP32_STRATEGY_ID, dequantStrategy);
-        auto gzipStrategy = std::make_shared<GzipStrategy>(6);
-        compressor.registerStrategy(SegmentType::WEIGHTS_FP32,        3, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::WEIGHTS_FP16,        3, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::WEIGHTS_INT8,        3, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::METADATA_JSON,       1, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::CONFIG,              1, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::TOKENIZER_VOCAB,     1, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::TOKENIZER_MODEL,     1, GZIP_STRATEGY_ID, gzipStrategy);
-        compressor.registerStrategy(SegmentType::GRAPH_STRUCTURE_PROTO, 1, GZIP_STRATEGY_ID, gzipStrategy);
+        auto gzipStrategy = std::make_shared<GzipStrategy>(9);  // max level for best ratio
+        // Gzip is the universal lossless fallback. Registered for every
+        // SegmentType that might appear so no segment ever ends up "stored
+        // uncompressed" (which would defeat the whole point of an archive).
+        // Without an explicit EMBEDDING_WEIGHTS entry, a 150k-vocab embedding
+        // that fails HSDR + Quant lands raw at ~270 MB — gzip won't shrink
+        // Q4_K bytes dramatically but reliably trims 5-15%.
+        const SegmentType gzip_types[] = {
+            SegmentType::WEIGHTS_FP32, SegmentType::WEIGHTS_FP16,
+            SegmentType::WEIGHTS_INT8, SegmentType::WEIGHTS_INT4,
+            SegmentType::ATTENTION_WEIGHTS,
+            SegmentType::FEED_FORWARD_WEIGHTS,
+            SegmentType::EMBEDDING_WEIGHTS,
+            SegmentType::LAYER_NORM_WEIGHTS,
+            SegmentType::METADATA_JSON,
+            SegmentType::CONFIG,
+            SegmentType::TOKENIZER_VOCAB,
+            SegmentType::TOKENIZER_MODEL,
+            SegmentType::GRAPH_STRUCTURE_PROTO,
+            SegmentType::SPARSE_INDICES,
+            SegmentType::MODEL_INPUT,
+            SegmentType::MODEL_OUTPUT,
+        };
+        for (SegmentType t : gzip_types) {
+            compressor.registerStrategy(t, 4, GZIP_STRATEGY_ID, gzipStrategy);
+        }
 
         // 3. Stream to .sdr file.
         auto t0 = std::chrono::steady_clock::now();

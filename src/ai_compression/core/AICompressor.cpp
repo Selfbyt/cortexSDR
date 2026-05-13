@@ -141,6 +141,27 @@ void AICompressor::compressModel(const std::string& modelPath, std::ostream& out
         // Write minimal valid archive? Or throw? For now, write minimal.
     }
 
+    // Apply skip predicate (used by CLI flags like --skip-embedding).
+    if (skipPredicate_) {
+        size_t kept = 0;
+        size_t dropped_count = 0;
+        size_t dropped_bytes = 0;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (skipPredicate_(segments[i])) {
+                dropped_bytes += segments[i].data.size();
+                ++dropped_count;
+                continue;
+            }
+            if (kept != i) segments[kept] = std::move(segments[i]);
+            ++kept;
+        }
+        segments.resize(kept);
+        if (dropped_count > 0) {
+            std::cerr << "  Skip-predicate dropped " << dropped_count
+                      << " segments (" << dropped_bytes << " source bytes)\n";
+        }
+    }
+
     // 2. Compress each segment and gather header info
     std::vector<CompressedSegmentHeader> headers;
     std::vector<std::vector<std::byte>> compressedDatas;

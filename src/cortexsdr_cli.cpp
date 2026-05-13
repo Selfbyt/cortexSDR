@@ -416,8 +416,33 @@ struct EmbeddingLayout {
     bool valid() const { return vocab_size > 0 && embedding_dim > 0; }
 };
 
+// Forward decl — the full LazyHSDREmbedding struct + state live just below
+// the embedding_lookup definition.
+struct LazyHSDREmbedding {
+    bool valid = false;
+    uint32_t R = 0;
+    uint32_t C = 0;
+    uint16_t K = 0;
+    uint8_t  S = 0;
+    uint8_t  k = 0;
+    std::vector<float> atoms;
+    std::vector<float> stage_scales;
+    std::vector<uint16_t> packed;
+};
+extern LazyHSDREmbedding g_lazy_emb;
+extern bool g_lazy_emb_tried;
+
 static EmbeddingLayout infer_embedding_layout(const CortexAICompression::LayerInfo& token_embedding, int token_id_hint = -1) {
     EmbeddingLayout best{};
+    // Lazy-HSDR path: pull dims directly from the parsed HSDR header.
+    if (g_lazy_emb.valid) {
+        best.vocab_size = g_lazy_emb.R;
+        best.embedding_dim = g_lazy_emb.C;
+        if (token_id_hint >= 0 && static_cast<size_t>(token_id_hint) >= best.vocab_size) {
+            return EmbeddingLayout{};
+        }
+        return best;
+    }
     const size_t total = token_embedding.weights.size();
     if (total == 0) {
         return best;
@@ -450,10 +475,102 @@ static EmbeddingLayout infer_embedding_layout(const CortexAICompression::LayerIn
     return best;
 }
 
-static std::vector<float> embedding_lookup(const CortexAICompression::LayerInfo& token_embedding, int token_id) {
-    if (token_id < 0 || token_embedding.weights.empty()) {
-        return {};
+// LazyHSDREmbedding struct forward-declared above near EmbeddingLayout.
+// Decoding one row is O(slots × tile_dim) and skips full materialisation —
+// critical for 150k-vocab embeddings whose FP32 form is 2+ GB.
+LazyHSDREmbedding g_lazy_emb;
+bool g_lazy_emb_tried = false;
+
+// Parse a per-tensor HSDR codes blob into a LazyHSDREmbedding. Format matches
+// HierarchicalSDRStrategy::compress() output: HSDRHeader, stage_scales[S],
+// atoms[K*C], packed_codes[n_tiles*S*k]. Returns false if magic/version don't
+// match (i.e. segment isn't HSDR-encoded).
+static bool parse_hsdr_codes_for_embedding(
+    const std::vector<std::byte>& blob, LazyHSDREmbedding& out)
+{
+    if (blob.size() < 32) return false;
+    const std::byte* p = blob.data();
+    char magic[4];
+    std::memcpy(magic, p, 4); p += 4;
+    if (magic[0] != 'H' || magic[1] != 'S' || magic[2] != 'D' || magic[3] != 'R') return false;
+    uint32_t version;
+    std::memcpy(&version, p, 4); p += 4;
+    uint32_t R_orig, C_orig, n_tiles;
+    std::memcpy(&R_orig, p, 4); p += 4;
+    std::memcpy(&C_orig, p, 4); p += 4;
+    std::memcpy(&n_tiles, p, 4); p += 4;
+    uint16_t tile_rows, tile_cols, n_atoms;
+    std::memcpy(&tile_rows, p, 2); p += 2;
+    std::memcpy(&tile_cols, p, 2); p += 2;
+    std::memcpy(&n_atoms, p, 2); p += 2;
+    uint8_t n_stages, k_per_stage;
+    std::memcpy(&n_stages, p, 1); p += 1;
+    std::memcpy(&k_per_stage, p, 1); p += 1;
+    float stage_decay;
+    std::memcpy(&stage_decay, p, 4); p += 4;
+    uint32_t edge_bytes_count;
+    std::memcpy(&edge_bytes_count, p, 4); p += 4;
+    (void)version; (void)R_orig; (void)C_orig; (void)stage_decay; (void)edge_bytes_count;
+    if (tile_rows != 1) return false;  // only 1D row-tile mode is lazy-decodable
+
+    out.R = n_tiles;
+    out.C = tile_cols;
+    out.K = n_atoms;
+    out.S = n_stages;
+    out.k = k_per_stage;
+    out.stage_scales.assign(reinterpret_cast<const float*>(p),
+                            reinterpret_cast<const float*>(p) + n_stages);
+    p += n_stages * sizeof(float);
+    const size_t atoms_count = static_cast<size_t>(n_atoms) * tile_cols;
+    out.atoms.assign(reinterpret_cast<const float*>(p),
+                     reinterpret_cast<const float*>(p) + atoms_count);
+    p += atoms_count * sizeof(float);
+    const size_t slots_per_tile = static_cast<size_t>(n_stages) * k_per_stage;
+    const size_t packed_count = static_cast<size_t>(n_tiles) * slots_per_tile;
+    out.packed.assign(reinterpret_cast<const uint16_t*>(p),
+                      reinterpret_cast<const uint16_t*>(p) + packed_count);
+    out.valid = true;
+    return true;
+}
+
+static std::vector<float> hsdr_decode_row(const LazyHSDREmbedding& e, uint32_t row) {
+    std::vector<float> out(e.C, 0.0f);
+    if (!e.valid || row >= e.R) return {};
+    const size_t slots = static_cast<size_t>(e.S) * e.k;
+    const uint16_t* slot_base = e.packed.data() + static_cast<size_t>(row) * slots;
+    for (uint8_t l = 0; l < e.S; ++l) {
+        const float gamma = e.stage_scales[l];
+        for (uint8_t b = 0; b < e.k; ++b) {
+            const uint16_t pk = slot_base[static_cast<size_t>(l) * e.k + b];
+            const uint16_t idx = pk >> 1;
+            const int8_t  sgn = (pk & 1) ? -1 : +1;
+            if (idx >= e.K) continue;
+            const float scale = gamma * static_cast<float>(sgn);
+            const float* atom = e.atoms.data() + static_cast<size_t>(idx) * e.C;
+            for (uint32_t c = 0; c < e.C; ++c) out[c] += scale * atom[c];
+        }
     }
+    return out;
+}
+
+static std::vector<float> embedding_lookup(const CortexAICompression::LayerInfo& token_embedding, int token_id) {
+    if (token_id < 0) return {};
+    // Fast path: lazy HSDR decode. Parse once from the compressed bytes;
+    // every subsequent row decode is O(S×k×C) ≈ 40 K ops for K=32, C=3584.
+    if (!g_lazy_emb_tried && g_model_loader && !g_token_embedding_layer_name.empty()) {
+        g_lazy_emb_tried = true;
+        try {
+            auto blob = g_model_loader->loadCompressedBytesByName(g_token_embedding_layer_name);
+            parse_hsdr_codes_for_embedding(blob, g_lazy_emb);
+        } catch (...) {
+            // No lazy path available — fall back to eager weights below.
+        }
+    }
+    if (g_lazy_emb.valid && static_cast<uint32_t>(token_id) < g_lazy_emb.R) {
+        return hsdr_decode_row(g_lazy_emb, static_cast<uint32_t>(token_id));
+    }
+
+    if (token_embedding.weights.empty()) return {};
     const EmbeddingLayout layout = infer_embedding_layout(token_embedding, token_id);
     if (!layout.valid() || static_cast<size_t>(token_id) >= layout.vocab_size) {
         return {};
@@ -843,7 +960,37 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                 throw std::runtime_error("Prompt tokenization produced no tokens");
             }
 
-            if (!g_cached_token_embedding) {
+            // Try lazy HSDR row-decode first — skips the 2 GB FP32 materialisation
+            // that would OOM on a 150k-vocab embedding. Fall back to eager
+            // loadLayerByName only when the segment isn't HSDR-encoded.
+            if (!g_lazy_emb_tried) {
+                g_lazy_emb_tried = true;
+                // Segment index keys segments by `name` (e.g. "token_embd.weight"),
+                // but g_token_embedding_layer_name is the layer_name without
+                // suffix. Resolve to the underlying segment name by scanning.
+                std::string seg_key;
+                for (const auto& s : g_model_loader->getSegmentIndex()) {
+                    if (s.layer_name == g_token_embedding_layer_name
+                        || s.name == g_token_embedding_layer_name
+                        || s.name == g_token_embedding_layer_name + ".weight") {
+                        seg_key = s.name; break;
+                    }
+                }
+                try {
+                    auto blob = g_model_loader->loadCompressedBytesByName(seg_key);
+                    const bool ok = parse_hsdr_codes_for_embedding(blob, g_lazy_emb);
+                    std::cout << "  - Lazy HSDR embedding parse: " << (ok ? "OK" : "FAILED")
+                              << " (blob=" << blob.size() << " bytes, key='" << seg_key << "')\n";
+                    if (g_lazy_emb.valid) {
+                        std::cout << "  - Lazy emb R=" << g_lazy_emb.R << " C=" << g_lazy_emb.C
+                                  << " K=" << g_lazy_emb.K << "\n";
+                    }
+                } catch (const std::exception& e) {
+                    std::cout << "  - Lazy HSDR embedding parse threw (key='" << seg_key
+                              << "'): " << e.what() << "\n";
+                }
+            }
+            if (!g_lazy_emb.valid && !g_cached_token_embedding) {
                 const auto embed_load_start = std::chrono::steady_clock::now();
                 g_cached_token_embedding = std::make_unique<CortexAICompression::LayerInfo>(
                     g_model_loader->loadLayerByName(g_token_embedding_layer_name));
@@ -854,8 +1001,11 @@ std::string generate_text(const std::string& prompt, int max_length = 100) {
                     std::cout << "  - Token embedding cache warmup: " << embed_load_ms << "ms" << std::endl;
                 }
             }
-            const CortexAICompression::LayerInfo& token_embedding = *g_cached_token_embedding;
-            if (token_embedding.weights.empty() && token_embedding.raw_data.empty()) {
+            static CortexAICompression::LayerInfo empty_layer_info;
+            const CortexAICompression::LayerInfo& token_embedding =
+                g_lazy_emb.valid ? empty_layer_info : *g_cached_token_embedding;
+            if (!g_lazy_emb.valid &&
+                token_embedding.weights.empty() && token_embedding.raw_data.empty()) {
                 throw std::runtime_error("Token embedding layer has no accessible backing data");
             }
 

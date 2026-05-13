@@ -220,6 +220,20 @@ public:
         const ModelSegment& segment, const SharedDictionary& dict) const;
 
     /**
+     * @brief Streaming per-tensor HSDR compress for very large quantised inputs.
+     *
+     * The default compress() materialises the entire FP32 dequantisation in
+     * memory, which OOMs on 150k-vocab embeddings (~2 GB FP32). This variant
+     * processes the source row-by-row through a streaming dequant, runs
+     * reservoir sampling to build a tile pool bounded by max_pool_tiles, fits
+     * a dictionary on the pool, and re-streams the source to encode each row
+     * against the dictionary. Memory peak: O(max_pool_tiles × C) instead of
+     * O(total elements). Currently supports Q4_K source data; falls back to
+     * regular compress() for other dtypes.
+     */
+    std::vector<std::byte> compressStreaming(const ModelSegment& segment) const;
+
+    /**
      * @brief Encode-only variant that takes already-dequantised FP32 bytes.
      *
      * Skips the dequant + extractTiles copy that compressWithExternalDictionary

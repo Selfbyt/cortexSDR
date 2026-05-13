@@ -637,6 +637,10 @@ add_executable(tool_hsda_inspect src/tool_hsda_inspect.cpp)
 target_link_libraries(tool_hsda_inspect PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
 target_compile_definitions(tool_hsda_inspect PRIVATE CORTEXSDR_STATIC=1)
 
+# .sdr archive inspector — strategy_id + compressed_size per segment
+add_executable(tool_sdr_inspect src/tool_sdr_inspect.cpp)
+target_compile_definitions(tool_sdr_inspect PRIVATE CORTEXSDR_STATIC=1)
+
 # Dequant-stats tool: dumps first Q4_K block of a chosen weight to validate parser/dequant
 add_executable(tool_dequant_stats src/tool_dequant_stats.cpp)
 target_link_libraries(tool_dequant_stats PRIVATE ${PROJECT_NAME} ${EXTRA_LIBS})
